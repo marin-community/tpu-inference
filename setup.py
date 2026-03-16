@@ -95,6 +95,7 @@ setup(
     entry_points={
         "vllm.general_plugins": [
             "tpu_quantization_configs = tpu_inference.layers.vllm.quantization:register_tpu_quantization_configs",
+            "tpu_custom_ops = tpu_inference.layers.vllm.custom_ops:register_custom_ops",
         ],
     },
 )
