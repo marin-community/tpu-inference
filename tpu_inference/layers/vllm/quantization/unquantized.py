@@ -16,6 +16,7 @@ from typing import Any, Callable, Optional
 
 import jax
 import torch
+import vllm.envs as vllm_envs
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from torch.nn import Parameter
 from torchax.interop import jax_view, torch_view
@@ -48,11 +49,36 @@ from tpu_inference.layers.vllm.quantization.base import VllmQuantizationMethod
 from tpu_inference.layers.vllm.quantization.configs import (
     VllmQuantConfig, VllmQuantLinearConfig)
 from tpu_inference.logger import init_logger
-from tpu_inference.utils import get_mesh_shape_product
+from tpu_inference.utils import get_mesh_shape_product, to_jax_dtype
 
 P = PartitionSpec
 
 logger = init_logger(__name__)
+
+
+def _torch_to_jax(tensor: torch.Tensor,
+                  sharding: NamedSharding | None = None) -> jax.Array:
+    """Convert a torch tensor to a JAX array.
+
+    Under Pathways there is no local CPU JAX device, so we convert via numpy
+    and use ``jax.device_put`` with *sharding* to place data directly onto the
+    TPU mesh from host memory, avoiding a full-size copy on a single device.
+
+    Outside Pathways, ``t2j`` works fine because the caller sets
+    ``jax.default_device(cpu)``.
+
+    Args:
+        tensor: The PyTorch tensor to convert.
+        sharding: Target sharding for direct placement.  Required under
+            Pathways; ignored otherwise.
+    """
+    if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+        assert sharding is not None, (
+            "_torch_to_jax: sharding must be provided under Pathways")
+        dtype = to_jax_dtype(tensor.dtype)
+        np_tensor = tensor.detach().cpu().to(torch.float32).numpy()
+        return jax.device_put(np_tensor, sharding).astype(dtype)
+    return t2j(tensor, use_dlpack=False)
 
 
 @register_quantization_config(UNQUANTIZED)
@@ -124,14 +150,31 @@ class VllmUnquantizedLinearMethod(vllm_linear.UnquantizedLinearMethod,
         if not _tensor_is_in_cpu(layer.weight):
             # Already processed and sharded.
             return
-        weight = t2j(layer.weight, use_dlpack=False)
+        # Under Pathways, shard weights directly onto the TPU mesh to avoid
+        # placing a full unsharded copy on a single device (OOM).
+        weight_sharding = NamedSharding(self.linear_config.mesh,
+                                        self.linear_config.weight_sharding)
+        weight = _torch_to_jax(layer.weight, sharding=weight_sharding)
+
+        logger.info(
+            f"[Linear process_weights] layer={type(layer).__name__}, "
+            f"weight shape={weight.shape}, dtype={weight.dtype}, "
+            f"sharding={weight.sharding}, "
+            f"shard_shape={weight.addressable_shards[0].data.shape if weight.addressable_shards else 'N/A'}, "
+            f"num_devices={len(weight.addressable_shards)}, "
+            f"total_bytes={weight.size * weight.itemsize} "
+            f"({weight.size * weight.itemsize / (1024**3):.3f} GiB)"
+        )
+
         # Free CPU memory immediately
         layer.weight.untyped_storage().resize_(0)
         delattr(layer, 'weight')
         if layer.bias is not None and not layer.skip_bias_add:
             if layer.return_bias:
                 logger.warning_once("Bias might return incorrect value.")
-            bias = t2j(layer.bias, use_dlpack=False)
+            bias_sharding = NamedSharding(self.linear_config.mesh,
+                                          self.linear_config.bias_sharding)
+            bias = _torch_to_jax(layer.bias, sharding=bias_sharding)
             layer.bias.untyped_storage().resize_(0)
             delattr(layer, 'bias')
         else:
@@ -253,8 +296,26 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
             return
         assert isinstance(layer, FusedMoE)
 
-        w13_weight = t2j(layer.w13_weight, use_dlpack=False)
-        w2_weight = t2j(layer.w2_weight, use_dlpack=False)
+        # Under Pathways, shard weights directly onto the TPU mesh to avoid
+        # placing a full unsharded copy on a single device (OOM for large MoE).
+        ep_sharding = NamedSharding(self.mesh, P(ShardingAxisName.EXPERT))
+        w13_weight = _torch_to_jax(layer.w13_weight, sharding=ep_sharding)
+        w2_weight = _torch_to_jax(layer.w2_weight, sharding=ep_sharding)
+
+        logger.info(
+            f"[MoE process_weights] AFTER _torch_to_jax: "
+            f"w13 shape={w13_weight.shape}, dtype={w13_weight.dtype}, "
+            f"sharding={w13_weight.sharding}, "
+            f"shard_shape={w13_weight.addressable_shards[0].data.shape if w13_weight.addressable_shards else 'N/A'}, "
+            f"num_devices={len(w13_weight.addressable_shards)}, "
+            f"w13_total_bytes={w13_weight.size * w13_weight.itemsize} "
+            f"({w13_weight.size * w13_weight.itemsize / (1024**3):.3f} GiB), "
+            f"w2 shape={w2_weight.shape}, "
+            f"w2_shard_shape={w2_weight.addressable_shards[0].data.shape if w2_weight.addressable_shards else 'N/A'}, "
+            f"w2_total_bytes={w2_weight.size * w2_weight.itemsize} "
+            f"({w2_weight.size * w2_weight.itemsize / (1024**3):.3f} GiB)"
+        )
+
         # Free CPU memory immediately
         layer.w13_weight.untyped_storage().resize_(0)
         layer.w2_weight.untyped_storage().resize_(0)
@@ -262,8 +323,8 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
         delattr(layer, 'w2_weight')
 
         if self.moe.has_bias:
-            w13_bias = t2j(layer.w13_bias, use_dlpack=False)
-            w2_bias = t2j(layer.w2_bias, use_dlpack=False)
+            w13_bias = _torch_to_jax(layer.w13_bias, sharding=ep_sharding)
+            w2_bias = _torch_to_jax(layer.w2_bias, sharding=ep_sharding)
             layer.w13_bias.untyped_storage().resize_(0)
             layer.w2_bias.untyped_storage().resize_(0)
             delattr(layer, 'w13_bias')
@@ -304,6 +365,13 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
         )
         weights = torch_view(
             shard_moe_weights(weights, self.moe_backend, self.mesh))
+
+        logger.info(
+            f"[MoE process_weights] AFTER sharding: "
+            f"w13_weight shape={weights.w13_weight.shape}, "
+            f"w2_weight shape={weights.w2_weight.shape}"
+        )
+
         layer.w13_weight = Parameter(weights.w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(weights.w2_weight, requires_grad=False)
 
