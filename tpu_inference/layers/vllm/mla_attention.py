@@ -78,7 +78,11 @@ class VllmTPUMLAAttention(MLAAttention):
 
             # TODO(gxd3): consider quantize W_UK_T, W_UV back to fp8.
             # Device_put `W_UK_T`, `W_UV` to TPUs
-            mesh = self.kv_b_proj.quant_method.linear_config.mesh
+            if hasattr(self.kv_b_proj, "scheme") and hasattr(
+                    self.kv_b_proj.scheme, "linear_config"):
+                mesh = self.kv_b_proj.scheme.linear_config.mesh
+            else:
+                mesh = self.kv_b_proj.quant_method.linear_config.mesh
             self.W_UK_T = torch_view(
                 jax.device_put(
                     jax_view(self.W_UK_T),
