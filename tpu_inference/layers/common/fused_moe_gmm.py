@@ -63,6 +63,13 @@ def _swigluoai(x1: jax.Array,
 
 def gmm_wrapper(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset,
                 last_gmm):
+    # Pad lhs along the token dimension to a multiple of 8 (size_lhs_sublane) to prevent
+    # out-of-bounds DMA access in Pallas BlockSpec when batch * topk is not a multiple of 8.
+    actual_tokens = lhs.shape[0]
+    pad_len = (8 - (actual_tokens % 8)) % 8
+    if pad_len > 0:
+        lhs = jnp.pad(lhs, ((0, pad_len), (0, 0)), constant_values=0)
+
     gmm_res = gmm_v2(
         lhs=lhs,
         rhs=rhs,

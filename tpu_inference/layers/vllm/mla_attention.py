@@ -106,30 +106,9 @@ class VllmTPUMLAAttention(MLAAttention):
             # vLLM: self.W_UK_T = W_UK.permute(1, 2, 0)
             self.W_UK_T = jnp.transpose(W_UK, (1, 2, 0))
             
-            self.W_UV = torch_view(self.W_UV)
-            self.W_UK_T = torch_view(self.W_UK_T)
-
-            # NOTE: vLLM dequantizes kv_b_proj weights which causes more memory
-            # usage than expected.
-
-            # TODO(gxd3): consider quantize W_UK_T, W_UV back to fp8.
-            # Device_put `W_UK_T`, `W_UV` to TPUs
-            if hasattr(self.kv_b_proj, "scheme") and hasattr(
-                    self.kv_b_proj.scheme, "linear_config"):
-                mesh = self.kv_b_proj.scheme.linear_config.mesh
-            else:
-                mesh = self.kv_b_proj.quant_method.linear_config.mesh
-            self.W_UK_T = torch_view(
-                jax.device_put(
-                    jax_view(self.W_UK_T),
-                    NamedSharding(mesh, P(ShardingAxisName.ATTN_HEAD, ))))
-            self.W_UV = torch_view(
-                jax.device_put(
-                    jax_view(self.W_UV),
-                    NamedSharding(mesh, P(ShardingAxisName.ATTN_HEAD, ))))
-
-            self.W_UK_T = Parameter(self.W_UK_T, requires_grad=False)
-            self.W_UV = Parameter(self.W_UV, requires_grad=False)
+            import numpy as np
+            self.W_UV = np.array(jnp.transpose(W_UV, (1, 0, 2)))
+            self.W_UK_T = np.array(jnp.transpose(W_UK, (1, 2, 0)))
 
             # Delete kv_b_proj_params as the dequantized weights are now stored
             # in self.W_UK_T and self.W_UV.
