@@ -123,7 +123,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         # (B, N, P) x (N, P, L) -> (B, N, L)
         # torch nn param
-        q_nope = jnp.einsum("bnp,npl->bnl", q_nope, jax_view(layer.W_UK_T))
+        q_nope = jnp.einsum("bnp,npl->bnl", q_nope, jax_view(layer.W_UK_T)).astype(q.dtype)
 
         q_scale = k_scale = v_scale = None
         if layer.kv_cache_quantized_dtype:
