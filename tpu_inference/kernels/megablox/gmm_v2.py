@@ -730,11 +730,11 @@ def calculate_tiling(
     # Calculate vmem limit for a single rhs buffer when using triple buffers.
     num_rhs_buffers = 3
     rhs_vmem_target = vmem_limit_bytes // num_rhs_buffers
-    base_rhs_size_bytes = dims.size_k * dims.size_n * rhs_bits // 8
+    base_rhs_size_bytes = dims.size_group * dims.size_k * dims.size_n * rhs_bits // 8
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
     # smaller than 2x of mxu_column_size.
-    tile_n_limit = pltpu.get_tpu_info().mxu_column_size * 2
+    tile_n_limit = pltpu.get_tpu_info().mxu_column_size
     tile_n_limit = min(tile_n_limit, dims.size_n)
 
     def _is_tile_k_quant_block_compatible(tk: int) -> bool:
@@ -759,8 +759,11 @@ def calculate_tiling(
         tile_n = align_to(dims.size_n, num_n_tiles * num_lanes) // num_n_tiles
 
     # If decreasing tile_n is no longer possible, we decrease tile_k instead.
-    if tile_n < tile_n_limit:
+    if pl.cdiv(base_rhs_size_bytes, num_n_tiles) > rhs_vmem_target:
         num_n_tiles -= 1
+        # If num_n_tiles becomes 0, it means the very first tile_n was already <= tile_n_limit.
+        # We must ensure num_n_tiles is at least 1.
+        num_n_tiles = max(1, num_n_tiles)
         tile_n = align_to(dims.size_n, num_n_tiles * num_lanes) // num_n_tiles
 
         # Decrease tile_k until rhs fits in vmem target and tile_k is valid.
@@ -801,6 +804,8 @@ def validate_inputs(
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
         num_quant_blocks = rhs_scale.shape[1]
+        if rhs_scale.shape != (size_group, num_quant_blocks, 1, size_n):
+            raise RuntimeError(f"CRASH DEBUG rhs_scale.shape: {rhs_scale.shape}, expected: {(size_group, num_quant_blocks, 1, size_n)}")
         assert rhs_scale.shape == (size_group, num_quant_blocks, 1, size_n)
         assert size_k % num_quant_blocks == 0
 
@@ -1026,7 +1031,7 @@ def gmm_v2(
             group_offset = group_offset[None]
 
     if vmem_limit_bytes is None:
-        vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+        vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.1)
 
     cfgs = make_gmm_configs(
         lhs,
