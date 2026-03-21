@@ -17,7 +17,7 @@ name: pre-commit
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, marin]
 
 jobs:
   pre-commit:
