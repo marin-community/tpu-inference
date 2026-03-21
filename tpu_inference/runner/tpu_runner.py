@@ -310,6 +310,21 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         np.random.seed(self.model_config.seed)
         self.rng_key = jax.random.key(self.model_config.seed)
 
+    def _init_sampling_rng(self) -> jax.Array:
+        """Initialize the RNG key for sampling.
+
+        When abstract dummy bootstrap is active (model state has not been
+        materialized yet), nnx.Rngs(...).params() can stall because it
+        tries to interact with abstract state. Use a direct JAX key instead.
+        """
+        from tpu_inference.models.common.model_loader import (
+            _get_tpu_bootstrap_config)
+        bootstrap = _get_tpu_bootstrap_config(self.vllm_config)
+        key = jax.random.key(self.model_config.seed)
+        if bootstrap.get("model_bootstrap") == "abstract_dummy":
+            return key
+        return nnx.Rngs(key).params()
+
     def _init_mesh(self) -> None:
         if envs.NEW_MODEL_DESIGN:
             self.mesh = self._create_new_model_mesh()
@@ -577,8 +592,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.state)
 
-        self.rng_params_for_sampling = nnx.Rngs(
-            jax.random.key(self.model_config.seed)).params()
+        self.rng_params_for_sampling = self._init_sampling_rng()
         self.is_multimodal_model = (self.model_config.is_multimodal_model
                                     and self.embed_multimodal_fn is not None
                                     and hasattr(self.model_config.hf_config,

@@ -48,6 +48,40 @@ _MODEL_REGISTRY = {}
 _VLLM_PREFERRED_ARCHITECTURES: frozenset[str] = frozenset(
     {"GptOssForCausalLM", "Qwen3MoeForCausalLM"})
 
+# Architectures that have JAX implementations and can use abstract dummy
+# bootstrap for fast startup (skip expensive random-init weight materialization).
+_ABSTRACT_BOOTSTRAP_ARCHITECTURES: frozenset[str] = frozenset({
+    "LlamaForCausalLM",
+    "Qwen3ForCausalLM",
+    "Qwen3MoeForCausalLM",
+})
+
+
+def _get_tpu_bootstrap_config(vllm_config: VllmConfig) -> dict:
+    """Extract TPU bootstrap config from model_loader_extra_config."""
+    extra = getattr(vllm_config.load_config, "model_loader_extra_config",
+                    None) or {}
+    return extra.get("tpu_bootstrap", {})
+
+
+def _use_abstract_dummy_bootstrap(vllm_config: VllmConfig,
+                                  model_class: Any) -> bool:
+    """Check if abstract dummy bootstrap should be used for fast startup."""
+    bootstrap = _get_tpu_bootstrap_config(vllm_config)
+    if bootstrap.get("model_bootstrap") != "abstract_dummy":
+        return False
+    if vllm_config.load_config.load_format != "dummy":
+        return False
+    arch = model_class.__name__
+    if arch not in _ABSTRACT_BOOTSTRAP_ARCHITECTURES:
+        return False
+    if apply_qwix_on_abstract_model(vllm_config):
+        return False
+    if getattr(vllm_config.model_config.hf_config, "quantization_config",
+               None):
+        return False
+    return True
+
 # List of architectures that don't have pipeline parallelism support in jax yet.
 _PP_DISABLED_MODELS: frozenset[str] = frozenset(
     {"DeepseekV3ForCausalLM", "Eagle3LlamaForCausalLM", "GptOssForCausalLM"})
@@ -138,7 +172,18 @@ def _get_nnx_model(
                                             apply_to_abstract_model=False)
         return model
 
-    if vllm_config.load_config.load_format == "dummy" and not issubclass(
+    if _use_abstract_dummy_bootstrap(vllm_config, model_class):
+        # Fast startup: create abstract model structure without allocating
+        # real weights. The caller (e.g. Marin) will inject real weights
+        # via sync_weights() / _sync_weights() after engine startup.
+        logger.info(
+            "Using abstract dummy bootstrap for %s (fast startup mode)",
+            model_class.__name__)
+        with jax.set_mesh(mesh):
+            model = nnx.eval_shape(create_abstract_model)
+        return model
+
+    elif vllm_config.load_config.load_format == "dummy" and not issubclass(
             model_class, LoadableWithIterator):
         # Create a sharded model with random inited weights.
         # TODO: currently Qwen2ForCausalLM is using legacy model implementation
@@ -481,6 +526,18 @@ def resolve_model_architecture(vllm_config: VllmConfig) -> str:
         f"Expected exactly one architecture, got {len(architectures)}: "
         f"{architectures}")
     arch = architectures[0]
+
+    # When fast bootstrap is requested, prefer flax_nnx for architectures
+    # that have JAX implementations and support abstract dummy bootstrap,
+    # even if the default steady-state preference is "vllm".
+    bootstrap = _get_tpu_bootstrap_config(vllm_config)
+    if (bootstrap.get("prefer_jax_for_bootstrap")
+            and arch in _ABSTRACT_BOOTSTRAP_ARCHITECTURES):
+        logger.info(
+            "Bootstrap-aware routing: preferring flax_nnx for %s "
+            "(overriding _VLLM_PREFERRED_ARCHITECTURES)", arch)
+        return "flax_nnx"
+
     impl = "vllm" if arch in _VLLM_PREFERRED_ARCHITECTURES else "flax_nnx"
     return impl
 
