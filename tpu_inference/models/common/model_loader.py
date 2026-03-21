@@ -58,6 +58,13 @@ _ABSTRACT_BOOTSTRAP_ARCHITECTURES: frozenset[str] = frozenset({
     "LlamaForCausalLM",
 })
 
+# Architectures that prefer_jax_for_bootstrap is allowed to reroute from
+# "vllm" to "flax_nnx". This is NOT the full JAX registry — only models
+# we have explicitly vetted for bootstrap-mode routing.
+_BOOTSTRAP_JAX_ROUTING_ALLOWLIST: frozenset[str] = frozenset({
+    "Qwen3MoeForCausalLM",
+})
+
 
 @dataclass(frozen=True)
 class TpuBootstrapConfig:
@@ -97,8 +104,14 @@ def _use_abstract_dummy_bootstrap(vllm_config: VllmConfig,
         return False
     if apply_qwix_on_abstract_model(vllm_config):
         return False
+    # Reject if any quantization is active — check both HF config
+    # (hf_config.quantization_config) and vLLM/TPU quantization
+    # (model_config.quantization), since TPU quantization is selected
+    # via the latter path independently of HF config.
     if getattr(vllm_config.model_config.hf_config, "quantization_config",
                None):
+        return False
+    if getattr(vllm_config.model_config, "quantization", None):
         return False
     return True
 
@@ -547,20 +560,18 @@ def resolve_model_architecture(vllm_config: VllmConfig) -> str:
         f"{architectures}")
     arch = architectures[0]
 
-    # When fast bootstrap is requested, prefer flax_nnx for architectures
-    # that have JAX implementations, even if the default steady-state
-    # preference is "vllm". This lets models like Qwen3-MoE use the
-    # efficient LoadableWithIterator path instead of the PyTorch wrapper.
+    # When fast bootstrap is requested, allow specific architectures that
+    # are normally vllm-preferred to route through flax_nnx instead.
+    # This is an explicit allowlist — not every JAX-registered model is
+    # safe to reroute (e.g. GptOssForCausalLM is JAX-registered but
+    # should stay on the vllm path).
     bootstrap = TpuBootstrapConfig.from_vllm_config(vllm_config)
-    if bootstrap.prefer_jax_for_bootstrap:
-        try:
-            _get_model_architecture(vllm_config.model_config.hf_config)
-            logger.info(
-                "Bootstrap-aware routing: preferring flax_nnx for %s "
-                "(overriding _VLLM_PREFERRED_ARCHITECTURES)", arch)
-            return "flax_nnx"
-        except UnsupportedArchitectureError:
-            pass
+    if (bootstrap.prefer_jax_for_bootstrap
+            and arch in _BOOTSTRAP_JAX_ROUTING_ALLOWLIST):
+        logger.info(
+            "Bootstrap-aware routing: preferring flax_nnx for %s "
+            "(overriding _VLLM_PREFERRED_ARCHITECTURES)", arch)
+        return "flax_nnx"
 
     impl = "vllm" if arch in _VLLM_PREFERRED_ARCHITECTURES else "flax_nnx"
     return impl
