@@ -574,7 +574,9 @@ class TestAbstractDummyBootstrap:
     def test_enabled_for_llama(self, vllm_config):
         vllm_config.load_config.load_format = "dummy"
         vllm_config.load_config.model_loader_extra_config = {
-            "tpu_bootstrap": {"model_bootstrap": "abstract_dummy"}
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_dummy"
+            }
         }
         model_class = self._make_mock_class("LlamaForCausalLM")
         assert model_loader._use_abstract_dummy_bootstrap(
@@ -585,7 +587,9 @@ class TestAbstractDummyBootstrap:
         the abstract dummy bootstrap override."""
         vllm_config.load_config.load_format = "dummy"
         vllm_config.load_config.model_loader_extra_config = {
-            "tpu_bootstrap": {"model_bootstrap": "abstract_dummy"}
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_dummy"
+            }
         }
         model_class = self._make_mock_class("Qwen3ForCausalLM")
         assert model_loader._use_abstract_dummy_bootstrap(
@@ -601,7 +605,9 @@ class TestAbstractDummyBootstrap:
     def test_disabled_for_non_dummy_format(self, vllm_config):
         vllm_config.load_config.load_format = "auto"
         vllm_config.load_config.model_loader_extra_config = {
-            "tpu_bootstrap": {"model_bootstrap": "abstract_dummy"}
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_dummy"
+            }
         }
         model_class = self._make_mock_class("LlamaForCausalLM")
         assert model_loader._use_abstract_dummy_bootstrap(
@@ -610,7 +616,9 @@ class TestAbstractDummyBootstrap:
     def test_disabled_with_hf_quantization_config(self, vllm_config):
         vllm_config.load_config.load_format = "dummy"
         vllm_config.load_config.model_loader_extra_config = {
-            "tpu_bootstrap": {"model_bootstrap": "abstract_dummy"}
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_dummy"
+            }
         }
         vllm_config.model_config.hf_config.quantization_config = {
             "quant_method": "gptq"
@@ -624,7 +632,9 @@ class TestAbstractDummyBootstrap:
         should also block abstract dummy bootstrap."""
         vllm_config.load_config.load_format = "dummy"
         vllm_config.load_config.model_loader_extra_config = {
-            "tpu_bootstrap": {"model_bootstrap": "abstract_dummy"}
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_dummy"
+            }
         }
         vllm_config.model_config.quantization = "tpu_int8"
         model_class = self._make_mock_class("LlamaForCausalLM")
@@ -651,7 +661,9 @@ class TestBootstrapAwareRouting:
             "Qwen3MoeForCausalLM"
         ]
         vllm_config.load_config.model_loader_extra_config = {
-            "tpu_bootstrap": {"prefer_jax_for_bootstrap": True}
+            "tpu_bootstrap": {
+                "prefer_jax_for_bootstrap": True
+            }
         }
         result = model_loader.resolve_model_architecture(vllm_config)
         assert result == "flax_nnx"
@@ -660,9 +672,7 @@ class TestBootstrapAwareRouting:
     def test_llama_routes_to_flax_by_default(self, vllm_config):
         """Llama is not in _VLLM_PREFERRED_ARCHITECTURES, so it routes
         to flax_nnx without any bootstrap config."""
-        vllm_config.model_config.hf_config.architectures = [
-            "LlamaForCausalLM"
-        ]
+        vllm_config.model_config.hf_config.architectures = ["LlamaForCausalLM"]
         result = model_loader.resolve_model_architecture(vllm_config)
         assert result == "flax_nnx"
 
@@ -670,11 +680,11 @@ class TestBootstrapAwareRouting:
     def test_unsupported_arch_falls_through(self, vllm_config):
         """For unsupported architectures, prefer_jax_for_bootstrap doesn't
         override — falls through to default logic."""
-        vllm_config.model_config.hf_config.architectures = [
-            "TotallyFakeModel"
-        ]
+        vllm_config.model_config.hf_config.architectures = ["TotallyFakeModel"]
         vllm_config.load_config.model_loader_extra_config = {
-            "tpu_bootstrap": {"prefer_jax_for_bootstrap": True}
+            "tpu_bootstrap": {
+                "prefer_jax_for_bootstrap": True
+            }
         }
         result = model_loader.resolve_model_architecture(vllm_config)
         assert result == "flax_nnx"  # not in _VLLM_PREFERRED
@@ -688,7 +698,9 @@ class TestBootstrapAwareRouting:
             "GptOssForCausalLM"
         ]
         vllm_config.load_config.model_loader_extra_config = {
-            "tpu_bootstrap": {"prefer_jax_for_bootstrap": True}
+            "tpu_bootstrap": {
+                "prefer_jax_for_bootstrap": True
+            }
         }
         result = model_loader.resolve_model_architecture(vllm_config)
         assert result == "vllm"
