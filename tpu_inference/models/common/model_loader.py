@@ -115,6 +115,7 @@ def _use_abstract_dummy_bootstrap(vllm_config: VllmConfig,
         return False
     return True
 
+
 # List of architectures that don't have pipeline parallelism support in jax yet.
 _PP_DISABLED_MODELS: frozenset[str] = frozenset(
     {"DeepseekV3ForCausalLM", "Eagle3LlamaForCausalLM", "GptOssForCausalLM"})

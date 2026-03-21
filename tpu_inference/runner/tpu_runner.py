@@ -317,8 +317,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         materialized yet), nnx.Rngs(...).params() can stall because it
         tries to interact with abstract state. Use a direct JAX key instead.
         """
-        from tpu_inference.models.common.model_loader import (
-            TpuBootstrapConfig)
+        from tpu_inference.models.common.model_loader import TpuBootstrapConfig
         bootstrap = TpuBootstrapConfig.from_vllm_config(self.vllm_config)
         key = jax.random.key(self.model_config.seed)
         if bootstrap.model_bootstrap == "abstract_dummy":
