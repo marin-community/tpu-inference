@@ -318,10 +318,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         tries to interact with abstract state. Use a direct JAX key instead.
         """
         from tpu_inference.models.common.model_loader import (
-            _get_tpu_bootstrap_config)
-        bootstrap = _get_tpu_bootstrap_config(self.vllm_config)
+            TpuBootstrapConfig)
+        bootstrap = TpuBootstrapConfig.from_vllm_config(self.vllm_config)
         key = jax.random.key(self.model_config.seed)
-        if bootstrap.get("model_bootstrap") == "abstract_dummy":
+        if bootstrap.model_bootstrap == "abstract_dummy":
             return key
         return nnx.Rngs(key).params()
 

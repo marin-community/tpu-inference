@@ -296,20 +296,6 @@ class KVCacheManager:
 
         kv_caches = self.runner.kv_caches
         num_blocks_list = []
-
-        # Check for bootstrap KV block cap from tpu_bootstrap config.
-        # When set, limits the number of KV cache blocks allocated at startup
-        # for fast engine readiness. The caller can reinitialize with a larger
-        # cache before serving traffic.
-        from tpu_inference.models.common.model_loader import (
-            _get_tpu_bootstrap_config)
-        bootstrap = _get_tpu_bootstrap_config(self.runner.vllm_config)
-        kv_bootstrap_blocks = bootstrap.get("kv_bootstrap_blocks")
-        if kv_bootstrap_blocks is not None:
-            logger.info(
-                "KV cache bootstrap: capping num_blocks to %d "
-                "(fast startup mode)", kv_bootstrap_blocks)
-
         for i, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
             layer_name = kv_cache_tensor.shared_by[0]
             layer_spec = layer_name_to_spec[layer_name]
@@ -320,9 +306,6 @@ class KVCacheManager:
             dp_size = self.runner.vllm_config.sharding_config.total_dp_size
             # num_blocks must be a multiple of dp_size
             num_blocks = (num_blocks // dp_size) * dp_size
-
-            if kv_bootstrap_blocks is not None:
-                num_blocks = min(num_blocks, kv_bootstrap_blocks)
             # NOTE: we'll multiply the num_kv_heads by 2 in the function
             if self.use_mla:
                 head_size = self.runner.model_config.hf_config.kv_lora_rank + \

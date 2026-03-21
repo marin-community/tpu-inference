@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import jax
@@ -48,27 +49,46 @@ _MODEL_REGISTRY = {}
 _VLLM_PREFERRED_ARCHITECTURES: frozenset[str] = frozenset(
     {"GptOssForCausalLM", "Qwen3MoeForCausalLM"})
 
-# Architectures that have JAX implementations and can use abstract dummy
-# bootstrap for fast startup (skip expensive random-init weight materialization).
+# Architectures that need abstract dummy bootstrap for fast startup.
+# Only includes models that do NOT implement LoadableWithIterator and
+# therefore fall into the expensive concrete random-init branch.
+# Qwen3/Qwen3MoE already implement LoadableWithIterator and take the
+# efficient abstract path natively — they don't need this override.
 _ABSTRACT_BOOTSTRAP_ARCHITECTURES: frozenset[str] = frozenset({
     "LlamaForCausalLM",
-    "Qwen3ForCausalLM",
-    "Qwen3MoeForCausalLM",
 })
 
 
-def _get_tpu_bootstrap_config(vllm_config: VllmConfig) -> dict:
-    """Extract TPU bootstrap config from model_loader_extra_config."""
-    extra = getattr(vllm_config.load_config, "model_loader_extra_config",
-                    None) or {}
-    return extra.get("tpu_bootstrap", {})
+@dataclass(frozen=True)
+class TpuBootstrapConfig:
+    """Typed config for TPU fast bootstrap, extracted from model_loader_extra_config."""
+    model_bootstrap: str = "default"
+    prefer_jax_for_bootstrap: bool = False
+
+    @classmethod
+    def from_vllm_config(cls, vllm_config: VllmConfig) -> "TpuBootstrapConfig":
+        extra = getattr(vllm_config.load_config, "model_loader_extra_config",
+                        None) or {}
+        raw = extra.get("tpu_bootstrap", {})
+        if not isinstance(raw, dict):
+            return cls()
+        model_bootstrap = raw.get("model_bootstrap", "default")
+        if model_bootstrap not in ("default", "abstract_dummy"):
+            raise ValueError(
+                f"Invalid tpu_bootstrap.model_bootstrap: {model_bootstrap!r}. "
+                "Valid options: 'default', 'abstract_dummy'")
+        return cls(
+            model_bootstrap=model_bootstrap,
+            prefer_jax_for_bootstrap=bool(
+                raw.get("prefer_jax_for_bootstrap", False)),
+        )
 
 
 def _use_abstract_dummy_bootstrap(vllm_config: VllmConfig,
                                   model_class: Any) -> bool:
     """Check if abstract dummy bootstrap should be used for fast startup."""
-    bootstrap = _get_tpu_bootstrap_config(vllm_config)
-    if bootstrap.get("model_bootstrap") != "abstract_dummy":
+    bootstrap = TpuBootstrapConfig.from_vllm_config(vllm_config)
+    if bootstrap.model_bootstrap != "abstract_dummy":
         return False
     if vllm_config.load_config.load_format != "dummy":
         return False
@@ -528,15 +548,19 @@ def resolve_model_architecture(vllm_config: VllmConfig) -> str:
     arch = architectures[0]
 
     # When fast bootstrap is requested, prefer flax_nnx for architectures
-    # that have JAX implementations and support abstract dummy bootstrap,
-    # even if the default steady-state preference is "vllm".
-    bootstrap = _get_tpu_bootstrap_config(vllm_config)
-    if (bootstrap.get("prefer_jax_for_bootstrap")
-            and arch in _ABSTRACT_BOOTSTRAP_ARCHITECTURES):
-        logger.info(
-            "Bootstrap-aware routing: preferring flax_nnx for %s "
-            "(overriding _VLLM_PREFERRED_ARCHITECTURES)", arch)
-        return "flax_nnx"
+    # that have JAX implementations, even if the default steady-state
+    # preference is "vllm". This lets models like Qwen3-MoE use the
+    # efficient LoadableWithIterator path instead of the PyTorch wrapper.
+    bootstrap = TpuBootstrapConfig.from_vllm_config(vllm_config)
+    if bootstrap.prefer_jax_for_bootstrap:
+        try:
+            _get_model_architecture(vllm_config.model_config.hf_config)
+            logger.info(
+                "Bootstrap-aware routing: preferring flax_nnx for %s "
+                "(overriding _VLLM_PREFERRED_ARCHITECTURES)", arch)
+            return "flax_nnx"
+        except UnsupportedArchitectureError:
+            pass
 
     impl = "vllm" if arch in _VLLM_PREFERRED_ARCHITECTURES else "flax_nnx"
     return impl
