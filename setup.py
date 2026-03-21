@@ -79,7 +79,10 @@ setup(
     author="tpu_inference Contributors",
     packages=find_packages(),
     python_requires=">=3.10",
-    install_requires=get_requirements(),
+    # Marin fork: don't bundle install_requires from requirements.txt.
+    # The dependency environment is provided by vllm-tpu; this package
+    # only needs to override the tpu_inference Python code.
+    install_requires=[],
     include_package_data=True,
     classifiers=[
         "Development Status :: 3 - Alpha",
