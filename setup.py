@@ -79,10 +79,11 @@ setup(
     author="tpu_inference Contributors",
     packages=find_packages(),
     python_requires=">=3.10",
-    # Marin fork: don't bundle install_requires from requirements.txt.
-    # The dependency environment is provided by vllm-tpu; this package
-    # only needs to override the tpu_inference Python code.
-    install_requires=[],
+    # Marin fork: only include runtime deps that vllm-tpu doesn't provide.
+    # Skip jax/jaxlib/gcsfs (conflict with Marin pins) and test-only deps.
+    install_requires=[
+        "tpu-info>=0.7.1",
+    ],
     include_package_data=True,
     classifiers=[
         "Development Status :: 3 - Alpha",
