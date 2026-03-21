@@ -607,7 +607,7 @@ class TestAbstractDummyBootstrap:
         assert model_loader._use_abstract_dummy_bootstrap(
             vllm_config, model_class) is False
 
-    def test_disabled_with_quantization(self, vllm_config):
+    def test_disabled_with_hf_quantization_config(self, vllm_config):
         vllm_config.load_config.load_format = "dummy"
         vllm_config.load_config.model_loader_extra_config = {
             "tpu_bootstrap": {"model_bootstrap": "abstract_dummy"}
@@ -615,6 +615,18 @@ class TestAbstractDummyBootstrap:
         vllm_config.model_config.hf_config.quantization_config = {
             "quant_method": "gptq"
         }
+        model_class = self._make_mock_class("LlamaForCausalLM")
+        assert model_loader._use_abstract_dummy_bootstrap(
+            vllm_config, model_class) is False
+
+    def test_disabled_with_tpu_quantization(self, vllm_config):
+        """TPU quantization via model_config.quantization (e.g. 'tpu_int8')
+        should also block abstract dummy bootstrap."""
+        vllm_config.load_config.load_format = "dummy"
+        vllm_config.load_config.model_loader_extra_config = {
+            "tpu_bootstrap": {"model_bootstrap": "abstract_dummy"}
+        }
+        vllm_config.model_config.quantization = "tpu_int8"
         model_class = self._make_mock_class("LlamaForCausalLM")
         assert model_loader._use_abstract_dummy_bootstrap(
             vllm_config, model_class) is False
@@ -666,3 +678,17 @@ class TestBootstrapAwareRouting:
         }
         result = model_loader.resolve_model_architecture(vllm_config)
         assert result == "flax_nnx"  # not in _VLLM_PREFERRED
+
+    @patch.dict(os.environ, {"MODEL_IMPL_TYPE": "auto"}, clear=True)
+    def test_gptoss_not_rerouted_by_bootstrap(self, vllm_config):
+        """GptOssForCausalLM is JAX-registered AND vllm-preferred.
+        prefer_jax_for_bootstrap must NOT reroute it because it is not
+        in the explicit _BOOTSTRAP_JAX_ROUTING_ALLOWLIST."""
+        vllm_config.model_config.hf_config.architectures = [
+            "GptOssForCausalLM"
+        ]
+        vllm_config.load_config.model_loader_extra_config = {
+            "tpu_bootstrap": {"prefer_jax_for_bootstrap": True}
+        }
+        result = model_loader.resolve_model_architecture(vllm_config)
+        assert result == "vllm"
