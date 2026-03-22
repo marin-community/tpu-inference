@@ -148,7 +148,7 @@ def _build_abstract_model_and_load_weights(
         loader = get_model_loader(vllm_config.load_config)
         if isinstance(loader, RunaiModelStreamerLoader):
             model_weights = vllm_config.model_config.model
-            if hasattr(vllm_config.model_config, "model_weights"):
+            if getattr(vllm_config.model_config, "model_weights", ""):
                 model_weights = vllm_config.model_config.model_weights
             weights_iterator = loader._get_weights_iterator(
                 model_weights, vllm_config.model_config.revision)

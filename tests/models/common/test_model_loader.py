@@ -760,6 +760,33 @@ class TestAbstractLoadBehavior:
         create_jit.assert_called_once()
         assert result is mock_jit_result
 
+    @patch("tpu_inference.models.common.model_loader._build_abstract_model_and_load_weights")
+    @patch("tpu_inference.models.common.model_loader._resolved_bootstrap_mode")
+    def test_get_nnx_model_dispatches_abstract_load(
+            self, mock_mode, mock_build):
+        """Core regression test: _get_nnx_model() takes the abstract_load
+        branch and returns the jitted model (not the bare abstract model)."""
+        mock_mode.return_value = "abstract_load"
+        sentinel = MagicMock(name="jit_model_sentinel")
+        mock_build.return_value = sentinel
+
+        fake_model_class = type("LlamaForCausalLM", (), {})
+        vllm_config = MagicMock()
+        rng = MagicMock()
+        mesh = MagicMock()
+
+        result = model_loader._get_nnx_model(
+            fake_model_class, vllm_config, rng, mesh)
+
+        mock_mode.assert_called_once_with(vllm_config, fake_model_class)
+        mock_build.assert_called_once()
+        # The first two args are the closures; verify config/rng/mesh pass-through
+        call_args = mock_build.call_args
+        assert call_args[0][2] is vllm_config
+        assert call_args[0][3] is rng
+        assert call_args[0][4] is mesh
+        assert result is sentinel
+
 
 class TestBootstrapAwareRouting:
     """Tests for bootstrap-aware architecture routing in get_model."""
