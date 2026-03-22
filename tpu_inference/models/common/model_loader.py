@@ -221,11 +221,16 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     _MODEL_REGISTRY["GptOssForCausalLM"] = GptOss
 
     architectures = getattr(config, "architectures", [])
+    model_type = getattr(config, "model_type", "unknown")
+    logger.info(
+        "Architecture lookup: hf_config.architectures=%s, "
+        "hf_config.model_type=%s, JAX registry keys=%s",
+        architectures, model_type, list(_MODEL_REGISTRY.keys()))
     for arch in architectures:
         if arch in _MODEL_REGISTRY:
             return _MODEL_REGISTRY[arch]
     raise UnsupportedArchitectureError(
-        f"Model architectures {architectures} not "
+        f"Model architectures {architectures} (model_type={model_type}) not "
         "registered in tpu-inference. Falling back to vLLM-native "
         f"Pytorch definition. JAX-native architectures: {list(_MODEL_REGISTRY.keys())}"
     )
@@ -482,12 +487,17 @@ def get_model(
     is_draft_model: bool = False,
 ) -> Any:
     impl = envs.MODEL_IMPL_TYPE
-    logger.info(f"Loading model with MODEL_IMPL_TYPE={impl}")
+    hf_config = vllm_config.model_config.hf_config
+    architectures = getattr(hf_config, "architectures", [])
+    model_type = getattr(hf_config, "model_type", "unknown")
+    model_path = getattr(vllm_config.model_config, "model", "unknown")
+    logger.info(
+        "Loading model with MODEL_IMPL_TYPE=%s | model=%s | "
+        "hf_config.architectures=%s | hf_config.model_type=%s",
+        impl, model_path, architectures, model_type)
 
     if impl == "auto":
         # Resolve "auto" based on architecture
-        architectures = getattr(vllm_config.model_config.hf_config,
-                                "architectures", [])
         assert len(architectures) == 1, (
             f"Expected exactly one architecture, got {len(architectures)}: "
             f"{architectures}")
