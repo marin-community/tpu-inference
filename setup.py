@@ -86,7 +86,12 @@ setup(
     author="tpu_inference Contributors",
     packages=find_packages(),
     python_requires=">=3.10",
-    install_requires=[],  # empty — vllm-tpu provides all deps
+    install_requires=[
+        "tpu-info",
+        "torchax",
+        "qwix",
+        "runai-model-streamer[s3,gcs]",
+    ],
     include_package_data=True,
     classifiers=[
         "Development Status :: 3 - Alpha",
