@@ -60,14 +60,18 @@ _BOOTSTRAP_JAX_ROUTING_ALLOWLIST: frozenset[str] = frozenset()
 
 @dataclass(frozen=True)
 class TpuBootstrapConfig:
-    """Typed config for TPU fast bootstrap, extracted from model_loader_extra_config."""
+    """Typed config for TPU fast bootstrap, extracted from additional_config.
+
+    Uses vllm_config.additional_config (not model_loader_extra_config)
+    because vLLM's dummy loader rejects any model_loader_extra_config.
+    Pass via CLI: --additional-config '{"tpu_bootstrap": {...}}'
+    """
     model_bootstrap: str = "default"
     prefer_jax_for_bootstrap: bool = False
 
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> "TpuBootstrapConfig":
-        extra = getattr(vllm_config.load_config, "model_loader_extra_config",
-                        None) or {}
+        extra = getattr(vllm_config, "additional_config", None) or {}
         raw = extra.get("tpu_bootstrap", {})
         if not isinstance(raw, dict):
             return cls()

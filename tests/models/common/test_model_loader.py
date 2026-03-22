@@ -470,7 +470,7 @@ class TestTpuBootstrapConfig:
         assert config.prefer_jax_for_bootstrap is False
 
     def test_abstract_dummy_config(self, vllm_config):
-        vllm_config.load_config.model_loader_extra_config = {
+        vllm_config.additional_config = {
             "tpu_bootstrap": {
                 "model_bootstrap": "abstract_dummy",
             }
@@ -480,7 +480,7 @@ class TestTpuBootstrapConfig:
         assert config.prefer_jax_for_bootstrap is False
 
     def test_prefer_jax_config(self, vllm_config):
-        vllm_config.load_config.model_loader_extra_config = {
+        vllm_config.additional_config = {
             "tpu_bootstrap": {
                 "prefer_jax_for_bootstrap": True,
             }
@@ -490,7 +490,7 @@ class TestTpuBootstrapConfig:
         assert config.prefer_jax_for_bootstrap is True
 
     def test_invalid_model_bootstrap_raises(self, vllm_config):
-        vllm_config.load_config.model_loader_extra_config = {
+        vllm_config.additional_config = {
             "tpu_bootstrap": {
                 "model_bootstrap": "invalid_value",
             }
@@ -499,12 +499,12 @@ class TestTpuBootstrapConfig:
             model_loader.TpuBootstrapConfig.from_vllm_config(vllm_config)
 
     def test_missing_extra_config(self, vllm_config):
-        vllm_config.load_config.model_loader_extra_config = None
+        vllm_config.additional_config = None
         config = model_loader.TpuBootstrapConfig.from_vllm_config(vllm_config)
         assert config.model_bootstrap == "default"
 
     def test_empty_extra_config(self, vllm_config):
-        vllm_config.load_config.model_loader_extra_config = {}
+        vllm_config.additional_config = {}
         config = model_loader.TpuBootstrapConfig.from_vllm_config(vllm_config)
         assert config.model_bootstrap == "default"
 
@@ -517,7 +517,7 @@ class TestAbstractDummyBootstrap:
 
     def test_enabled_for_llama(self, vllm_config):
         vllm_config.load_config.load_format = "dummy"
-        vllm_config.load_config.model_loader_extra_config = {
+        vllm_config.additional_config = {
             "tpu_bootstrap": {
                 "model_bootstrap": "abstract_dummy"
             }
@@ -529,7 +529,7 @@ class TestAbstractDummyBootstrap:
     def test_disabled_for_qwen3(self, vllm_config):
         """Qwen3 is NOT in _ABSTRACT_BOOTSTRAP_ARCHITECTURES on v0.13.2."""
         vllm_config.load_config.load_format = "dummy"
-        vllm_config.load_config.model_loader_extra_config = {
+        vllm_config.additional_config = {
             "tpu_bootstrap": {
                 "model_bootstrap": "abstract_dummy"
             }
@@ -540,14 +540,14 @@ class TestAbstractDummyBootstrap:
 
     def test_disabled_without_opt_in(self, vllm_config):
         vllm_config.load_config.load_format = "dummy"
-        vllm_config.load_config.model_loader_extra_config = {}
+        vllm_config.additional_config = {}
         model_class = self._make_mock_class("LlamaForCausalLM")
         assert model_loader._use_abstract_dummy_bootstrap(
             vllm_config, model_class) is False
 
     def test_disabled_for_non_dummy_format(self, vllm_config):
         vllm_config.load_config.load_format = "auto"
-        vllm_config.load_config.model_loader_extra_config = {
+        vllm_config.additional_config = {
             "tpu_bootstrap": {
                 "model_bootstrap": "abstract_dummy"
             }
@@ -558,7 +558,7 @@ class TestAbstractDummyBootstrap:
 
     def test_disabled_with_hf_quantization_config(self, vllm_config):
         vllm_config.load_config.load_format = "dummy"
-        vllm_config.load_config.model_loader_extra_config = {
+        vllm_config.additional_config = {
             "tpu_bootstrap": {
                 "model_bootstrap": "abstract_dummy"
             }
@@ -574,7 +574,7 @@ class TestAbstractDummyBootstrap:
         """TPU quantization via model_config.quantization (e.g. 'tpu_int8')
         should also block abstract dummy bootstrap."""
         vllm_config.load_config.load_format = "dummy"
-        vllm_config.load_config.model_loader_extra_config = {
+        vllm_config.additional_config = {
             "tpu_bootstrap": {
                 "model_bootstrap": "abstract_dummy"
             }
@@ -629,7 +629,7 @@ class TestBootstrapAwareRouting:
         vllm_config.model_config.hf_config.architectures = [
             "GptOssForCausalLM"
         ]
-        vllm_config.load_config.model_loader_extra_config = {
+        vllm_config.additional_config = {
             "tpu_bootstrap": {
                 "prefer_jax_for_bootstrap": True
             }
