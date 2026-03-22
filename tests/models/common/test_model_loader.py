@@ -71,7 +71,8 @@ def vllm_config() -> MagicMock:
     mock_config.load_config = MagicMock()
     mock_config.load_config.download_dir = None
     mock_config.load_config.load_format = "auto"
-    mock_config.additional_config = {}
+    mock_config.load_config.model_loader_extra_config = dict()
+    mock_config.additional_config = dict()
     mock_config.cache_config = MagicMock(cache_dtype="auto")
     mock_config.parallel_config = ParallelConfig(pipeline_parallel_size=1)
     return mock_config
@@ -452,4 +453,189 @@ class TestGetModel:
 
         mock_get_flax.assert_not_called()
         mock_get_vllm.assert_called_once_with(vllm_config, rng, mesh)
+        assert result == "vllm_model_sentinel"
+
+
+# ==============================================================================
+# >> Test Suite for TpuBootstrapConfig and Fast Bootstrap
+# ==============================================================================
+
+
+class TestTpuBootstrapConfig:
+    """Tests for TpuBootstrapConfig parsing and validation."""
+
+    def test_default_config(self, vllm_config):
+        config = model_loader.TpuBootstrapConfig.from_vllm_config(vllm_config)
+        assert config.model_bootstrap == "default"
+        assert config.prefer_jax_for_bootstrap is False
+
+    def test_abstract_dummy_config(self, vllm_config):
+        vllm_config.load_config.model_loader_extra_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_dummy",
+            }
+        }
+        config = model_loader.TpuBootstrapConfig.from_vllm_config(vllm_config)
+        assert config.model_bootstrap == "abstract_dummy"
+        assert config.prefer_jax_for_bootstrap is False
+
+    def test_prefer_jax_config(self, vllm_config):
+        vllm_config.load_config.model_loader_extra_config = {
+            "tpu_bootstrap": {
+                "prefer_jax_for_bootstrap": True,
+            }
+        }
+        config = model_loader.TpuBootstrapConfig.from_vllm_config(vllm_config)
+        assert config.model_bootstrap == "default"
+        assert config.prefer_jax_for_bootstrap is True
+
+    def test_invalid_model_bootstrap_raises(self, vllm_config):
+        vllm_config.load_config.model_loader_extra_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "invalid_value",
+            }
+        }
+        with pytest.raises(ValueError, match="Invalid tpu_bootstrap"):
+            model_loader.TpuBootstrapConfig.from_vllm_config(vllm_config)
+
+    def test_missing_extra_config(self, vllm_config):
+        vllm_config.load_config.model_loader_extra_config = None
+        config = model_loader.TpuBootstrapConfig.from_vllm_config(vllm_config)
+        assert config.model_bootstrap == "default"
+
+    def test_empty_extra_config(self, vllm_config):
+        vllm_config.load_config.model_loader_extra_config = {}
+        config = model_loader.TpuBootstrapConfig.from_vllm_config(vllm_config)
+        assert config.model_bootstrap == "default"
+
+
+class TestAbstractDummyBootstrap:
+    """Tests for _use_abstract_dummy_bootstrap gating logic."""
+
+    def _make_mock_class(self, name):
+        return type(name, (), {})
+
+    def test_enabled_for_llama(self, vllm_config):
+        vllm_config.load_config.load_format = "dummy"
+        vllm_config.load_config.model_loader_extra_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_dummy"
+            }
+        }
+        model_class = self._make_mock_class("LlamaForCausalLM")
+        assert model_loader._use_abstract_dummy_bootstrap(
+            vllm_config, model_class) is True
+
+    def test_disabled_for_qwen3(self, vllm_config):
+        """Qwen3 is NOT in _ABSTRACT_BOOTSTRAP_ARCHITECTURES on v0.13.2."""
+        vllm_config.load_config.load_format = "dummy"
+        vllm_config.load_config.model_loader_extra_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_dummy"
+            }
+        }
+        model_class = self._make_mock_class("Qwen3ForCausalLM")
+        assert model_loader._use_abstract_dummy_bootstrap(
+            vllm_config, model_class) is False
+
+    def test_disabled_without_opt_in(self, vllm_config):
+        vllm_config.load_config.load_format = "dummy"
+        vllm_config.load_config.model_loader_extra_config = {}
+        model_class = self._make_mock_class("LlamaForCausalLM")
+        assert model_loader._use_abstract_dummy_bootstrap(
+            vllm_config, model_class) is False
+
+    def test_disabled_for_non_dummy_format(self, vllm_config):
+        vllm_config.load_config.load_format = "auto"
+        vllm_config.load_config.model_loader_extra_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_dummy"
+            }
+        }
+        model_class = self._make_mock_class("LlamaForCausalLM")
+        assert model_loader._use_abstract_dummy_bootstrap(
+            vllm_config, model_class) is False
+
+    def test_disabled_with_hf_quantization_config(self, vllm_config):
+        vllm_config.load_config.load_format = "dummy"
+        vllm_config.load_config.model_loader_extra_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_dummy"
+            }
+        }
+        vllm_config.model_config.hf_config.quantization_config = {
+            "quant_method": "gptq"
+        }
+        model_class = self._make_mock_class("LlamaForCausalLM")
+        assert model_loader._use_abstract_dummy_bootstrap(
+            vllm_config, model_class) is False
+
+    def test_disabled_with_tpu_quantization(self, vllm_config):
+        """TPU quantization via model_config.quantization (e.g. 'tpu_int8')
+        should also block abstract dummy bootstrap."""
+        vllm_config.load_config.load_format = "dummy"
+        vllm_config.load_config.model_loader_extra_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_dummy"
+            }
+        }
+        vllm_config.model_config.quantization = "tpu_int8"
+        model_class = self._make_mock_class("LlamaForCausalLM")
+        assert model_loader._use_abstract_dummy_bootstrap(
+            vllm_config, model_class) is False
+
+
+class TestBootstrapAwareRouting:
+    """Tests for bootstrap-aware architecture routing in get_model."""
+
+    @patch.dict(os.environ, {"MODEL_IMPL_TYPE": "auto"}, clear=True)
+    @patch("tpu_inference.models.common.model_loader.get_vllm_model")
+    @patch("tpu_inference.models.common.model_loader.get_flax_model")
+    def test_gptoss_defaults_to_vllm(self, mock_get_flax, mock_get_vllm,
+                                     vllm_config, rng, mesh):
+        """Without bootstrap config, GptOss routes to vllm."""
+        vllm_config.model_config.hf_config.architectures = [
+            "GptOssForCausalLM"
+        ]
+        mock_get_vllm.return_value = "vllm_model_sentinel"
+        result = model_loader.get_model(vllm_config, rng, mesh)
+        mock_get_flax.assert_not_called()
+        mock_get_vllm.assert_called_once()
+        assert result == "vllm_model_sentinel"
+
+    @patch.dict(os.environ, {"MODEL_IMPL_TYPE": "auto"}, clear=True)
+    @patch("tpu_inference.models.common.model_loader.get_vllm_model")
+    @patch("tpu_inference.models.common.model_loader.get_flax_model")
+    def test_llama_routes_to_flax_by_default(self, mock_get_flax,
+                                             mock_get_vllm, vllm_config, rng,
+                                             mesh):
+        """Llama is not in _VLLM_PREFERRED_ARCHITECTURES, so it routes
+        to flax_nnx without any bootstrap config."""
+        vllm_config.model_config.hf_config.architectures = ["LlamaForCausalLM"]
+        mock_get_flax.return_value = "flax_model_sentinel"
+        result = model_loader.get_model(vllm_config, rng, mesh)
+        mock_get_flax.assert_called_once()
+        mock_get_vllm.assert_not_called()
+        assert result == "flax_model_sentinel"
+
+    @patch.dict(os.environ, {"MODEL_IMPL_TYPE": "auto"}, clear=True)
+    @patch("tpu_inference.models.common.model_loader.get_vllm_model")
+    @patch("tpu_inference.models.common.model_loader.get_flax_model")
+    def test_gptoss_not_rerouted_by_bootstrap(self, mock_get_flax,
+                                              mock_get_vllm, vllm_config, rng,
+                                              mesh):
+        """GptOssForCausalLM is vllm-preferred. prefer_jax_for_bootstrap
+        must NOT reroute it because it is not in _BOOTSTRAP_JAX_ROUTING_ALLOWLIST."""
+        vllm_config.model_config.hf_config.architectures = [
+            "GptOssForCausalLM"
+        ]
+        vllm_config.load_config.model_loader_extra_config = {
+            "tpu_bootstrap": {
+                "prefer_jax_for_bootstrap": True
+            }
+        }
+        mock_get_vllm.return_value = "vllm_model_sentinel"
+        result = model_loader.get_model(vllm_config, rng, mesh)
+        mock_get_flax.assert_not_called()
+        mock_get_vllm.assert_called_once()
         assert result == "vllm_model_sentinel"

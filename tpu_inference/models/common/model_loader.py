@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import jax
@@ -42,6 +43,69 @@ _MODEL_REGISTRY = {}
 # "flax_nnx" implementation due to various factors such as performance.
 _VLLM_PREFERRED_ARCHITECTURES: frozenset[str] = frozenset(
     {"GptOssForCausalLM"})
+
+# Architectures that need abstract dummy bootstrap for fast startup.
+# Only includes models that do NOT implement LoadableWithIterator and
+# therefore fall into the expensive concrete random-init branch.
+_ABSTRACT_BOOTSTRAP_ARCHITECTURES: frozenset[str] = frozenset({
+    "LlamaForCausalLM",
+})
+
+# Architectures that prefer_jax_for_bootstrap is allowed to reroute from
+# "vllm" to "flax_nnx". This is NOT the full JAX registry — only models
+# we have explicitly vetted for bootstrap-mode routing.
+# Empty on v0.13.2 because Qwen3MoeForCausalLM is not in the registry.
+_BOOTSTRAP_JAX_ROUTING_ALLOWLIST: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class TpuBootstrapConfig:
+    """Typed config for TPU fast bootstrap, extracted from model_loader_extra_config."""
+    model_bootstrap: str = "default"
+    prefer_jax_for_bootstrap: bool = False
+
+    @classmethod
+    def from_vllm_config(cls, vllm_config: VllmConfig) -> "TpuBootstrapConfig":
+        extra = getattr(vllm_config.load_config, "model_loader_extra_config",
+                        None) or {}
+        raw = extra.get("tpu_bootstrap", {})
+        if not isinstance(raw, dict):
+            return cls()
+        model_bootstrap = raw.get("model_bootstrap", "default")
+        if model_bootstrap not in ("default", "abstract_dummy"):
+            raise ValueError(
+                f"Invalid tpu_bootstrap.model_bootstrap: {model_bootstrap!r}. "
+                "Valid options: 'default', 'abstract_dummy'")
+        return cls(
+            model_bootstrap=model_bootstrap,
+            prefer_jax_for_bootstrap=bool(
+                raw.get("prefer_jax_for_bootstrap", False)),
+        )
+
+
+def _use_abstract_dummy_bootstrap(vllm_config: VllmConfig,
+                                  model_class: Any) -> bool:
+    """Check if abstract dummy bootstrap should be used for fast startup."""
+    bootstrap = TpuBootstrapConfig.from_vllm_config(vllm_config)
+    if bootstrap.model_bootstrap != "abstract_dummy":
+        return False
+    if vllm_config.load_config.load_format != "dummy":
+        return False
+    arch = model_class.__name__
+    if arch not in _ABSTRACT_BOOTSTRAP_ARCHITECTURES:
+        return False
+    if apply_qwix_on_abstract_model(vllm_config):
+        return False
+    # Reject if any quantization is active — check both HF config
+    # (hf_config.quantization_config) and vLLM/TPU quantization
+    # (model_config.quantization), since TPU quantization is selected
+    # via the latter path independently of HF config.
+    if getattr(vllm_config.model_config.hf_config, "quantization_config",
+               None):
+        return False
+    if getattr(vllm_config.model_config, "quantization", None):
+        return False
+    return True
 
 
 class UnsupportedArchitectureError(ValueError):
@@ -125,7 +189,18 @@ def _get_nnx_model(
                                             apply_to_abstract_model=False)
         return model
 
-    if vllm_config.load_config.load_format == "dummy":
+    if _use_abstract_dummy_bootstrap(vllm_config, model_class):
+        # Fast startup: create abstract model structure without allocating
+        # real weights. The caller (e.g. Marin) will inject real weights
+        # via sync_weights() / _sync_weights() after engine startup.
+        logger.info(
+            "Using abstract dummy bootstrap for %s (fast startup mode)",
+            model_class.__name__)
+        with mesh:
+            model = nnx.eval_shape(create_abstract_model)
+        return model
+
+    elif vllm_config.load_config.load_format == "dummy":
         # Create a sharded model with random inited weights.
         # TODO: currently Qwen2ForCausalLM is using legacy model implementation
         # will merge the random init logic when all model are migrated to new model implementation
@@ -371,7 +446,18 @@ def get_model(
             f"Expected exactly one architecture, got {len(architectures)}: "
             f"{architectures}")
         arch = architectures[0]
-        impl = "vllm" if arch in _VLLM_PREFERRED_ARCHITECTURES else "flax_nnx"
+
+        # When fast bootstrap is requested, allow specific architectures that
+        # are normally vllm-preferred to route through flax_nnx instead.
+        bootstrap = TpuBootstrapConfig.from_vllm_config(vllm_config)
+        if (bootstrap.prefer_jax_for_bootstrap
+                and arch in _BOOTSTRAP_JAX_ROUTING_ALLOWLIST):
+            logger.info(
+                "Bootstrap-aware routing: preferring flax_nnx for %s "
+                "(overriding _VLLM_PREFERRED_ARCHITECTURES)", arch)
+            impl = "flax_nnx"
+        else:
+            impl = "vllm" if arch in _VLLM_PREFERRED_ARCHITECTURES else "flax_nnx"
         logger.info(f"Resolved MODEL_IMPL_TYPE 'auto' to '{impl}'")
 
     match impl:

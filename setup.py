@@ -86,7 +86,7 @@ setup(
     author="tpu_inference Contributors",
     packages=find_packages(),
     python_requires=">=3.10",
-    install_requires=get_requirements(),
+    install_requires=[],  # empty — vllm-tpu provides all deps
     include_package_data=True,
     classifiers=[
         "Development Status :: 3 - Alpha",
