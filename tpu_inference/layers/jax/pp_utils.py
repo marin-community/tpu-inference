@@ -50,4 +50,4 @@ def make_layers(
         + [layer_fn() for _ in range(start_layer, end_layer)] \
         + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]
 
-    return start_layer, end_layer, layers
+    return start_layer, end_layer, nnx.List(layers)
