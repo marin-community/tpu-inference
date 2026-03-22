@@ -13,12 +13,15 @@
 # limitations under the License.
 """Streaming weight loader using fsspec for fast GCS/local safetensors loading.
 
-Adapted from Levanter's fsspec_safetensor.py. Streams weights shard-by-shard,
-chunk-by-chunk sequentially. All arrays materialized on CPU.
-Peak host RAM ≈ chunk_size_bytes (~2 GiB).
+Adapted from Levanter's fsspec_safetensor.py. Streams weights shard-by-shard
+with concurrent chunk downloads within each shard. All arrays materialized on CPU.
+Peak host RAM ≈ shard_size (one shard's chunks in flight at a time).
 """
 
+import asyncio
+import concurrent.futures
 import json
+import os
 import resource
 import struct
 import time
@@ -30,13 +33,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from fsspec import AbstractFileSystem
+from fsspec.asyn import AsyncFileSystem
 
 from tpu_inference.logger import init_logger
 
 logger = init_logger(__name__)
 
 # Safetensors dtype string → numpy dtype.
-# Ported from levanter/compat/fsspec_safetensor.py lines 24-37.
 _SAFETENSOR_DTYPE_MAP: Dict[str, np.dtype] = {
     "F16": np.dtype("float16"),
     "BF16": np.dtype(jnp.bfloat16),
@@ -53,7 +56,10 @@ _SAFETENSOR_DTYPE_MAP: Dict[str, np.dtype] = {
     "BOOL": np.dtype("bool"),
 }
 
-DEFAULT_CHUNK_SIZE_BYTES = 2 * 1024**3  # 2 GiB
+DEFAULT_CHUNK_SIZE_BYTES = int(
+    os.environ.get("FSSPEC_CHUNK_BYTES", 2 * 1024**3))  # 2 GiB
+MAX_CONCURRENT_CHUNKS = int(
+    os.environ.get("FSSPEC_MAX_CONCURRENT_CHUNKS", "8"))
 
 
 @dataclass(frozen=True)
@@ -78,6 +84,37 @@ class ChunkSpec:
     @property
     def size(self) -> int:
         return self.byte_end - self.byte_start
+
+
+class _AsyncifyingFileSystemWrapper(AsyncFileSystem):
+    """Wrap a synchronous fsspec filesystem to provide async methods via a thread pool.
+
+    Ported from Levanter's fsspec_safetensor.py. Allows concurrent chunk
+    downloads using asyncio.gather() + ThreadPoolExecutor, where each download
+    runs in its own thread (releasing the GIL during I/O).
+    """
+
+    def __init__(self, fs: AbstractFileSystem, max_workers: int):
+        super().__init__()
+        self._fs = fs
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers)
+
+    async def _cat_file(
+        self,
+        path: str,
+        start: int | None = None,
+        end: int | None = None,
+        **kwargs,
+    ) -> bytes:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            lambda: self._fs.cat_file(path, start=start, end=end, **kwargs),
+        )
+
+    def shutdown(self):
+        self._executor.shutdown(wait=False)
 
 
 def _get_filesystem(path: str) -> AbstractFileSystem:
@@ -129,10 +166,7 @@ def _read_metadata(fs: AbstractFileSystem, path: str) -> Dict[str, TensorRecord]
 
 
 def _build_chunks(tensors: Iterable[TensorRecord], chunk_limit: int) -> List[ChunkSpec]:
-    """Group tensor records into download chunks respecting byte limit.
-
-    Ported from levanter/compat/fsspec_safetensor.py lines 136-187.
-    """
+    """Group tensor records into download chunks respecting byte limit."""
     if chunk_limit <= 0:
         raise ValueError("chunk_limit must be positive")
 
@@ -192,7 +226,6 @@ def _discover_shards(fs: AbstractFileSystem, model_path: str) -> List[str]:
     Checks for model.safetensors.index.json first (multi-shard),
     then falls back to single model.safetensors file.
     """
-    # Normalize path (strip trailing slash for consistency)
     model_path = model_path.rstrip("/")
 
     # Try multi-shard index first
@@ -201,7 +234,6 @@ def _discover_shards(fs: AbstractFileSystem, model_path: str) -> List[str]:
         index_bytes = fs.cat_file(index_path)
         index_data = json.loads(index_bytes.decode("utf-8"))
         weight_map = index_data.get("weight_map", {})
-        # Get unique shard filenames in sorted order
         shard_files = sorted(set(weight_map.values()))
         full_paths = [f"{model_path}/{f}" for f in shard_files]
         logger.info("Discovered %d shards from index: %s", len(full_paths),
@@ -229,65 +261,124 @@ def _discover_shards(fs: AbstractFileSystem, model_path: str) -> List[str]:
     return found
 
 
+async def _download_shard_concurrent(
+    async_fs: _AsyncifyingFileSystemWrapper,
+    chunks: List[ChunkSpec],
+    cpu_device: jax.Device,
+    max_concurrent: int,
+) -> List[Tuple[str, jax.Array]]:
+    """Download all chunks for a shard concurrently, return (name, array) pairs.
+
+    Uses asyncio.Semaphore to bound the number of in-flight downloads,
+    and asyncio.gather to run them concurrently via the thread pool.
+    Each chunk is downloaded, tensors are materialized on CPU, and the raw
+    bytes are freed immediately after materialization.
+    """
+    semaphore = asyncio.Semaphore(max(1, min(max_concurrent, len(chunks))))
+
+    async def _download_and_materialize(
+        chunk: ChunkSpec,
+    ) -> List[Tuple[str, jax.Array]]:
+        async with semaphore:
+            raw = await async_fs._cat_file(
+                chunk.file_path, start=chunk.byte_start, end=chunk.byte_end)
+            chunk_view = memoryview(raw)
+            results: List[Tuple[str, jax.Array]] = []
+            with jax.default_device(cpu_device):
+                for record in chunk.tensors:
+                    offset = record.byte_start - chunk.byte_start
+                    count = int(np.prod(record.shape, dtype=int))
+                    arr = np.frombuffer(
+                        chunk_view, dtype=record.dtype,
+                        count=count, offset=offset,
+                    ).reshape(record.shape)
+                    results.append((record.key, jnp.asarray(arr)))
+            del chunk_view, raw
+            return results
+
+    all_chunk_results = await asyncio.gather(
+        *(_download_and_materialize(chunk) for chunk in chunks))
+
+    # Flatten: list of lists → single list, preserving chunk order
+    flat: List[Tuple[str, jax.Array]] = []
+    for chunk_results in all_chunk_results:
+        flat.extend(chunk_results)
+    return flat
+
+
 def fsspec_weights_iterator(
     model_path: str,
     *,
     chunk_size_bytes: int = DEFAULT_CHUNK_SIZE_BYTES,
+    max_concurrent_chunks: int = MAX_CONCURRENT_CHUNKS,
 ) -> Iterator[Tuple[str, jax.Array]]:
     """Yield (name, jax.Array) pairs from remote safetensors via fsspec.
 
-    Streams weights shard-by-shard, chunk-by-chunk sequentially.
-    All arrays materialized on CPU. Peak host RAM ≈ chunk_size_bytes.
+    Streams weights shard-by-shard with concurrent chunk downloads within
+    each shard. All arrays materialized on CPU.
+    Peak host RAM ≈ one shard's worth of tensors + concurrent download buffer.
 
     Args:
         model_path: Path to model directory (gs://, local, etc.)
-        chunk_size_bytes: Max bytes per download chunk (default 2 GiB)
+        chunk_size_bytes: Max bytes per download chunk (default 2 GiB,
+            configurable via FSSPEC_CHUNK_BYTES env var)
+        max_concurrent_chunks: Max concurrent chunk downloads (default 8,
+            configurable via FSSPEC_MAX_CONCURRENT_CHUNKS env var)
 
     Yields:
         (tensor_name, jax_array) pairs with arrays on CPU device
     """
     cpu_device = jax.devices("cpu")[0]
     fs = _get_filesystem(model_path)
+    async_fs = _AsyncifyingFileSystemWrapper(fs, max_workers=max_concurrent_chunks)
     shard_files = _discover_shards(fs, model_path)
+    loop = asyncio.new_event_loop()
+
+    logger.info(
+        "fsspec streamer: %d shards, chunk_size=%.0f MiB, "
+        "max_concurrent_chunks=%d",
+        len(shard_files), chunk_size_bytes / 2**20, max_concurrent_chunks)
 
     total_tensors = 0
     total_bytes = 0
     t_all = time.time()
 
-    for shard_file in shard_files:
-        t0 = time.time()
-        records = _read_metadata(fs, shard_file)
-        chunks = _build_chunks(records.values(), chunk_size_bytes)
-        shard_bytes = 0
-        shard_tensors = 0
+    try:
+        for shard_file in shard_files:
+            t0 = time.time()
+            records = _read_metadata(fs, shard_file)
+            chunks = _build_chunks(records.values(), chunk_size_bytes)
 
-        for chunk in chunks:
-            raw = fs.cat_file(chunk.file_path,
-                              start=chunk.byte_start, end=chunk.byte_end)
-            with jax.default_device(cpu_device):
-                for record in chunk.tensors:
-                    offset = record.byte_start - chunk.byte_start
-                    count = int(np.prod(record.shape, dtype=int))
-                    arr = np.frombuffer(
-                        raw, dtype=record.dtype,
-                        count=count, offset=offset,
-                    ).reshape(record.shape)
-                    yield record.key, jnp.asarray(arr)
-                    tensor_bytes = record.byte_end - record.byte_start
-                    shard_bytes += tensor_bytes
-                    shard_tensors += 1
-            del raw  # free chunk memory
+            # Download all chunks for this shard concurrently
+            shard_results = loop.run_until_complete(
+                _download_shard_concurrent(
+                    async_fs, chunks, cpu_device, max_concurrent_chunks))
 
-        elapsed = time.time() - t0
-        peak_rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-        shard_name = shard_file.rsplit("/", 1)[-1]
-        logger.info(
-            "Shard %s: %d tensors, %.1f GiB in %.1fs (%.0f MiB/s), "
-            "peak RSS=%.0f MB",
-            shard_name, shard_tensors, shard_bytes / 2**30, elapsed,
-            (shard_bytes / 2**20) / max(elapsed, 0.001), peak_rss_mb)
-        total_tensors += shard_tensors
-        total_bytes += shard_bytes
+            shard_bytes = 0
+            shard_tensors = 0
+            for name, array in shard_results:
+                yield name, array
+                # Count bytes from the record (array.nbytes could differ due to
+                # padding, use the original record size for accurate throughput)
+                shard_bytes += array.nbytes
+                shard_tensors += 1
+
+            del shard_results  # free shard memory
+
+            elapsed = time.time() - t0
+            peak_rss_mb = resource.getrusage(
+                resource.RUSAGE_SELF).ru_maxrss / 1024
+            shard_name = shard_file.rsplit("/", 1)[-1]
+            logger.info(
+                "Shard %s: %d tensors, %.1f GiB in %.1fs (%.0f MiB/s), "
+                "peak RSS=%.0f MB",
+                shard_name, shard_tensors, shard_bytes / 2**30, elapsed,
+                (shard_bytes / 2**20) / max(elapsed, 0.001), peak_rss_mb)
+            total_tensors += shard_tensors
+            total_bytes += shard_bytes
+    finally:
+        async_fs.shutdown()
+        loop.close()
 
     total_elapsed = time.time() - t_all
     logger.info(
