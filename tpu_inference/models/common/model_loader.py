@@ -51,6 +51,14 @@ _ABSTRACT_BOOTSTRAP_ARCHITECTURES: frozenset[str] = frozenset({
     "LlamaForCausalLM",
 })
 
+# Fallback mapping from HuggingFace model_type to JAX registry key.
+# Used when vLLM rewrites hf_config.architectures (e.g. LlamaForCausalLM →
+# MistralForCausalLM) before tpu-inference sees them.
+_MODEL_TYPE_TO_REGISTRY_KEY: dict[str, str] = {
+    "llama": "LlamaForCausalLM",
+    "qwen3": "Qwen3ForCausalLM",
+}
+
 # Architectures that prefer_jax_for_bootstrap is allowed to reroute from
 # "vllm" to "flax_nnx". This is NOT the full JAX registry — only models
 # we have explicitly vetted for bootstrap-mode routing.
@@ -229,6 +237,19 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     for arch in architectures:
         if arch in _MODEL_REGISTRY:
             return _MODEL_REGISTRY[arch]
+
+    # Fallback: vLLM may remap architectures (e.g. LlamaForCausalLM →
+    # MistralForCausalLM) before we see hf_config.  Use model_type as
+    # ground truth to find the correct JAX class.
+    if model_type in _MODEL_TYPE_TO_REGISTRY_KEY:
+        fallback_key = _MODEL_TYPE_TO_REGISTRY_KEY[model_type]
+        if fallback_key in _MODEL_REGISTRY:
+            logger.info(
+                "Architecture fallback: model_type=%r mapped to %r "
+                "(original architectures=%s were not in JAX registry)",
+                model_type, fallback_key, architectures)
+            return _MODEL_REGISTRY[fallback_key]
+
     raise UnsupportedArchitectureError(
         f"Model architectures {architectures} (model_type={model_type}) not "
         "registered in tpu-inference. Falling back to vLLM-native "

@@ -113,6 +113,32 @@ def test_get_model_architecture_unsupported():
         model_loader._get_model_architecture(config)
 
 
+def test_get_model_architecture_model_type_fallback():
+    """
+    Tests that _get_model_architecture falls back to model_type when
+    vLLM remaps architectures (e.g. LlamaForCausalLM → MistralForCausalLM).
+    """
+    from tpu_inference.models.jax.llama3 import LlamaForCausalLM
+    config = PretrainedConfig(
+        architectures=["MistralForCausalLM"],
+        model_type="llama",
+    )
+    model_class = model_loader._get_model_architecture(config)
+    assert model_class == LlamaForCausalLM
+
+
+def test_get_model_architecture_model_type_fallback_unknown():
+    """
+    Tests that model_type fallback doesn't fire for unknown model_type.
+    """
+    config = PretrainedConfig(
+        architectures=["MistralForCausalLM"],
+        model_type="mistral",
+    )
+    with pytest.raises(ValueError, match="not registered"):
+        model_loader._get_model_architecture(config)
+
+
 @pytest.fixture(autouse=True)
 def clear_model_registry_after_test():
     """Clear the model registry after each test to prevent side effects."""
