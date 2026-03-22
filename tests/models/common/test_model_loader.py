@@ -471,6 +471,7 @@ class TestTpuBootstrapConfig:
         config = model_loader.TpuBootstrapConfig.from_vllm_config(vllm_config)
         assert config.model_bootstrap == "default"
         assert config.prefer_jax_for_bootstrap is False
+        assert config.weight_loader == "default"
 
     def test_abstract_dummy_config(self, vllm_config):
         vllm_config.additional_config = {
@@ -842,3 +843,112 @@ class TestBootstrapAwareRouting:
         mock_get_flax.assert_not_called()
         mock_get_vllm.assert_called_once()
         assert result == "vllm_model_sentinel"
+
+
+# ==============================================================================
+# >> Test Suite for weight_loader Config and fsspec_streamer Dispatch
+# ==============================================================================
+
+
+class TestWeightLoaderConfig:
+    """Tests for weight_loader field in TpuBootstrapConfig."""
+
+    def test_weight_loader_config_parsing(self, vllm_config):
+        vllm_config.additional_config = {
+            "tpu_bootstrap": {
+                "weight_loader": "fsspec_streamer",
+            }
+        }
+        config = model_loader.TpuBootstrapConfig.from_vllm_config(vllm_config)
+        assert config.weight_loader == "fsspec_streamer"
+
+    def test_weight_loader_default(self, vllm_config):
+        vllm_config.additional_config = {
+            "tpu_bootstrap": {}
+        }
+        config = model_loader.TpuBootstrapConfig.from_vllm_config(vllm_config)
+        assert config.weight_loader == "default"
+
+    def test_invalid_weight_loader_raises(self, vllm_config):
+        vllm_config.additional_config = {
+            "tpu_bootstrap": {
+                "weight_loader": "s3_magic",
+            }
+        }
+        with pytest.raises(ValueError, match="Invalid tpu_bootstrap.weight_loader"):
+            model_loader.TpuBootstrapConfig.from_vllm_config(vllm_config)
+
+    def test_abstract_load_with_dummy_still_raises(self, vllm_config):
+        """abstract_load + dummy load_format still rejected, regardless of weight_loader."""
+        vllm_config.load_config.load_format = "dummy"
+        vllm_config.additional_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_load",
+                "weight_loader": "fsspec_streamer",
+            }
+        }
+        model_class = type("LlamaForCausalLM", (), {})
+        with pytest.raises(ValueError, match="requires a real load_format"):
+            model_loader._resolved_bootstrap_mode(vllm_config, model_class)
+
+    @patch("tpu_inference.models.common.model_loader.apply_qwix_on_abstract_model",
+           return_value=False)
+    @patch("tpu_inference.models.common.model_loader.get_model_loader")
+    @patch("tpu_inference.models.common.model_loader.nnx.eval_shape")
+    def test_fsspec_streamer_branch_sets_iterator(
+            self, mock_eval_shape, mock_get_loader, mock_qwix_check):
+        """When weight_loader=fsspec_streamer, fsspec_weights_iterator is used
+        and model_weights_iterator is set/cleaned on model_config."""
+        mock_model = MagicMock()
+        mock_eval_shape.return_value = mock_model
+        mock_loader = MagicMock()
+        mock_loader.__class__ = type("DefaultLoader", (), {})
+        mock_get_loader.return_value = mock_loader
+        mock_jit_result = MagicMock(name="jit_model")
+
+        create_abstract = MagicMock()
+        create_jit = MagicMock(return_value=mock_jit_result)
+
+        vllm_config = MagicMock()
+        vllm_config.model_config.model = "/fake/model"
+        del vllm_config.model_config.model_weights
+        vllm_config.additional_config = {
+            "tpu_bootstrap": {"weight_loader": "fsspec_streamer"}
+        }
+        rng_val = MagicMock()
+        mesh_val = MagicMock()
+
+        mock_iter = iter([("w", "data")])
+        with patch(
+            "tpu_inference.models.jax.streaming_weights.fsspec_weights_iterator",
+            return_value=mock_iter,
+        ) as mock_fsspec:
+            result = model_loader._build_abstract_model_and_load_weights(
+                create_abstract, create_jit, vllm_config, rng_val, mesh_val)
+
+        mock_fsspec.assert_called_once_with("/fake/model")
+        mock_model.load_weights.assert_called_once_with(rng_val)
+        # Iterator should be cleaned up
+        assert not hasattr(vllm_config.model_config, "model_weights_iterator")
+        assert result is mock_jit_result
+
+
+class TestLoadHfWeightsTypeDispatch:
+    """Tests for jax.Array / torch.Tensor dispatch in load_hf_weights iterator path."""
+
+    def test_load_hf_weights_rejects_ndarray(self, vllm_config, mesh):
+        """Iterator yields np.ndarray → TypeError."""
+        from tpu_inference.models.jax.utils.weight_utils import load_hf_weights, MetadataMap
+
+        mock_model = MagicMock()
+        mock_model.__class__ = type("FakeModel", (), {})
+        metadata_map = MetadataMap(name_map={})
+
+        # Set up weights_iterator with a numpy array (unsupported type)
+        vllm_config.model_config.model_weights_iterator = iter([
+            ("bad_weight", np.zeros((4, 4)))
+        ])
+
+        with pytest.raises(TypeError, match="Unsupported weight type"):
+            load_hf_weights(
+                vllm_config, mock_model, metadata_map, mesh)

@@ -476,16 +476,24 @@ def load_hf_weights(
     weights_iterator = None
     if hasattr(vllm_config.model_config, "model_weights_iterator"):
         weights_iterator = vllm_config.model_config.model_weights_iterator
-    env = torchax.default_env()
-    # The weights_iterator is used in RunAI model streamer integration.
+    # The weights_iterator is used in RunAI model streamer integration
+    # and fsspec streaming. Lazy-init torchax only when torch tensors appear.
     if weights_iterator is not None:
+        env = None  # lazy: only init torchax when we see a torch.Tensor
         for hf_key, hf_weight in weights_iterator:
             if filter_regex and not re.match(filter_regex, hf_key):
                 continue
 
-            # Since the weights_iterator yields Pytorch tensors (torch.Tensor),
-            # we need to convert them to JAX arrays (jax.Array).
-            hf_weight_jax = env.t2j_copy(hf_weight)
+            if isinstance(hf_weight, jax.Array):
+                hf_weight_jax = hf_weight
+            elif isinstance(hf_weight, torch.Tensor):
+                if env is None:
+                    env = torchax.default_env()
+                hf_weight_jax = env.t2j_copy(hf_weight)
+            else:
+                raise TypeError(
+                    f"Unsupported weight type for key {hf_key!r}: "
+                    f"{type(hf_weight)!r}. Expected jax.Array or torch.Tensor.")
 
             _load_and_shard_weight(
                 vllm_config,

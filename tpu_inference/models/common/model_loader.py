@@ -68,6 +68,7 @@ class TpuBootstrapConfig:
     """
     model_bootstrap: str = "default"
     prefer_jax_for_bootstrap: bool = False
+    weight_loader: str = "default"
 
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> "TpuBootstrapConfig":
@@ -80,10 +81,16 @@ class TpuBootstrapConfig:
             raise ValueError(
                 f"Invalid tpu_bootstrap.model_bootstrap: {model_bootstrap!r}. "
                 "Valid options: 'default', 'abstract_dummy', 'abstract_load'")
+        weight_loader = raw.get("weight_loader", "default")
+        if weight_loader not in ("default", "fsspec_streamer"):
+            raise ValueError(
+                f"Invalid tpu_bootstrap.weight_loader: {weight_loader!r}. "
+                "Valid options: 'default', 'fsspec_streamer'")
         return cls(
             model_bootstrap=model_bootstrap,
             prefer_jax_for_bootstrap=bool(
                 raw.get("prefer_jax_for_bootstrap", False)),
+            weight_loader=weight_loader,
         )
 
 
@@ -144,9 +151,27 @@ def _build_abstract_model_and_load_weights(
 
     model = nnx.eval_shape(abstract_model_fn)
 
+    bootstrap = TpuBootstrapConfig.from_vllm_config(vllm_config)
+
     with mesh:
-        loader = get_model_loader(vllm_config.load_config)
-        if isinstance(loader, RunaiModelStreamerLoader):
+        if bootstrap.weight_loader == "fsspec_streamer":
+            from tpu_inference.models.jax.streaming_weights import (
+                fsspec_weights_iterator)
+            model_path = vllm_config.model_config.model
+            if getattr(vllm_config.model_config, "model_weights", ""):
+                model_path = vllm_config.model_config.model_weights
+            weights_iterator = fsspec_weights_iterator(model_path)
+            vllm_config.model_config.model_weights_iterator = weights_iterator
+            try:
+                model.load_weights(rng)
+            finally:
+                if hasattr(vllm_config.model_config,
+                           "model_weights_iterator"):
+                    delattr(vllm_config.model_config,
+                            "model_weights_iterator")
+        elif isinstance(
+                (loader := get_model_loader(vllm_config.load_config)),
+                RunaiModelStreamerLoader):
             model_weights = vllm_config.model_config.model
             if getattr(vllm_config.model_config, "model_weights", ""):
                 model_weights = vllm_config.model_config.model_weights
