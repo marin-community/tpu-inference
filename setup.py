@@ -79,10 +79,15 @@ setup(
     author="tpu_inference Contributors",
     packages=find_packages(),
     python_requires=">=3.10",
-    # Marin fork: only include runtime deps that vllm-tpu doesn't provide.
-    # Skip jax/jaxlib/gcsfs (conflict with Marin pins) and test-only deps.
+    # Marin fork: include runtime deps that stock vllm doesn't provide.
+    # Skip jax/jaxlib/gcsfs/torch/torchvision (managed by Marin) and test-only deps.
     install_requires=[
         "tpu-info>=0.7.1",
+        "torchax>=0.0.11",
+        "flax>=0.12.4",
+        "jaxtyping",
+        "qwix>=0.1.2",
+        "runai-model-streamer[s3,gcs]>=0.15.4",
     ],
     include_package_data=True,
     classifiers=[
