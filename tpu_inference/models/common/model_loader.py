@@ -158,11 +158,10 @@ def _build_abstract_model_and_load_weights(
             mesh,
             apply_to_abstract_model=True)
 
-    model = nnx.eval_shape(abstract_model_fn)
-
     bootstrap = TpuBootstrapConfig.from_vllm_config(vllm_config)
 
     with mesh:
+        model = nnx.eval_shape(abstract_model_fn)
         if bootstrap.weight_loader == "fsspec_streamer":
             from tpu_inference.models.jax.streaming_weights import (
                 fsspec_weights_iterator)
