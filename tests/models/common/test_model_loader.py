@@ -936,12 +936,21 @@ class TestWeightLoaderConfig:
 class TestLoadHfWeightsTypeDispatch:
     """Tests for jax.Array / torch.Tensor dispatch in load_hf_weights iterator path."""
 
-    def test_load_hf_weights_rejects_ndarray(self, vllm_config, mesh):
-        """Iterator yields np.ndarray → TypeError."""
+    @patch("tpu_inference.models.jax.utils.weight_utils.nnx.state",
+           return_value=MagicMock())
+    @patch("tpu_inference.models.jax.utils.weight_utils.nnx.get_named_sharding",
+           return_value=MagicMock())
+    def test_load_hf_weights_rejects_ndarray(self, mock_shardings,
+                                              mock_state, vllm_config, mesh):
+        """Iterator yields np.ndarray → TypeError.
+
+        We patch nnx.state/get_named_sharding so the test reaches the
+        iterator type-dispatch branch (otherwise nnx.state fails on a
+        non-Module mock).
+        """
         from tpu_inference.models.jax.utils.weight_utils import load_hf_weights, MetadataMap
 
         mock_model = MagicMock()
-        mock_model.__class__ = type("FakeModel", (), {})
         metadata_map = MetadataMap(name_map={})
 
         # Set up weights_iterator with a numpy array (unsupported type)
