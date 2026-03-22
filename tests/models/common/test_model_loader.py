@@ -113,30 +113,32 @@ def test_get_model_architecture_unsupported():
         model_loader._get_model_architecture(config)
 
 
-def test_get_model_architecture_model_type_fallback():
+def test_get_model_architecture_mistral_alias():
     """
-    Tests that _get_model_architecture falls back to model_type when
-    vLLM remaps architectures (e.g. LlamaForCausalLM → MistralForCausalLM).
+    Tests that MistralForCausalLM (vLLM's remap of LlamaForCausalLM)
+    resolves to the same JAX LlamaForCausalLM class.
     """
     from tpu_inference.models.jax.llama3 import LlamaForCausalLM
     config = PretrainedConfig(
         architectures=["MistralForCausalLM"],
-        model_type="llama",
+        model_type="transformer",
     )
     model_class = model_loader._get_model_architecture(config)
     assert model_class == LlamaForCausalLM
 
 
-def test_get_model_architecture_model_type_fallback_unknown():
+def test_get_model_architecture_model_type_fallback():
     """
-    Tests that model_type fallback doesn't fire for unknown model_type.
+    Tests that _get_model_architecture falls back to model_type when
+    architectures are not in the registry but model_type is known.
     """
+    from tpu_inference.models.jax.llama3 import LlamaForCausalLM
     config = PretrainedConfig(
-        architectures=["MistralForCausalLM"],
-        model_type="mistral",
+        architectures=["SomeUnknownArch"],
+        model_type="llama",
     )
-    with pytest.raises(ValueError, match="not registered"):
-        model_loader._get_model_architecture(config)
+    model_class = model_loader._get_model_architecture(config)
+    assert model_class == LlamaForCausalLM
 
 
 @pytest.fixture(autouse=True)

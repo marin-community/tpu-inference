@@ -49,6 +49,7 @@ _VLLM_PREFERRED_ARCHITECTURES: frozenset[str] = frozenset(
 # therefore fall into the expensive concrete random-init branch.
 _ABSTRACT_BOOTSTRAP_ARCHITECTURES: frozenset[str] = frozenset({
     "LlamaForCausalLM",
+    "MistralForCausalLM",  # vLLM alias for LlamaForCausalLM
 })
 
 # Fallback mapping from HuggingFace model_type to JAX registry key.
@@ -221,6 +222,9 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     _MODEL_REGISTRY["Llama4ForCausalLM"] = Llama4ForCausalLM
     _MODEL_REGISTRY["DeepseekV3ForCausalLM"] = DeepSeekV3
     _MODEL_REGISTRY["LlamaForCausalLM"] = LlamaForCausalLM
+    # vLLM remaps LlamaForCausalLM → MistralForCausalLM (they share the
+    # same architecture).  Register the alias so our JAX path is reached.
+    _MODEL_REGISTRY["MistralForCausalLM"] = LlamaForCausalLM
     _MODEL_REGISTRY["Llama4ForConditionalGeneration"] = LlamaGuard4ForCausalLM
     _MODEL_REGISTRY["Qwen3ForCausalLM"] = Qwen3ForCausalLM
     _MODEL_REGISTRY[
