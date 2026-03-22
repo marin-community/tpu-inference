@@ -160,7 +160,7 @@ def _build_abstract_model_and_load_weights(
 
     bootstrap = TpuBootstrapConfig.from_vllm_config(vllm_config)
 
-    with mesh:
+    with mesh, jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
         model = nnx.eval_shape(abstract_model_fn)
         if bootstrap.weight_loader == "fsspec_streamer":
             from tpu_inference.models.jax.streaming_weights import (
@@ -309,7 +309,7 @@ def _get_nnx_model(
         logger.info(
             "Abstract dummy bootstrap for %s (RL injection mode)",
             model_class.__name__)
-        with mesh:
+        with mesh, jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
             model = nnx.eval_shape(create_abstract_model)
         return model
 
