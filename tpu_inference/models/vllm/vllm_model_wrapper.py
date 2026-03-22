@@ -143,8 +143,13 @@ class VllmModelWrapper:
 
         # Load the vLLM model and wrap it into a new model whose forward
         # function can calculate the hidden_state and logits.
+        import time as _time
+        _t0 = _time.time()
         with load_context, jax_context:
             vllm_model = vllm_get_model(vllm_config=vllm_config_for_load)
+        _t1 = _time.time()
+        logger.info("[phase] load_weights: vllm_get_model %.1fs", _t1 - _t0)
+
         lora_manager = None
         if vllm_config_for_load.lora_config is not None:
             # Replace layers in the model with LoRA layers.
@@ -159,10 +164,19 @@ class VllmModelWrapper:
         self.vllm_config.compilation_config.static_forward_context = static_forward_context
 
         self.model = _VllmRunner(vllm_model)
+        _t2 = _time.time()
+        logger.info("[phase] load_weights: model wrapping %.1fs", _t2 - _t1)
+
         params_and_buffers = shard_model_to_tpu(self.model, self.mesh)
+        _t3 = _time.time()
+        logger.info("[phase] load_weights: shard_model_to_tpu %.1fs", _t3 - _t2)
 
         # Returning to the jax land, so we need to wrap it into a JaxValue.
-        return jax_view(params_and_buffers), lora_manager
+        result = jax_view(params_and_buffers), lora_manager
+        _t4 = _time.time()
+        logger.info("[phase] load_weights: jax_view %.1fs", _t4 - _t3)
+        logger.info("[phase] load_weights: TOTAL %.1fs", _t4 - _t0)
+        return result
 
     def jit_step_func(self):
 

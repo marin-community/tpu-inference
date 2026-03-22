@@ -158,10 +158,15 @@ def _build_abstract_model_and_load_weights(
             mesh,
             apply_to_abstract_model=True)
 
+    import time as _time
     bootstrap = TpuBootstrapConfig.from_vllm_config(vllm_config)
 
     with jax.set_mesh(mesh):
+        _t0 = _time.time()
         model = nnx.eval_shape(abstract_model_fn)
+        _t1 = _time.time()
+        logger.info("[phase] abstract_load: eval_shape %.1fs", _t1 - _t0)
+
         if bootstrap.weight_loader == "fsspec_streamer":
             from tpu_inference.models.jax.streaming_weights import (
                 fsspec_weights_iterator)
@@ -195,8 +200,14 @@ def _build_abstract_model_and_load_weights(
                             "model_weights_iterator")
         else:
             model.load_weights(rng)
+        _t2 = _time.time()
+        logger.info("[phase] abstract_load: load_weights %.1fs", _t2 - _t1)
+
         jit_model = create_jit_model(
             model, use_qwix_on_abstract_model=should_apply_qwix)
+        _t3 = _time.time()
+        logger.info("[phase] abstract_load: create_jit_model %.1fs", _t3 - _t2)
+        logger.info("[phase] abstract_load: TOTAL %.1fs", _t3 - _t0)
     return jit_model
 
 
@@ -382,13 +393,21 @@ def get_flax_model(
     model_dtype = to_jax_dtype(vllm_config.model_config.dtype)
     vllm_config.model_config.dtype = model_dtype
 
+    import time as _time
+    _t0 = _time.time()
     if is_draft_model:
         model_class = _get_model_architecture(
             vllm_config.speculative_config.draft_model_config.hf_config)
     else:
         model_class = _get_model_architecture(
             vllm_config.model_config.hf_config)
+    _t1 = _time.time()
+    logger.info("[phase] get_flax_model: arch lookup %.1fs", _t1 - _t0)
+
     jit_model = _get_nnx_model(model_class, vllm_config, rng, mesh)
+    _t2 = _time.time()
+    logger.info("[phase] get_flax_model: _get_nnx_model %.1fs", _t2 - _t1)
+
     kv_cache_sharding = NamedSharding(
         mesh,
         PartitionSpec(ShardingAxisName.ATTN_DATA, None,
@@ -401,6 +420,8 @@ def get_flax_model(
     # For performance consideration, refer to:
     # https://flax.readthedocs.io/en/latest/guides/performance.html
     graphdef, state = nnx.split(jit_model)
+    _t3 = _time.time()
+    logger.info("[phase] get_flax_model: nnx.split %.1fs", _t3 - _t2)
 
     @functools.partial(
         jax.jit,
@@ -486,6 +507,8 @@ def get_vllm_model(
     rng: jax.Array,
     mesh: Mesh,
 ):
+    import time as _time
+    t0 = _time.time()
     model_dtype = to_torch_dtype(vllm_config.model_config.dtype)
     vllm_config.model_config.dtype = model_dtype
     from tpu_inference.models.vllm.vllm_model_wrapper import VllmModelWrapper
@@ -495,11 +518,22 @@ def get_vllm_model(
         rng=rng,
         mesh=mesh,
     )
+    t1 = _time.time()
+    logger.info("[phase] get_vllm_model: VllmModelWrapper init %.1fs", t1 - t0)
+
     params, lora_manager = model.load_weights()
+    t2 = _time.time()
+    logger.info("[phase] get_vllm_model: load_weights %.1fs", t2 - t1)
 
     jit_model = model.jit_step_func()
+    t3 = _time.time()
+    logger.info("[phase] get_vllm_model: jit_step_func %.1fs", t3 - t2)
+
     compute_logits_fn = model.jit_compute_logits_func()
-    # the model needs to be returned because lora weights are neither torch.nn.parameter nor torch.nn.buffer. After we load the lora weights and set it to the torch.nn.Module, we can shard it and move it to TPU.
+    t4 = _time.time()
+    logger.info("[phase] get_vllm_model: jit_compute_logits %.1fs", t4 - t3)
+    logger.info("[phase] get_vllm_model: TOTAL %.1fs", t4 - t0)
+
     combine_hidden_states_fn = None
     return jit_model, compute_logits_fn, combine_hidden_states_fn, None, params, lora_manager, model
 
