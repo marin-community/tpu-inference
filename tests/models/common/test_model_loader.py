@@ -30,6 +30,9 @@ from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
 from vllm.engine.arg_utils import EngineArgs
 from vllm.model_executor.models.registry import ModelRegistry
 
+from vllm.model_executor.model_loader.runai_streamer_loader import \
+    RunaiModelStreamerLoader
+
 from tpu_inference.models.common import model_loader
 from tpu_inference.models.jax.qwen3 import Qwen3ForCausalLM
 
@@ -479,6 +482,16 @@ class TestTpuBootstrapConfig:
         assert config.model_bootstrap == "abstract_dummy"
         assert config.prefer_jax_for_bootstrap is False
 
+    def test_abstract_load_config(self, vllm_config):
+        vllm_config.additional_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_load",
+            }
+        }
+        config = model_loader.TpuBootstrapConfig.from_vllm_config(vllm_config)
+        assert config.model_bootstrap == "abstract_load"
+        assert config.prefer_jax_for_bootstrap is False
+
     def test_prefer_jax_config(self, vllm_config):
         vllm_config.additional_config = {
             "tpu_bootstrap": {
@@ -509,13 +522,13 @@ class TestTpuBootstrapConfig:
         assert config.model_bootstrap == "default"
 
 
-class TestAbstractDummyBootstrap:
-    """Tests for _use_abstract_dummy_bootstrap gating logic."""
+class TestResolvedBootstrapMode:
+    """Tests for _resolved_bootstrap_mode gating logic."""
 
     def _make_mock_class(self, name):
         return type(name, (), {})
 
-    def test_enabled_for_llama(self, vllm_config):
+    def test_abstract_dummy_returns_abstract_dummy(self, vllm_config):
         vllm_config.load_config.load_format = "dummy"
         vllm_config.additional_config = {
             "tpu_bootstrap": {
@@ -523,11 +536,40 @@ class TestAbstractDummyBootstrap:
             }
         }
         model_class = self._make_mock_class("LlamaForCausalLM")
-        assert model_loader._use_abstract_dummy_bootstrap(
-            vllm_config, model_class) is True
+        assert model_loader._resolved_bootstrap_mode(
+            vllm_config, model_class) == "abstract_dummy"
 
-    def test_disabled_for_qwen3(self, vllm_config):
-        """Qwen3 is NOT in _ABSTRACT_BOOTSTRAP_ARCHITECTURES on v0.13.2."""
+    def test_abstract_load_for_llama(self, vllm_config):
+        vllm_config.load_config.load_format = "runai_streamer"
+        vllm_config.additional_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_load"
+            }
+        }
+        model_class = self._make_mock_class("LlamaForCausalLM")
+        assert model_loader._resolved_bootstrap_mode(
+            vllm_config, model_class) == "abstract_load"
+
+    def test_default_mode_silently_returns_default(self, vllm_config):
+        """Default mode returns 'default' even for unsupported architectures
+        — only non-default modes raise."""
+        vllm_config.additional_config = {}
+        model_class = self._make_mock_class("UnsupportedArch")
+        assert model_loader._resolved_bootstrap_mode(
+            vllm_config, model_class) == "default"
+
+    def test_abstract_load_on_unsupported_arch_raises(self, vllm_config):
+        vllm_config.load_config.load_format = "runai_streamer"
+        vllm_config.additional_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_load"
+            }
+        }
+        model_class = self._make_mock_class("Qwen3ForCausalLM")
+        with pytest.raises(ValueError, match="not supported for architecture"):
+            model_loader._resolved_bootstrap_mode(vllm_config, model_class)
+
+    def test_abstract_dummy_on_unsupported_arch_raises(self, vllm_config):
         vllm_config.load_config.load_format = "dummy"
         vllm_config.additional_config = {
             "tpu_bootstrap": {
@@ -535,17 +577,47 @@ class TestAbstractDummyBootstrap:
             }
         }
         model_class = self._make_mock_class("Qwen3ForCausalLM")
-        assert model_loader._use_abstract_dummy_bootstrap(
-            vllm_config, model_class) is False
+        with pytest.raises(ValueError, match="not supported for architecture"):
+            model_loader._resolved_bootstrap_mode(vllm_config, model_class)
 
-    def test_disabled_without_opt_in(self, vllm_config):
-        vllm_config.load_config.load_format = "dummy"
-        vllm_config.additional_config = {}
+    def test_abstract_load_with_quantization_raises(self, vllm_config):
+        vllm_config.load_config.load_format = "runai_streamer"
+        vllm_config.additional_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_load"
+            }
+        }
+        vllm_config.model_config.hf_config.quantization_config = {
+            "quant_method": "gptq"
+        }
         model_class = self._make_mock_class("LlamaForCausalLM")
-        assert model_loader._use_abstract_dummy_bootstrap(
-            vllm_config, model_class) is False
+        with pytest.raises(ValueError, match="quantization_config"):
+            model_loader._resolved_bootstrap_mode(vllm_config, model_class)
 
-    def test_disabled_for_non_dummy_format(self, vllm_config):
+    def test_abstract_load_with_tpu_quantization_raises(self, vllm_config):
+        vllm_config.load_config.load_format = "runai_streamer"
+        vllm_config.additional_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_load"
+            }
+        }
+        vllm_config.model_config.quantization = "tpu_int8"
+        model_class = self._make_mock_class("LlamaForCausalLM")
+        with pytest.raises(ValueError, match="TPU quantization"):
+            model_loader._resolved_bootstrap_mode(vllm_config, model_class)
+
+    def test_abstract_load_with_dummy_load_format_raises(self, vllm_config):
+        vllm_config.load_config.load_format = "dummy"
+        vllm_config.additional_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_load"
+            }
+        }
+        model_class = self._make_mock_class("LlamaForCausalLM")
+        with pytest.raises(ValueError, match="requires a real load_format"):
+            model_loader._resolved_bootstrap_mode(vllm_config, model_class)
+
+    def test_abstract_dummy_with_non_dummy_load_format_raises(self, vllm_config):
         vllm_config.load_config.load_format = "auto"
         vllm_config.additional_config = {
             "tpu_bootstrap": {
@@ -553,36 +625,140 @@ class TestAbstractDummyBootstrap:
             }
         }
         model_class = self._make_mock_class("LlamaForCausalLM")
-        assert model_loader._use_abstract_dummy_bootstrap(
-            vllm_config, model_class) is False
+        with pytest.raises(ValueError, match="requires load_format='dummy'"):
+            model_loader._resolved_bootstrap_mode(vllm_config, model_class)
 
-    def test_disabled_with_hf_quantization_config(self, vllm_config):
-        vllm_config.load_config.load_format = "dummy"
-        vllm_config.additional_config = {
-            "tpu_bootstrap": {
-                "model_bootstrap": "abstract_dummy"
-            }
-        }
-        vllm_config.model_config.hf_config.quantization_config = {
-            "quant_method": "gptq"
-        }
-        model_class = self._make_mock_class("LlamaForCausalLM")
-        assert model_loader._use_abstract_dummy_bootstrap(
-            vllm_config, model_class) is False
 
-    def test_disabled_with_tpu_quantization(self, vllm_config):
-        """TPU quantization via model_config.quantization (e.g. 'tpu_int8')
-        should also block abstract dummy bootstrap."""
-        vllm_config.load_config.load_format = "dummy"
-        vllm_config.additional_config = {
-            "tpu_bootstrap": {
-                "model_bootstrap": "abstract_dummy"
-            }
-        }
-        vllm_config.model_config.quantization = "tpu_int8"
-        model_class = self._make_mock_class("LlamaForCausalLM")
-        assert model_loader._use_abstract_dummy_bootstrap(
-            vllm_config, model_class) is False
+class TestAbstractLoadBehavior:
+    """Behavioral tests for _build_abstract_model_and_load_weights and
+    the abstract_load control-flow path in _get_nnx_model."""
+
+    @patch("tpu_inference.models.common.model_loader.apply_qwix_on_abstract_model",
+           return_value=False)
+    @patch("tpu_inference.models.common.model_loader.get_model_loader")
+    @patch("tpu_inference.models.common.model_loader.nnx.eval_shape")
+    def test_abstract_load_calls_load_weights_and_jits(
+            self, mock_eval_shape, mock_get_loader, mock_qwix_check):
+        """Proves the abstract model is created, load_weights() is called,
+        create_jit_model() is called, and the return value is the jitted model."""
+        mock_model = MagicMock()
+        mock_eval_shape.return_value = mock_model
+        mock_loader = MagicMock()
+        mock_loader.__class__ = type("DefaultLoader", (), {})
+        mock_get_loader.return_value = mock_loader
+        mock_jit_result = MagicMock(name="jit_model")
+
+        create_abstract = MagicMock(name="create_abstract_model")
+        create_jit = MagicMock(name="create_jit_model", return_value=mock_jit_result)
+
+        vllm_config = MagicMock()
+        rng = MagicMock()
+        mesh = MagicMock()
+
+        result = model_loader._build_abstract_model_and_load_weights(
+            create_abstract, create_jit, vllm_config, rng, mesh)
+
+        mock_eval_shape.assert_called_once()
+        mock_model.load_weights.assert_called_once_with(rng)
+        create_jit.assert_called_once_with(
+            mock_model, use_qwix_on_abstract_model=False)
+        assert result is mock_jit_result
+
+    @patch("tpu_inference.models.common.model_loader.apply_qwix_on_abstract_model",
+           return_value=False)
+    @patch("tpu_inference.models.common.model_loader.get_model_loader")
+    @patch("tpu_inference.models.common.model_loader.nnx.eval_shape")
+    def test_abstract_load_cleans_model_weights_iterator_on_success(
+            self, mock_eval_shape, mock_get_loader, mock_qwix_check):
+        """With RunaiModelStreamerLoader, model_weights_iterator is set before
+        load_weights and deleted afterward."""
+        mock_model = MagicMock()
+        mock_eval_shape.return_value = mock_model
+
+        mock_loader = MagicMock(spec=RunaiModelStreamerLoader)
+        mock_loader._get_weights_iterator.return_value = iter([("w", "data")])
+        mock_get_loader.return_value = mock_loader
+
+        create_abstract = MagicMock()
+        create_jit = MagicMock(return_value=MagicMock(name="jit_model"))
+
+        vllm_config = MagicMock()
+        vllm_config.model_config.model = "/fake/model"
+        vllm_config.model_config.revision = None
+        # Ensure model_weights attr doesn't exist
+        del vllm_config.model_config.model_weights
+        mesh = MagicMock()
+        rng = MagicMock()
+
+        model_loader._build_abstract_model_and_load_weights(
+            create_abstract, create_jit, vllm_config, rng, mesh)
+
+        # Iterator should have been cleaned up
+        assert not hasattr(vllm_config.model_config, "model_weights_iterator")
+        mock_model.load_weights.assert_called_once_with(rng)
+
+    @patch("tpu_inference.models.common.model_loader.apply_qwix_on_abstract_model",
+           return_value=False)
+    @patch("tpu_inference.models.common.model_loader.get_model_loader")
+    @patch("tpu_inference.models.common.model_loader.nnx.eval_shape")
+    def test_abstract_load_cleans_model_weights_iterator_on_failure(
+            self, mock_eval_shape, mock_get_loader, mock_qwix_check):
+        """If load_weights raises, model_weights_iterator is still cleaned up
+        via try/finally."""
+        mock_model = MagicMock()
+        mock_model.load_weights.side_effect = RuntimeError("load failed")
+        mock_eval_shape.return_value = mock_model
+
+        mock_loader = MagicMock(spec=RunaiModelStreamerLoader)
+        mock_loader._get_weights_iterator.return_value = iter([("w", "data")])
+        mock_get_loader.return_value = mock_loader
+
+        create_abstract = MagicMock()
+        create_jit = MagicMock()
+
+        vllm_config = MagicMock()
+        vllm_config.model_config.model = "/fake/model"
+        vllm_config.model_config.revision = None
+        del vllm_config.model_config.model_weights
+        mesh = MagicMock()
+        rng = MagicMock()
+
+        with pytest.raises(RuntimeError, match="load failed"):
+            model_loader._build_abstract_model_and_load_weights(
+                create_abstract, create_jit, vllm_config, rng, mesh)
+
+        # Iterator should still be cleaned up despite the error
+        assert not hasattr(vllm_config.model_config, "model_weights_iterator")
+
+    @patch("tpu_inference.models.common.model_loader.apply_qwix_on_abstract_model",
+           return_value=False)
+    @patch("tpu_inference.models.common.model_loader.get_model_loader")
+    @patch("tpu_inference.models.common.model_loader.nnx.eval_shape")
+    def test_default_non_dummy_path_still_loads_and_jits(
+            self, mock_eval_shape, mock_get_loader, mock_qwix_check):
+        """Regression: mode='default' with a real load format goes through
+        _build_abstract_model_and_load_weights (same as abstract_load)."""
+        mock_model = MagicMock()
+        mock_eval_shape.return_value = mock_model
+        mock_loader = MagicMock()
+        mock_loader.__class__ = type("DefaultLoader", (), {})
+        mock_get_loader.return_value = mock_loader
+        mock_jit_result = MagicMock(name="jit_model")
+
+        create_abstract = MagicMock()
+        create_jit = MagicMock(return_value=mock_jit_result)
+
+        vllm_config = MagicMock()
+        rng = MagicMock()
+        mesh = MagicMock()
+
+        result = model_loader._build_abstract_model_and_load_weights(
+            create_abstract, create_jit, vllm_config, rng, mesh)
+
+        mock_eval_shape.assert_called_once()
+        mock_model.load_weights.assert_called_once_with(rng)
+        create_jit.assert_called_once()
+        assert result is mock_jit_result
 
 
 class TestBootstrapAwareRouting:

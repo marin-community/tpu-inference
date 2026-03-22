@@ -76,10 +76,10 @@ class TpuBootstrapConfig:
         if not isinstance(raw, dict):
             return cls()
         model_bootstrap = raw.get("model_bootstrap", "default")
-        if model_bootstrap not in ("default", "abstract_dummy"):
+        if model_bootstrap not in ("default", "abstract_dummy", "abstract_load"):
             raise ValueError(
                 f"Invalid tpu_bootstrap.model_bootstrap: {model_bootstrap!r}. "
-                "Valid options: 'default', 'abstract_dummy'")
+                "Valid options: 'default', 'abstract_dummy', 'abstract_load'")
         return cls(
             model_bootstrap=model_bootstrap,
             prefer_jax_for_bootstrap=bool(
@@ -87,29 +87,84 @@ class TpuBootstrapConfig:
         )
 
 
-def _use_abstract_dummy_bootstrap(vllm_config: VllmConfig,
-                                  model_class: Any) -> bool:
-    """Check if abstract dummy bootstrap should be used for fast startup."""
+def _resolved_bootstrap_mode(vllm_config: VllmConfig,
+                             model_class: Any) -> str:
+    """Resolve which bootstrap mode to use.
+
+    Returns "default", "abstract_dummy", or "abstract_load".
+
+    Raises ValueError if a non-default mode was explicitly requested but
+    cannot be honored (unsupported arch, quantization active, wrong
+    load_format). Only "default" silently returns "default".
+    """
     bootstrap = TpuBootstrapConfig.from_vllm_config(vllm_config)
-    if bootstrap.model_bootstrap != "abstract_dummy":
-        return False
-    if vllm_config.load_config.load_format != "dummy":
-        return False
+    mode = bootstrap.model_bootstrap
+    if mode == "default":
+        return "default"
+    # Non-default mode was explicitly requested — fail loudly if invalid
     arch = model_class.__name__
     if arch not in _ABSTRACT_BOOTSTRAP_ARCHITECTURES:
-        return False
+        raise ValueError(
+            f"{mode} is not supported for architecture {arch!r}")
     if apply_qwix_on_abstract_model(vllm_config):
-        return False
-    # Reject if any quantization is active — check both HF config
-    # (hf_config.quantization_config) and vLLM/TPU quantization
-    # (model_config.quantization), since TPU quantization is selected
-    # via the latter path independently of HF config.
+        raise ValueError(
+            f"{mode} is incompatible with Qwix abstract quantization")
     if getattr(vllm_config.model_config.hf_config, "quantization_config",
                None):
-        return False
+        raise ValueError(
+            f"{mode} is incompatible with hf quantization_config")
     if getattr(vllm_config.model_config, "quantization", None):
-        return False
-    return True
+        raise ValueError(
+            f"{mode} is incompatible with TPU quantization")
+    # Validate mode vs load_format
+    if mode == "abstract_dummy" and vllm_config.load_config.load_format != "dummy":
+        raise ValueError("abstract_dummy requires load_format='dummy'")
+    if mode == "abstract_load" and vllm_config.load_config.load_format == "dummy":
+        raise ValueError(
+            "abstract_load requires a real load_format, not 'dummy'")
+    return mode
+
+
+def _build_abstract_model_and_load_weights(
+    create_abstract_model,
+    create_jit_model,
+    vllm_config: VllmConfig,
+    rng: jax.Array,
+    mesh: Mesh,
+) -> nnx.Module:
+    """Create abstract model, load real weights, JIT compile."""
+    abstract_model_fn = create_abstract_model
+    if should_apply_qwix := apply_qwix_on_abstract_model(vllm_config):
+        abstract_model_fn = apply_qwix_quantization(
+            vllm_config,
+            create_abstract_model,
+            rng,
+            mesh,
+            apply_to_abstract_model=True)
+
+    model = nnx.eval_shape(abstract_model_fn)
+
+    with mesh:
+        loader = get_model_loader(vllm_config.load_config)
+        if isinstance(loader, RunaiModelStreamerLoader):
+            model_weights = vllm_config.model_config.model
+            if hasattr(vllm_config.model_config, "model_weights"):
+                model_weights = vllm_config.model_config.model_weights
+            weights_iterator = loader._get_weights_iterator(
+                model_weights, vllm_config.model_config.revision)
+            vllm_config.model_config.model_weights_iterator = weights_iterator
+            try:
+                model.load_weights(rng)
+            finally:
+                if hasattr(vllm_config.model_config,
+                           "model_weights_iterator"):
+                    delattr(vllm_config.model_config,
+                            "model_weights_iterator")
+        else:
+            model.load_weights(rng)
+        jit_model = create_jit_model(
+            model, use_qwix_on_abstract_model=should_apply_qwix)
+    return jit_model
 
 
 class UnsupportedArchitectureError(ValueError):
@@ -193,18 +248,25 @@ def _get_nnx_model(
                                             apply_to_abstract_model=False)
         return model
 
-    if _use_abstract_dummy_bootstrap(vllm_config, model_class):
-        # Fast startup: create abstract model structure without allocating
-        # real weights. The caller (e.g. Marin) will inject real weights
-        # via sync_weights() / _sync_weights() after engine startup.
+    mode = _resolved_bootstrap_mode(vllm_config, model_class)
+
+    if mode == "abstract_dummy":
+        # RL path: abstract model only, caller injects weights via _sync_weights()
         logger.info(
-            "Using abstract dummy bootstrap for %s (fast startup mode)",
+            "Abstract dummy bootstrap for %s (RL injection mode)",
             model_class.__name__)
         with mesh:
             model = nnx.eval_shape(create_abstract_model)
         return model
 
-    elif vllm_config.load_config.load_format == "dummy":
+    if mode == "abstract_load":
+        # Fast serve path: abstract model + real weight loading
+        logger.info("Abstract load bootstrap for %s", model_class.__name__)
+        return _build_abstract_model_and_load_weights(
+            create_abstract_model, create_jit_model, vllm_config, rng, mesh)
+
+    # Default paths (mode == "default")
+    if vllm_config.load_config.load_format == "dummy":
         # Create a sharded model with random inited weights.
         # TODO: currently Qwen2ForCausalLM is using legacy model implementation
         # will merge the random init logic when all model are migrated to new model implementation
@@ -251,53 +313,8 @@ def _get_nnx_model(
             if hasattr(jit_model, 'initialize_cache'):
                 jit_model.initialize_cache()
     else:
-        # We first create an abstract model without allocating any weights,
-        # then fill in its weigths during load_weights from HF.
-        # This shows 2 advantages than the normal way:
-        # 1. The model weights will only be allocated once. Otherwise the normal way
-        #    will random-init the model weights first, then load the real weights.
-        #    The two pass weights allocation causes model loading slow.
-        # 2. The model loading won't be OOM. Otherwise the normal way will hold
-        #    a full model weights after random-init, then duplicate a layer during
-        #    the load_weights. This would be easy to OOM if the layer is super large.
-        abstract_model_fn = create_abstract_model
-        # NOTE: only one of the abstract (this) or or concrete Qwix quantization paths should
-        # be taken
-        if should_apply_qwix_on_abstract_model := apply_qwix_on_abstract_model(
-                vllm_config):
-            # NOTE: if Qwix is not configured, this will return `create_abstract_model` and
-            # thus be a no-op
-            abstract_model_fn = apply_qwix_quantization(
-                vllm_config,
-                create_abstract_model,
-                rng,
-                mesh,
-                apply_to_abstract_model=True)
-        model = nnx.eval_shape(abstract_model_fn)
-        # Although the created model can already work, we still need to jit
-        # the model creation again, otherwise the model forward will have
-        # non-trivial overhead in PjitFunction.
-        with mesh:
-            loader = get_model_loader(vllm_config.load_config)
-            if isinstance(loader, RunaiModelStreamerLoader):
-                model_weights = vllm_config.model_config.model
-                if hasattr(vllm_config.model_config, "model_weights"):
-                    model_weights = vllm_config.model_config.model_weights
-                weights_iterator = loader._get_weights_iterator(
-                    model_weights, vllm_config.model_config.revision)
-                # We set the weights iterator at runtime, to prevent having to change
-                # every model's load_weights signature. This also prevents us from hitting
-                # a TypeError at runtime if you use the RunaiModelStreamerLoader with any
-                # flax_nnx model whose load_weights function does not accept the
-                # weights_iterator keyword argument.
-                vllm_config.model_config.model_weights_iterator = weights_iterator
-                model.load_weights(rng)
-                del vllm_config.model_config.model_weights_iterator
-            else:
-                model.load_weights(rng)
-            jit_model = create_jit_model(
-                model,
-                use_qwix_on_abstract_model=should_apply_qwix_on_abstract_model)
+        return _build_abstract_model_and_load_weights(
+            create_abstract_model, create_jit_model, vllm_config, rng, mesh)
     return jit_model
 
 
