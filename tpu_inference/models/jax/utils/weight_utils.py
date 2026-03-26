@@ -18,7 +18,7 @@ import glob
 import math
 import os
 import re
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -103,7 +103,15 @@ def model_weights_generator(
     framework: str,
     filter_regex: Optional[str] = None,
     download_dir: Optional[str] = None,
+    weights_iterator: Optional[Iterable[tuple[str, Any]]] = None,
 ) -> Generator[tuple, None, None]:
+    if weights_iterator is not None:
+        for name, weight_tensor in weights_iterator:
+            if filter_regex is not None and not re.match(filter_regex, name):
+                continue
+            yield name, weight_tensor
+        return
+
     for st_file in model_file_generator(model_name_or_path, download_dir):
         for name, weight_tensor in model_weights_single_file_generator(
                 st_file, framework, filter_regex):

@@ -15,7 +15,8 @@ from jax.sharding import Mesh
 from safetensors.numpy import save_file
 
 from tpu_inference.models.jax.utils.weight_utils import (
-    MetadataMap, load_hf_weights, transfer_state_with_mappings)
+    MetadataMap, load_hf_weights, model_weights_generator,
+    transfer_state_with_mappings)
 
 # ----- nnx.Module Wrappers -----
 
@@ -178,3 +179,23 @@ class WeightLoadingDtypeTest(jtu.JaxTestCase):
 
         self.assertEqual(model.weight_to_cast.value.dtype, model_dtype)
         self.assertEqual(model.weight_to_keep.value.dtype, jnp.float32)
+
+
+class ModelWeightsGeneratorIteratorTest(jtu.JaxTestCase):
+
+    def test_uses_supplied_iterator(self):
+        tensor = jnp.ones((2, 2), dtype=jnp.bfloat16)
+        weights_iterator = iter([("keep.weight", tensor), ("drop.bias", tensor)])
+
+        pairs = list(
+            model_weights_generator(
+                model_name_or_path="unused",
+                framework="pt",
+                filter_regex=r"keep\..*",
+                weights_iterator=weights_iterator,
+            ))
+
+        self.assertLen(pairs, 1)
+        self.assertEqual(pairs[0][0], "keep.weight")
+        np.testing.assert_array_equal(np.asarray(pairs[0][1]),
+                                      np.asarray(tensor))

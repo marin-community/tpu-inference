@@ -48,6 +48,22 @@ DTYPE_VIEW_MAP = {
 }
 
 
+def gpt_oss_weights_generator(vllm_config: VllmConfig):
+    model_name_or_path = vllm_config.model_config.model
+    if getattr(vllm_config.model_config, "model_weights", ""):
+        model_name_or_path = vllm_config.model_config.model_weights
+    weights_iterator = getattr(vllm_config.model_config,
+                               "model_weights_iterator", None)
+    if weights_iterator is not None:
+        logger.info("Loading GPT-OSS weights from model_weights_iterator")
+    return model_weights_generator(
+        model_name_or_path=model_name_or_path,
+        framework="pt",
+        download_dir=vllm_config.load_config.download_dir,
+        weights_iterator=weights_iterator,
+    )
+
+
 @dataclass
 class GptOss(nnx.Module):
     """
@@ -292,10 +308,8 @@ class GptOss(nnx.Module):
         is_verbose = self.vllm_config.additional_config.get(
             "is_verbose", False)
 
-        names_and_weights_generator = model_weights_generator(
-            model_name_or_path=self.vllm_config.model_config.model,
-            framework="pt",
-            download_dir=self.vllm_config.load_config.download_dir)
+        names_and_weights_generator = gpt_oss_weights_generator(
+            self.vllm_config)
 
         # Build a pool of weights with MXFP4 experts combined if neededs
         pool: dict[str, torch.Tensor | tuple] = (self._build_mxfp4_pool(
@@ -329,6 +343,8 @@ class GptOss(nnx.Module):
                 if isinstance(loaded_weight, tuple):
                     # Loaded weight is an MXFP4 tuple
                     blocks_u8, scales_u8 = loaded_weight
+                    blocks_u8 = self._to_jax_array(blocks_u8)
+                    scales_u8 = self._to_jax_array(scales_u8)
                     # Quantized param (QArray): set qvalue/scale directly and skip regular path
                     if hasattr(model_weight, "array"):  # QArray check
                         codes_fp32_t = u8_unpack_e2m1(blocks_u8).astype(
@@ -426,12 +442,8 @@ class GptOss(nnx.Module):
             codes_fp32_t = transform_fn(codes_fp32_t, None)
             scales_fp32_t = transform_fn(scales_fp32_t, None)
 
-        # Convert from torch.Tensor to numpy before creating JAX arrays
-        codes_fp32_t = codes_fp32_t.detach().cpu().numpy()
-        scales_fp32_t = scales_fp32_t.detach().cpu().numpy()
-
-        codes_jnp = jnp.asarray(codes_fp32_t).astype(q_dtype)
-        scales_jnp = jnp.asarray(scales_fp32_t).astype(s_dtype)
+        codes_jnp = self._to_jax_array(codes_fp32_t).astype(q_dtype)
+        scales_jnp = self._to_jax_array(scales_fp32_t).astype(s_dtype)
 
         def get_q_slice(index):
             return codes_jnp[index]
@@ -455,16 +467,30 @@ class GptOss(nnx.Module):
         """Assign a regular tensor (non-MXFP4) into the model param with transform applied."""
         if jax_path_template == "layers.*.attn.sinks_N":
             # Checkpoint is bf16, but we have to upcast sinks to f32, as required by RPA_v3 kernel
-            weight_np = jnp.array(loaded_weight.to(torch.float32).numpy())
-        else:
-            torch_view_type = DTYPE_VIEW_MAP.get(jnp.dtype(cast_type))
-            if torch_view_type:
-                weight_np = jnp.array(
-                    loaded_weight.view(torch_view_type).numpy()).view(
-                        cast_type)
+            if isinstance(loaded_weight, jax.Array):
+                weight_np = loaded_weight.astype(jnp.float32)
+            elif isinstance(loaded_weight, torch.Tensor):
+                weight_np = jnp.array(loaded_weight.to(torch.float32).numpy())
             else:
-                raise ValueError(
-                    f"Unsupported dtype for tensor conversion: {cast_type}")
+                raise TypeError(
+                    f"Unsupported weight type for GPT-OSS tensor conversion: {type(loaded_weight)!r}"
+                )
+        else:
+            if isinstance(loaded_weight, jax.Array):
+                weight_np = loaded_weight.astype(cast_type)
+            elif isinstance(loaded_weight, torch.Tensor):
+                torch_view_type = DTYPE_VIEW_MAP.get(jnp.dtype(cast_type))
+                if torch_view_type:
+                    weight_np = jnp.array(
+                        loaded_weight.view(torch_view_type).numpy()).view(
+                            cast_type)
+                else:
+                    raise ValueError(
+                        f"Unsupported dtype for tensor conversion: {cast_type}")
+            else:
+                raise TypeError(
+                    f"Unsupported weight type for GPT-OSS tensor conversion: {type(loaded_weight)!r}"
+                )
 
         transformed_weight = transform_fn(
             weight_np, target_shape) if transform_fn else weight_np
@@ -481,6 +507,15 @@ class GptOss(nnx.Module):
             transformed_weight.shape,
             NamedSharding(self.mesh, P(*model_weight.sharding)), get_slice)
         model_weight.value = sharded_array
+
+    def _to_jax_array(self, loaded_weight):
+        if isinstance(loaded_weight, jax.Array):
+            return loaded_weight
+        if isinstance(loaded_weight, torch.Tensor):
+            return jnp.asarray(loaded_weight.detach().cpu().numpy())
+        raise TypeError(
+            f"Unsupported weight type for GPT-OSS streamed loading: {type(loaded_weight)!r}"
+        )
 
     def __call__(
         self,
