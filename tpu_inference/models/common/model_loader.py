@@ -73,6 +73,10 @@ _ABSTRACT_BOOTSTRAP_HF_QUANTIZATION_ALLOWLIST: dict[str, frozenset[str]] = {
     "GptOss": frozenset({MXFP4}),
 }
 
+_ABSTRACT_BOOTSTRAP_TPU_QUANTIZATION_ALLOWLIST: dict[str, frozenset[str]] = {
+    "GptOss": frozenset({MXFP4}),
+}
+
 
 @dataclass(frozen=True)
 class TpuBootstrapConfig:
@@ -138,7 +142,9 @@ def _resolved_bootstrap_mode(vllm_config: VllmConfig,
             vllm_config, model_class, hf_quantization_config)):
         raise ValueError(
             f"{mode} is incompatible with hf quantization_config")
-    if getattr(vllm_config.model_config, "quantization", None):
+    tpu_quantization = getattr(vllm_config.model_config, "quantization", None)
+    if (tpu_quantization and not _is_bootstrap_safe_tpu_quantization(
+            vllm_config, model_class, tpu_quantization)):
         raise ValueError(
             f"{mode} is incompatible with TPU quantization")
     # Validate mode vs load_format
@@ -161,6 +167,21 @@ def _is_bootstrap_safe_hf_quantization(vllm_config: VllmConfig, model_class: Any
         return False
     quant_method = hf_quantization_config.get("quant_method")
     if quant_method not in allowed_quant_methods:
+        return False
+    additional_config = getattr(vllm_config, "additional_config", {}) or {}
+    return bool(additional_config.get("skip_quantization", False))
+
+
+def _is_bootstrap_safe_tpu_quantization(vllm_config: VllmConfig,
+                                        model_class: Any,
+                                        tpu_quantization: Any) -> bool:
+    arch = model_class.__name__
+    allowed_quant_methods = _ABSTRACT_BOOTSTRAP_TPU_QUANTIZATION_ALLOWLIST.get(
+        arch)
+    if allowed_quant_methods is None or not isinstance(tpu_quantization, str):
+        return False
+    normalized_quant_method = tpu_quantization.removeprefix("tpu-")
+    if normalized_quant_method not in allowed_quant_methods:
         return False
     additional_config = getattr(vllm_config, "additional_config", {}) or {}
     return bool(additional_config.get("skip_quantization", False))

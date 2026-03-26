@@ -677,6 +677,33 @@ class TestResolvedBootstrapMode:
         with pytest.raises(ValueError, match="quantization_config"):
             model_loader._resolved_bootstrap_mode(vllm_config, model_class)
 
+    def test_gptoss_abstract_load_allows_tpu_mxfp4_when_skip_quantization(
+            self, vllm_config):
+        vllm_config.load_config.load_format = "runai_streamer"
+        vllm_config.additional_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_load"
+            },
+            "skip_quantization": True,
+        }
+        vllm_config.model_config.quantization = "tpu-mxfp4"
+        model_class = self._make_mock_class("GptOss")
+        assert model_loader._resolved_bootstrap_mode(
+            vllm_config, model_class) == "abstract_load"
+
+    def test_gptoss_abstract_load_with_tpu_quantization_requires_skip_quantization(
+            self, vllm_config):
+        vllm_config.load_config.load_format = "runai_streamer"
+        vllm_config.additional_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_load"
+            }
+        }
+        vllm_config.model_config.quantization = "tpu-mxfp4"
+        model_class = self._make_mock_class("GptOss")
+        with pytest.raises(ValueError, match="TPU quantization"):
+            model_loader._resolved_bootstrap_mode(vllm_config, model_class)
+
     def test_abstract_dummy_with_non_dummy_load_format_raises(self, vllm_config):
         vllm_config.load_config.load_format = "auto"
         vllm_config.additional_config = {
