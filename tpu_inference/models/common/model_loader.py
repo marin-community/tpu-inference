@@ -393,9 +393,11 @@ def _get_nnx_model(
                 apply_to_abstract_model=True)
 
             model = nnx.eval_shape(abstract_model_fn)
-            quantization_config = vllm_config.model_config.hf_config.quantization_config if hasattr(
+            quantization_config = getattr(
                 vllm_config.model_config.hf_config,
-                "quantization_config") else {}
+                "quantization_config",
+                None,
+            ) or {}
             load_random_weights_into_qwix_abstract_model(
                 rng, model, mesh, quantization_config)
             with mesh:

@@ -48,6 +48,17 @@ DTYPE_VIEW_MAP = {
 }
 
 
+def _hf_quant_method(hf_config: object) -> str | None:
+    """Return the Hugging Face quantization method when present."""
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    if not isinstance(quantization_config, dict):
+        return None
+    quant_method = quantization_config.get("quant_method")
+    if isinstance(quant_method, str):
+        return quant_method
+    return None
+
+
 def gpt_oss_weights_generator(vllm_config: VllmConfig):
     model_name_or_path = vllm_config.model_config.model
     if getattr(vllm_config.model_config, "model_weights", ""):
@@ -222,9 +233,7 @@ class GptOss(nnx.Module):
         self.rng = nnx.Rngs(rng)
 
         # Determine quantization method from HF config (config.json)
-        quant_method = (self.hf_config.quantization_config["quant_method"]
-                        if hasattr(self.hf_config, "quantization_config") else
-                        None)
+        quant_method = _hf_quant_method(self.hf_config)
 
         # Format: 'hf_key': ('jax_model_path', transform_function, target_shape)
         transforms = {

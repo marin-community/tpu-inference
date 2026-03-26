@@ -17,6 +17,7 @@ from safetensors.numpy import save_file
 from tpu_inference.models.jax.utils.weight_utils import (
     MetadataMap, load_hf_weights, model_weights_generator,
     transfer_state_with_mappings)
+from tpu_inference.models.jax.gpt_oss import _hf_quant_method
 
 # ----- nnx.Module Wrappers -----
 
@@ -199,3 +200,12 @@ class ModelWeightsGeneratorIteratorTest(jtu.JaxTestCase):
         self.assertEqual(pairs[0][0], "keep.weight")
         np.testing.assert_array_equal(np.asarray(pairs[0][1]),
                                       np.asarray(tensor))
+
+
+class GptOssConfigHelperTest(jtu.JaxTestCase):
+
+    def test_hf_quant_method_handles_missing_quantization(self):
+        class MockConfig:
+            quantization_config = None
+
+        assert _hf_quant_method(MockConfig()) is None

@@ -677,6 +677,20 @@ class TestResolvedBootstrapMode:
         with pytest.raises(ValueError, match="quantization_config"):
             model_loader._resolved_bootstrap_mode(vllm_config, model_class)
 
+    def test_gptoss_bf16_abstract_load_allows_unquantized_streaming(
+            self, vllm_config):
+        vllm_config.load_config.load_format = "runai_streamer"
+        vllm_config.additional_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_load"
+            }
+        }
+        vllm_config.model_config.hf_config.quantization_config = None
+        vllm_config.model_config.quantization = None
+        model_class = self._make_mock_class("GptOss")
+        assert model_loader._resolved_bootstrap_mode(
+            vllm_config, model_class) == "abstract_load"
+
     def test_gptoss_abstract_load_allows_tpu_mxfp4_when_skip_quantization(
             self, vllm_config):
         vllm_config.load_config.load_format = "runai_streamer"

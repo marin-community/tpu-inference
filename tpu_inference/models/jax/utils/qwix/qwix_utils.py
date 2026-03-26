@@ -445,8 +445,9 @@ def get_default_qwix_quantization_config(
         return None
     model_type = hf_config.model_type.lower() if hasattr(
         hf_config, "model_type") else None
-    quant_method = hf_config.quantization_config["quant_method"] if hasattr(
-        hf_config, "quantization_config") else None
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    quant_method = (quantization_config.get("quant_method")
+                    if isinstance(quantization_config, dict) else None)
     # TODO (jacobplatin): remove this so that we can support various quantization types + make
     # more flexible
     # NOTE (jacobplatin): we'll default to mixed FP8 (attention) + FP4 (MoE experts)
@@ -457,7 +458,7 @@ def get_default_qwix_quantization_config(
         # Dynamically fetch block size from HF config if available
         # Config fmt: 'weight_block_size': [1, 512] -> we want the 2nd dim for tile_size
         # NOTE: if the checkpoint is not 1D subchannel, we will throw an error
-        hf_quant_config = hf_config.quantization_config
+        hf_quant_config = quantization_config
         assert "weight_block_size" in hf_quant_config, "Expected weight_block_size in quantization_config"
         block_size = hf_quant_config["weight_block_size"]
         if isinstance(block_size, (list, tuple)) and len(block_size) == 2:

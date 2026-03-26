@@ -957,6 +957,16 @@ class TestGetDefaultQwixQuantizationConfig(unittest.TestCase):
             hf_config, False)
         self.assertEqual(result, self.mock_gpt_oss_config)
 
+    def test_gpt_oss_bf16_without_quantization_returns_none(self):
+        """BF16 GPT-OSS should not inject MXFP4 defaults when quantization is absent."""
+        hf_config = MagicMock()
+        hf_config.model_type = "gpt_oss"
+        hf_config.quantization_config = None
+
+        result = quantize_qwix.get_default_qwix_quantization_config(
+            hf_config, False)
+        self.assertIsNone(result)
+
     def test_missing_attributes_handled(self):
         """Test that function handles hf_config objects missing model_type safely."""
         hf_config = object()  # No attributes
