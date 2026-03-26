@@ -28,6 +28,7 @@ from vllm.model_executor.model_loader.runai_streamer_loader import \
 from vllm.utils.func_utils import supports_kw
 
 from tpu_inference import envs
+from tpu_inference.layers.common.quant_methods import MXFP4
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.utils.qwix.qwix_utils import (
@@ -50,6 +51,7 @@ _VLLM_PREFERRED_ARCHITECTURES: frozenset[str] = frozenset(
 _ABSTRACT_BOOTSTRAP_ARCHITECTURES: frozenset[str] = frozenset({
     "LlamaForCausalLM",
     "MistralForCausalLM",  # vLLM alias for LlamaForCausalLM
+    "GptOss",
 })
 
 # Fallback mapping from HuggingFace model_type to JAX registry key.
@@ -64,7 +66,12 @@ _MODEL_TYPE_TO_REGISTRY_KEY: dict[str, str] = {
 # "vllm" to "flax_nnx". This is NOT the full JAX registry — only models
 # we have explicitly vetted for bootstrap-mode routing.
 # Empty on v0.13.2 because Qwen3MoeForCausalLM is not in the registry.
-_BOOTSTRAP_JAX_ROUTING_ALLOWLIST: frozenset[str] = frozenset()
+_BOOTSTRAP_JAX_ROUTING_ALLOWLIST: frozenset[str] = frozenset(
+    {"GptOssForCausalLM"})
+
+_ABSTRACT_BOOTSTRAP_HF_QUANTIZATION_ALLOWLIST: dict[str, frozenset[str]] = {
+    "GptOss": frozenset({MXFP4}),
+}
 
 
 @dataclass(frozen=True)
@@ -125,8 +132,10 @@ def _resolved_bootstrap_mode(vllm_config: VllmConfig,
     if apply_qwix_on_abstract_model(vllm_config):
         raise ValueError(
             f"{mode} is incompatible with Qwix abstract quantization")
-    if getattr(vllm_config.model_config.hf_config, "quantization_config",
-               None):
+    hf_quantization_config = getattr(vllm_config.model_config.hf_config,
+                                     "quantization_config", None)
+    if (hf_quantization_config and not _is_bootstrap_safe_hf_quantization(
+            vllm_config, model_class, hf_quantization_config)):
         raise ValueError(
             f"{mode} is incompatible with hf quantization_config")
     if getattr(vllm_config.model_config, "quantization", None):
@@ -139,6 +148,22 @@ def _resolved_bootstrap_mode(vllm_config: VllmConfig,
         raise ValueError(
             "abstract_load requires a real load_format, not 'dummy'")
     return mode
+
+
+def _is_bootstrap_safe_hf_quantization(vllm_config: VllmConfig, model_class: Any,
+                                       hf_quantization_config: Any) -> bool:
+    arch = model_class.__name__
+    allowed_quant_methods = _ABSTRACT_BOOTSTRAP_HF_QUANTIZATION_ALLOWLIST.get(
+        arch)
+    if allowed_quant_methods is None:
+        return False
+    if not isinstance(hf_quantization_config, dict):
+        return False
+    quant_method = hf_quantization_config.get("quant_method")
+    if quant_method not in allowed_quant_methods:
+        return False
+    additional_config = getattr(vllm_config, "additional_config", {}) or {}
+    return bool(additional_config.get("skip_quantization", False))
 
 
 def _build_abstract_model_and_load_weights(

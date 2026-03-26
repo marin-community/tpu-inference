@@ -646,6 +646,37 @@ class TestResolvedBootstrapMode:
         with pytest.raises(ValueError, match="requires a real load_format"):
             model_loader._resolved_bootstrap_mode(vllm_config, model_class)
 
+    def test_gptoss_abstract_load_allows_mxfp4_when_skip_quantization(
+            self, vllm_config):
+        vllm_config.load_config.load_format = "runai_streamer"
+        vllm_config.additional_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_load"
+            },
+            "skip_quantization": True,
+        }
+        vllm_config.model_config.hf_config.quantization_config = {
+            "quant_method": "mxfp4"
+        }
+        model_class = self._make_mock_class("GptOss")
+        assert model_loader._resolved_bootstrap_mode(
+            vllm_config, model_class) == "abstract_load"
+
+    def test_gptoss_abstract_load_requires_skip_quantization(
+            self, vllm_config):
+        vllm_config.load_config.load_format = "runai_streamer"
+        vllm_config.additional_config = {
+            "tpu_bootstrap": {
+                "model_bootstrap": "abstract_load"
+            }
+        }
+        vllm_config.model_config.hf_config.quantization_config = {
+            "quant_method": "mxfp4"
+        }
+        model_class = self._make_mock_class("GptOss")
+        with pytest.raises(ValueError, match="quantization_config"):
+            model_loader._resolved_bootstrap_mode(vllm_config, model_class)
+
     def test_abstract_dummy_with_non_dummy_load_format_raises(self, vllm_config):
         vllm_config.load_config.load_format = "auto"
         vllm_config.additional_config = {
@@ -853,11 +884,10 @@ class TestBootstrapAwareRouting:
     @patch.dict(os.environ, {"MODEL_IMPL_TYPE": "auto"}, clear=True)
     @patch("tpu_inference.models.common.model_loader.get_vllm_model")
     @patch("tpu_inference.models.common.model_loader.get_flax_model")
-    def test_gptoss_not_rerouted_by_bootstrap(self, mock_get_flax,
-                                              mock_get_vllm, vllm_config, rng,
-                                              mesh):
-        """GptOssForCausalLM is vllm-preferred. prefer_jax_for_bootstrap
-        must NOT reroute it because it is not in _BOOTSTRAP_JAX_ROUTING_ALLOWLIST."""
+    def test_gptoss_rerouted_by_bootstrap(self, mock_get_flax,
+                                          mock_get_vllm, vllm_config, rng,
+                                          mesh):
+        """GPT-OSS can explicitly opt into the JAX bootstrap route."""
         vllm_config.model_config.hf_config.architectures = [
             "GptOssForCausalLM"
         ]
@@ -866,11 +896,11 @@ class TestBootstrapAwareRouting:
                 "prefer_jax_for_bootstrap": True
             }
         }
-        mock_get_vllm.return_value = "vllm_model_sentinel"
+        mock_get_flax.return_value = "flax_model_sentinel"
         result = model_loader.get_model(vllm_config, rng, mesh)
-        mock_get_flax.assert_not_called()
-        mock_get_vllm.assert_called_once()
-        assert result == "vllm_model_sentinel"
+        mock_get_flax.assert_called_once()
+        mock_get_vllm.assert_not_called()
+        assert result == "flax_model_sentinel"
 
 
 # ==============================================================================
