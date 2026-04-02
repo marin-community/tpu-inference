@@ -6,7 +6,8 @@ import jax.numpy as jnp
 import torch
 import vllm.envs as vllm_envs
 from tpu_info import device
-from vllm.inputs import ProcessorInputs, PromptType
+from vllm.inputs import EngineInput, PromptType
+from vllm.multimodal.processing import ProcessorInputs
 from vllm.platforms.interface import Platform, PlatformEnum
 
 from tpu_inference import envs
@@ -230,9 +231,8 @@ class TpuPlatform(Platform):
     @classmethod
     def validate_request(
         cls,
-        prompt: PromptType,
+        processed_inputs: EngineInput,
         params: Union["SamplingParams", PoolingParams],
-        processed_inputs: ProcessorInputs,
     ) -> None:
         """Raises if this request is unsupported on this platform"""
         from vllm.sampling_params import SamplingParams, SamplingType
