@@ -33,6 +33,7 @@ DECODE_HEAVY_RATIO_THRESHOLD = 0.2
 # for prefilling is in the BALANCED phase
 BALANCED_RATIO_THRESHOLD = (0.4, 0.6)
 PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR = 15
+PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP = 0
 
 logger = init_logger(__name__)
 
@@ -42,6 +43,8 @@ class InferencePhase(Enum):
     DECODE_HEAVY = 1
     BALANCED = 2
     AMBIGUOUS = 3
+    PREFILL_ONLY = 4
+    DECODE_ONLY = 5
 
 
 def get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:
@@ -259,15 +262,19 @@ def determine_phase_from_batch_composition_stats(
     total_num_scheduled_tokens = batch_composition_stats[
         "total_num_scheduled_tokens"]
     prefill_ratio_for_batch = num_prefill_tokens / total_num_scheduled_tokens
+    if prefill_ratio_for_batch == 1.0:
+        return InferencePhase.PREFILL_ONLY
+    if prefill_ratio_for_batch == 0.0:
+        return InferencePhase.DECODE_ONLY
     if prefill_ratio_for_batch >= PREFILL_HEAVY_RATIO_THRESHOLD:
         return InferencePhase.PREFILL_HEAVY
-    elif prefill_ratio_for_batch <= DECODE_HEAVY_RATIO_THRESHOLD:
+    if prefill_ratio_for_batch <= DECODE_HEAVY_RATIO_THRESHOLD:
         return InferencePhase.DECODE_HEAVY
-    elif prefill_ratio_for_batch >= BALANCED_RATIO_THRESHOLD[
+    if prefill_ratio_for_batch >= BALANCED_RATIO_THRESHOLD[
             0] and prefill_ratio_for_batch <= BALANCED_RATIO_THRESHOLD[1]:
         return InferencePhase.BALANCED
-    else:
-        return InferencePhase.AMBIGUOUS
+
+    return InferencePhase.AMBIGUOUS
 
 
 class PhasedBasedProfiler:
@@ -299,10 +306,16 @@ class PhasedBasedProfiler:
         self.num_steps_to_profile_for: int = int(
             os.getenv("PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR",
                       PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR))
+        self.num_decode_steps_to_skip: int = int(
+            os.getenv("PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP",
+                      PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP))
+        self.decode_steps_skipped: int = 0
         self.profile_dir: str = profile_dir
         # NOTE: we purposely don't have AMBIGUOUS here
         self.inference_phase_seen: dict = {
+            InferencePhase.PREFILL_ONLY: False,
             InferencePhase.PREFILL_HEAVY: False,
+            InferencePhase.DECODE_ONLY: False,
             InferencePhase.DECODE_HEAVY: False,
             InferencePhase.BALANCED: False
         }
@@ -314,6 +327,10 @@ class PhasedBasedProfiler:
         logger.info(
             "Phased-based profiler enabled. Traces will be saved to: %s",
             self.profile_dir)
+        if self.num_decode_steps_to_skip > 0:
+            logger.info(
+                "Will skip %d decode-heavy steps before profiling decode_heavy phase.",
+                self.num_decode_steps_to_skip)
 
     def _write_batch_composition_stats_to_file_helper(
             self, batch_composition_stats: dict) -> None:
@@ -349,6 +366,15 @@ class PhasedBasedProfiler:
         for phase, has_been_seen in self.inference_phase_seen.items():
             if has_been_seen or phase != current_determined_phase:
                 continue
+
+            # Skip a configurable number of decode-heavy steps before profiling
+            if phase == InferencePhase.DECODE_HEAVY and \
+                    self.decode_steps_skipped < self.num_decode_steps_to_skip:
+                self.decode_steps_skipped += 1
+                logger.debug(
+                    "Skipping decode-heavy step %d/%d before profiling.",
+                    self.decode_steps_skipped, self.num_decode_steps_to_skip)
+                break
 
             self.inference_phase_seen[phase] = True
             self.profiling_n_steps_left = self.num_steps_to_profile_for

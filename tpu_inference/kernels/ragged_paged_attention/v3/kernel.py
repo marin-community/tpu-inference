@@ -452,13 +452,16 @@ def _ragged_paged_attention_kernel_loop(
                 q = jnp.clip(q, min=minval, max=maxval)
             q = q.astype(k.dtype)
 
-        s = jnp.matmul(q, k.T,
-                       preferred_element_type=jnp.float32).astype(out_dtype)
-        s *= sm_scale
+        s = jnp.matmul(q, k.T, preferred_element_type=jnp.float32)
+
+        s_scale = sm_scale
         if k_scale is not None:
-            s *= k_scale
+            s_scale *= k_scale
         if q_scale is not None:
-            s *= q_scale
+            s_scale *= q_scale
+
+        s *= s_scale
+
         if soft_cap is not None:
             s = soft_cap * jnp.tanh(s / soft_cap)
 
@@ -491,6 +494,9 @@ def _ragged_paged_attention_kernel_loop(
             s = jnp.where(mask, s, mask_value)
 
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
+
+        # if converting the type too early, there will be accuracy issue.
+        s_rowmax = s_rowmax.astype(out_dtype)
         m_prev = m_ref[...]
         m_curr = jnp.maximum(m_prev, s_rowmax)
         m_ref[...] = m_curr
@@ -518,10 +524,12 @@ def _ragged_paged_attention_kernel_loop(
                                     128)
         assert o_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head,
                                head_dim)
-        pv = jnp.matmul(p, v,
-                        preferred_element_type=jnp.float32).astype(out_dtype)
+        pv = jnp.matmul(p, v, preferred_element_type=jnp.float32)
+
         if v_scale is not None:
             pv *= v_scale
+        # if converting the type too early, there will be accuracy issue.
+        pv = pv.astype(out_dtype)
         o_prev = o_ref[...]
         o_ref[...] = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
 

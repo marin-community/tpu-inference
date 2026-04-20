@@ -253,6 +253,8 @@ def get_default_maps(model_config, mesh: Mesh,
     sharding_size = mesh.shape["model"]
 
     hf_config = model_config.hf_config
+    if text_config := getattr(hf_config, "text_config", None):
+        hf_config = text_config
 
     num_heads = hf_config.num_attention_heads
     num_kv_heads = hf_config.num_key_value_heads
@@ -810,9 +812,14 @@ def load_nnx_param_from_reshaped_torch(
         reshape_dims: Optional tuple specifying the shape to reshape the torch weight to before permutation. If None, no reshaping is applied.
         permute_dims: Optional tuple specifying the permutation of dimensions. If None, no-op for 1D tensors and transpose for 2D tensors is applied.
     """
-    jax_weight = jax_array_from_reshaped_torch(torch_weight,
-                                               reshape_dims=reshape_dims,
-                                               permute_dims=permute_dims)
+    try:
+        jax_weight = jax_array_from_reshaped_torch(torch_weight,
+                                                   reshape_dims=reshape_dims,
+                                                   permute_dims=permute_dims)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to convert torch weight for '{param_name}' ({torch_weight.shape}) to JAX array, with reshape_dims={reshape_dims} and permute_dims={permute_dims}"
+        ) from e
 
     assert tuple(jax_weight.shape) == jax_param.value.shape, \
         f"Shape mismatch when loading weight '{param_name}': torch {jax_weight.shape} vs jax {jax_param.value.shape}"
@@ -871,6 +878,14 @@ class JaxAutoWeightsLoader(AutoWeightsLoader):
         # Book mark those already done processing, skip if visited.
         self._process_weights_after_loading_per_module = defaultdict(
             lambda: False)
+
+    def _add_loadable_non_param_tensors(self, module: JaxModule,
+                                        child_params: dict[str, Any]):
+        """
+        Add tensor names that are not in the model params that may be in the
+        safetensors, e.g., batch normalization stats and registered buffers.
+        """
+        ...
 
     def _load_module(self, base_prefix: str, module: JaxModule,
                      weights: Iterable) -> Iterable:
