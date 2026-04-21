@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Datastructures defining an input batch
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional, cast
 
 import jax
@@ -13,7 +13,9 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.utils.collection_utils import swap_dict_values
 from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
+from vllm.v1.spec_decode.utils import is_spec_decode_unsupported
 
 from tpu_inference.runner.block_table import MultiGroupBlockTable
 
@@ -29,6 +31,8 @@ class CachedRequestState(NewRequestData):
     generator: Optional[Any] = None
     mrope_positions: Optional[jax.Array] = None
     mrope_position_delta: Optional[int] = None
+    in_progress_prompt_logprobs: list[LogprobsTensors] = field(
+        default_factory=list)
 
     def __post_init__(self):
         self.num_prompt_tokens = len(self.prompt_token_ids)

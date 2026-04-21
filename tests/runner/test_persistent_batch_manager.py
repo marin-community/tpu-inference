@@ -16,6 +16,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+from vllm.v1.outputs import LogprobsTensors
 
 from tpu_inference.runner.persistent_batch_manager import \
     PersistentBatchManager
@@ -127,6 +128,55 @@ class TestReorderBatch(unittest.TestCase):
 
 
 class TestPersistentBatchManager(unittest.TestCase):
+
+    def test_update_states_preserves_cached_prompt_logprobs(self):
+        requests = {}
+        input_batch = MagicMock()
+        input_batch.req_id_to_index = {}
+        input_batch.num_reqs = 0
+        input_batch.remove_request.return_value = None
+
+        encoder_cache = MagicMock()
+        model_config = MagicMock()
+
+        manager = PersistentBatchManager(requests,
+                                         input_batch,
+                                         encoder_cache,
+                                         False,
+                                         model_config,
+                                         is_last_rank=True)
+
+        cached_prompt_logprobs = LogprobsTensors(
+            logprob_token_ids=np.array([[1, 2]], dtype=np.int32),
+            logprobs=np.array([[0.1, 0.2]], dtype=np.float32),
+            selected_token_ranks=np.array([1], dtype=np.int32),
+        )
+
+        new_req_data = MagicMock()
+        new_req_data.req_id = "req-1"
+        new_req_data.prompt_token_ids = [10, 11]
+        new_req_data.mm_features = []
+        new_req_data.sampling_params = MagicMock()
+        new_req_data.pooling_params = None
+        new_req_data.block_ids = ([1], )
+        new_req_data.num_computed_tokens = 1
+        new_req_data.lora_request = None
+        new_req_data.cached_prompt_logprobs = cached_prompt_logprobs
+
+        scheduler_output = MagicMock()
+        scheduler_output.finished_req_ids = set()
+        scheduler_output.free_encoder_mm_hashes = []
+        scheduler_output.num_scheduled_tokens = {"req-1": 1}
+        scheduler_output.scheduled_new_reqs = [new_req_data]
+        scheduler_output.scheduled_cached_reqs.req_ids = []
+        scheduler_output.scheduled_spec_decode_tokens = {}
+
+        manager.update_states(scheduler_output, None)
+
+        self.assertIs(
+            manager.requests["req-1"].cached_prompt_logprobs,
+            cached_prompt_logprobs,
+        )
 
     def test_update_states_pp_non_last_rank(self):
         """
