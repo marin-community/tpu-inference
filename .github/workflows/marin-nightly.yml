@@ -92,6 +92,14 @@ jobs:
             "marin-validate-dist" \
             validated
 
+      - name: Extract upstream sync metadata
+        run: |
+          jq '.upstream_sync // {
+            "status": "missing",
+            "fork_repo": .repo,
+            "message": "No upstream sync metadata was present in marin-build.json."
+          }' validated/marin-build.json > validated/marin-upstream-sync.json
+
       - name: Download paired vLLM nightly assets
         run: |
           bash .github/scripts/marin_release.sh download-release-assets \
@@ -142,6 +150,8 @@ jobs:
 
           This release reuses the exact wheel produced by the latest successful \`marin-validate.yml\` run on \`main\`.
 
+          $(bash .github/scripts/marin_upstream_sync_notes.sh validated/marin-upstream-sync.json "MERGED WITH UPSTREAM TPU-INFERENCE MAIN")
+
           Paired \`vllm\` release: \`${{ steps.vllm.outputs.VLLM_TAG }}\`
           EOF
 
@@ -153,7 +163,8 @@ jobs:
             "$TITLE" \
             /tmp/tpu-nightly-notes.md \
             validated/*.whl \
-            validated/marin-build.json
+            validated/marin-build.json \
+            validated/marin-upstream-sync.json
 
           {
             echo "TAG=${TAG}"
@@ -190,6 +201,8 @@ jobs:
         id: pair
         run: |
           VLLM_SHA=$(jq -r '.sha' paired-vllm/marin-build.json)
+          VLLM_UPSTREAM_SYNC=$(jq -c '.upstream_sync // {"status":"missing","message":"No paired vLLM upstream sync metadata was present."}' paired-vllm/marin-build.json)
+          TPU_UPSTREAM_SYNC=$(jq -c '.upstream_sync // {"status":"missing","message":"No TPU upstream sync metadata was present."}' validated/marin-build.json)
           RELEASED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
           jq -n \
@@ -199,13 +212,17 @@ jobs:
             --arg vllm_tag "${{ steps.vllm.outputs.VLLM_TAG }}" \
             --arg tpu_sha "${{ steps.immutable.outputs.SHA }}" \
             --arg tpu_tag "${{ steps.immutable.outputs.TAG }}" \
+            --argjson vllm_upstream_sync "$VLLM_UPSTREAM_SYNC" \
+            --argjson tpu_upstream_sync "$TPU_UPSTREAM_SYNC" \
             '{
               release_type: $release_type,
               released_at: $released_at,
               vllm_sha: $vllm_sha,
               vllm_tag: $vllm_tag,
               tpu_inference_sha: $tpu_sha,
-              tpu_inference_tag: $tpu_tag
+              tpu_inference_tag: $tpu_tag,
+              vllm_upstream_sync: $vllm_upstream_sync,
+              tpu_inference_upstream_sync: $tpu_upstream_sync
             }' > marin-release-pair.json
 
           {
@@ -218,6 +235,8 @@ jobs:
           cat > /tmp/tpu-nightly-paired-notes.md <<EOF
           Auto-published nightly release for \`${{ steps.immutable.outputs.SHA }}\`.
 
+          $(bash .github/scripts/marin_upstream_sync_notes.sh validated/marin-upstream-sync.json "MERGED WITH UPSTREAM TPU-INFERENCE MAIN")
+
           Paired \`vllm\` release: \`${{ steps.pair.outputs.VLLM_TAG }}\`
           EOF
 
@@ -225,6 +244,9 @@ jobs:
           Moving alias for the latest Marin nightly release.
 
           Current immutable release: \`${{ steps.immutable.outputs.TAG }}\`
+
+          $(bash .github/scripts/marin_upstream_sync_notes.sh validated/marin-upstream-sync.json "MERGED WITH UPSTREAM TPU-INFERENCE MAIN")
+
           Paired \`vllm\` release: \`${{ steps.pair.outputs.VLLM_TAG }}\`
           EOF
 
@@ -237,6 +259,7 @@ jobs:
             /tmp/tpu-nightly-paired-notes.md \
             validated/*.whl \
             validated/marin-build.json \
+            validated/marin-upstream-sync.json \
             marin-release-pair.json
 
           bash .github/scripts/marin_release.sh upsert-release \
@@ -248,4 +271,5 @@ jobs:
             /tmp/tpu-nightly-alias-paired-notes.md \
             validated/*.whl \
             validated/marin-build.json \
+            validated/marin-upstream-sync.json \
             marin-release-pair.json

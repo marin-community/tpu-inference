@@ -76,6 +76,22 @@ jobs:
           import pathlib
 
           wheel_name = next(pathlib.Path("dist").glob("*.whl")).name
+          upstream_sync_path = pathlib.Path(".marin/upstream-sync.json")
+          if upstream_sync_path.exists():
+              upstream_sync = json.loads(upstream_sync_path.read_text())
+              upstream_sync.setdefault("status", "recorded")
+          else:
+              upstream_sync = {
+                  "status": "missing",
+                  "fork_repo": "marin-community/tpu-inference",
+                  "upstream_repo": "vllm-project/tpu-inference",
+                  "upstream_branch": "main",
+                  "message": (
+                      "No .marin/upstream-sync.json metadata was present "
+                      "when this artifact was validated."
+                  ),
+              }
+
           payload = {
               "repo": "marin-community/tpu-inference",
               "sha": "${{ steps.vars.outputs.SHA }}",
@@ -83,9 +99,12 @@ jobs:
               "date": "${{ steps.vars.outputs.DATE }}",
               "version": "${{ steps.vars.outputs.VERSION }}",
               "wheel": wheel_name,
+              "upstream_sync": upstream_sync,
           }
           pathlib.Path("dist/marin-build.json").write_text(
               json.dumps(payload, indent=2) + "\n")
+          pathlib.Path("dist/marin-upstream-sync.json").write_text(
+              json.dumps(upstream_sync, indent=2) + "\n")
           PY
 
       - name: Syntax-check TPU runner
@@ -171,4 +190,5 @@ jobs:
           path: |
             dist/*.whl
             dist/marin-build.json
+            dist/marin-upstream-sync.json
           retention-days: 14
