@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pipeline-name: deepseek-ai/DeepSeek-R1
-# pipeline-type: text-only
 steps:
   - label: "${TPU_VERSION:-tpu6e} Unit tests for deepseek-ai/DeepSeek-R1"
     key: "${TPU_VERSION:-tpu6e}_deepseek-ai_DeepSeek-R1_UnitTest"
@@ -58,7 +56,7 @@ steps:
       queue: cpu  # TODO: replace with execution environment
     env:
       TEST_MODEL: deepseek-ai/DeepSeek-R1
-      TENSOR_PARALLEL_SIZE: 1
+      TENSOR_PARALLEL_SIZE: "${TENSOR_PARALLEL_SIZE_SINGLE:-1}"
       MINIMUM_ACCURACY_THRESHOLD: 0  # TODO : replace 0 with your accuracy threshold
     commands:
       - |
@@ -85,7 +83,7 @@ steps:
       queue: cpu  # TODO: replace with execution environment
     env:
       TEST_MODEL: deepseek-ai/DeepSeek-R1
-      TENSOR_PARALLEL_SIZE: 1
+      TENSOR_PARALLEL_SIZE: "${TENSOR_PARALLEL_SIZE_SINGLE:-1}"
       MINIMUM_THROUGHPUT_THRESHOLD: 0  # TODO : replace 0 with your performance threshold
     commands:
       - |
