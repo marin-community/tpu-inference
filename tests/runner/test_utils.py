@@ -2,6 +2,7 @@
 import io
 import logging
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, mock_open, patch
 
 import jax
@@ -12,8 +13,8 @@ from jax._src.interpreters import pxla
 from jax._src.pallas.utils import next_power_of_2
 
 from tpu_inference.runner.utils import (
-    PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR, ForbidCompile, InferencePhase,
-    LatencyTracker, PhasedBasedProfiler,
+    PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR, AggregatedStatsLogger,
+    ForbidCompile, InferencePhase, LatencyTracker, PhasedBasedProfiler,
     determine_phase_from_batch_composition_stats, get_batch_composition_stats,
     get_padded_num_reqs_with_upper_limit, get_padded_token_len,
     get_req_paddings, get_token_paddings)
@@ -259,39 +260,59 @@ class MockInputBatch:
 
 class MockSchedulerOutput:
 
-    def __init__(self, num_scheduled_tokens):
+    def __init__(self,
+                 num_scheduled_tokens,
+                 scheduled_spec_decode_tokens=None):
         self.num_scheduled_tokens = num_scheduled_tokens
+        self.scheduled_spec_decode_tokens = scheduled_spec_decode_tokens or {}
 
 
 @pytest.mark.parametrize(
-    "scenario, num_reqs, req_ids, computed, scheduled, expected_prefill, expected_decode, expected_phase",
+    "scenario, num_reqs, req_ids, computed, scheduled, spec_tokens, expected_prefill, expected_decode, expected_phase",
     [
         ("prefill_only", 2, [101, 102], [0, 0], {
             101: 50,
             102: 100
-        }, 150, 0, "PREFILL_ONLY"),
+        }, None, 150, 0, "PREFILL_ONLY"),
         ("decode_only", 3, [201, 202, 203], [10, 20, 5], {
             201: 1,
             202: 1,
             203: 1
-        }, 0, 3, "DECODE_ONLY"),
+        }, None, 0, 3, "DECODE_ONLY"),
         ("mixed_batch", 4, [301, 302, 303, 304], [0, 10, 0, 20], {
             301: 100,
             302: 1,
             303: 50,
             304: 1
-        }, 150, 2, "PREFILL_HEAVY"),
+        }, None, 150, 2, "PREFILL_HEAVY"),
         ("chunked_prefill", 2, [401, 402], [50, 10], {
             401: 50,
             402: 1
-        }, 50, 1, "PREFILL_HEAVY"),
+        }, None, 50, 1, "PREFILL_HEAVY"),
+        # Speculative decoding: 1 target token + 3 draft tokens per request
+        # should all count as decode tokens, not chunked prefill.
+        ("spec_decode_only", 2, [501, 502], [10, 20], {
+            501: 4,
+            502: 4
+        }, {
+            501: [1, 2, 3],
+            502: [4, 5, 6]
+        }, 0, 8, "DECODE_ONLY"),
+        # Mixed: one request is doing chunked prefill, the other is verifying
+        # draft tokens. Spec tokens must not be misclassified as prefill.
+        ("spec_decode_with_chunked_prefill", 2, [601, 602], [0, 10], {
+            601: 50,
+            602: 4
+        }, {
+            602: [1, 2, 3]
+        }, 50, 4, "PREFILL_HEAVY"),
     ])
 def test_get_batch_composition_stats(scenario, num_reqs, req_ids, computed,
-                                     scheduled, expected_prefill,
+                                     scheduled, spec_tokens, expected_prefill,
                                      expected_decode, expected_phase):
     """Tests get_batch_composition_stats for various scenarios."""
     input_batch = MockInputBatch(req_ids, computed)
-    scheduler_output = MockSchedulerOutput(scheduled)
+    scheduler_output = MockSchedulerOutput(scheduled, spec_tokens)
     total_tokens = sum(scheduled.values())
     batch_id = 42
 
@@ -336,6 +357,128 @@ def test_determine_phase_from_batch_composition_stats(prefill_tokens,
     }
     phase = determine_phase_from_batch_composition_stats(stats)
     assert phase == expected_phase
+
+
+@pytest.fixture
+def aggregated_stats_logger_fixture(tmp_path):
+    """Fixture to mock dependencies for AggregatedStatsLogger."""
+    target_module = "tpu_inference.runner.utils"
+    mock_storage = MagicMock()
+    cloud_mock = MagicMock()
+    cloud_mock.storage = mock_storage
+    with patch(f"{target_module}.datetime") as mock_datetime, \
+         patch(f"{target_module}.atexit") as mock_atexit, \
+         patch("threading.Thread") as mock_thread, \
+         patch.dict("sys.modules", {"google.cloud": cloud_mock, "google.cloud.storage": mock_storage}), \
+         patch("tempfile.gettempdir", return_value=str(tmp_path)):
+
+        mock_now = MagicMock()
+        mock_now.strftime.return_value = "2025_01_01_12_00_00"
+        mock_datetime.datetime.now.return_value = mock_now
+
+        yield {
+            "mock_datetime": mock_datetime,
+            "mock_atexit": mock_atexit,
+            "mock_thread": mock_thread,
+            "mock_storage": mock_storage,
+            "tmp_path": tmp_path,
+        }
+
+
+def test_aggregated_stats_logger_initialization_local_path(
+        aggregated_stats_logger_fixture):
+    """Test logger initialization with a local directory."""
+    tmp_path = aggregated_stats_logger_fixture["tmp_path"]
+    profile_dir = tmp_path / "profiles"
+    logger = AggregatedStatsLogger(profile_dir=str(profile_dir))
+
+    expected_filename = "all_batches_stats_2025_01_01_12_00_00.jsonl"
+    expected_path = profile_dir / expected_filename
+
+    assert logger.profile_dir == str(profile_dir)
+    assert logger.local_temp_file == str(expected_path)
+    assert logger.target_file == str(expected_path)
+    assert profile_dir.exists()
+    assert expected_path.exists()
+    assert expected_path.read_text() == ""
+
+    aggregated_stats_logger_fixture[
+        "mock_atexit"].register.assert_called_once_with(logger.close)
+
+
+def test_aggregated_stats_logger_initialization_gcs_path(
+        aggregated_stats_logger_fixture):
+    """Test logger initialization with a GCS directory."""
+    tmp_path = aggregated_stats_logger_fixture["tmp_path"]
+    profile_dir = "gs://my-bucket/profiles"
+    logger = AggregatedStatsLogger(profile_dir=profile_dir)
+
+    expected_filename = "all_batches_stats_2025_01_01_12_00_00.jsonl"
+    expected_local_path = tmp_path / expected_filename
+    expected_target_path = f"gs://my-bucket/profiles/{expected_filename}"
+
+    assert logger.profile_dir == profile_dir
+    assert logger.local_temp_file == str(expected_local_path)
+    assert logger.target_file == expected_target_path
+    assert expected_local_path.exists()
+    assert expected_local_path.read_text() == ""
+
+    aggregated_stats_logger_fixture[
+        "mock_atexit"].register.assert_called_once_with(logger.close)
+
+
+def test_aggregated_stats_logger_log_single_entry(
+        aggregated_stats_logger_fixture):
+    """Test logging a single statistics dictionary."""
+    tmp_path = aggregated_stats_logger_fixture["tmp_path"]
+    profile_dir = tmp_path / "logs"
+    logger = AggregatedStatsLogger(profile_dir=str(profile_dir))
+
+    stats = {"batch_id": 1, "tokens": 100}
+    logger.log(stats)
+    logger.flush()
+
+    expected_json = '{"batch_id": 1, "tokens": 100}\n'
+    local_file_path = Path(logger.local_temp_file)
+    assert local_file_path.read_text() == expected_json
+
+
+def test_aggregated_stats_logger_auto_flush(aggregated_stats_logger_fixture):
+    """Test that flush is called automatically after flush_interval."""
+    profile_dir = "gs://my-bucket/logs"
+    flush_interval = 3
+    logger = AggregatedStatsLogger(profile_dir=profile_dir,
+                                   flush_interval=flush_interval)
+    mock_thread = aggregated_stats_logger_fixture["mock_thread"]
+    mock_storage = aggregated_stats_logger_fixture["mock_storage"]
+
+    for i in range(flush_interval - 1):
+        logger.log({"step": i})
+    mock_thread.assert_not_called()
+    mock_storage.Client.assert_not_called()
+
+    logger.log({"step": flush_interval - 1})
+    mock_thread.assert_called_once()
+    mock_thread.return_value.start.assert_called_once()
+    mock_storage.Client.assert_not_called()
+
+
+def test_aggregated_stats_logger_close_flushes_and_cleans_up_gcs(
+        aggregated_stats_logger_fixture):
+    """Test that close() flushes and removes the local temp file for GCS."""
+    profile_dir = "gs://my-bucket/logs"
+    logger = AggregatedStatsLogger(profile_dir=profile_dir)
+    mock_thread = aggregated_stats_logger_fixture["mock_thread"]
+    mock_storage = aggregated_stats_logger_fixture["mock_storage"]
+    logger.log({"step": 1})
+    local_file_path = Path(logger.local_temp_file)
+
+    assert local_file_path.exists()
+
+    logger.close()
+    mock_thread.assert_not_called()
+    mock_storage.Client.assert_called_once()
+    assert not local_file_path.exists()
 
 
 @pytest.fixture
@@ -401,7 +544,7 @@ def test_phased_profiler_full_cycle(profiler_fixture):
 
 
 def test_phased_profiler_ignores_initial_request(profiler_fixture):
-    """Tests that profiling is not triggered for initial small requests."""
+    """Tests that profiling is not triggered for initial single-token requests."""
     profiler = profiler_fixture["profiler"]
     mock_start = profiler_fixture["mock_start"]
     mock_determine_phase = profiler_fixture["mock_determine_phase"]
@@ -409,9 +552,6 @@ def test_phased_profiler_ignores_initial_request(profiler_fixture):
     mock_determine_phase.return_value = InferencePhase.PREFILL_HEAVY
 
     profiler.step({"num_reqs": 1, "total_num_scheduled_tokens": 1})
-    mock_start.assert_not_called()
-
-    profiler.step({"num_reqs": 1, "total_num_scheduled_tokens": 100})
     mock_start.assert_not_called()
 
     profiler.step({"num_reqs": 2, "total_num_scheduled_tokens": 1})
@@ -571,35 +711,78 @@ def test_phased_profiler_skips_decode_only_steps_based_on_kv_len(
     assert profiler.current_phase == ""
 
 
-def test_merge_multihost_profile_directories(tmp_path):
-    """Tests that multi-host profile directories with different timestamps are consolidated correctly."""
+def test_merge_profile_directories_ray_multihost(tmp_path):
+    """Ray multi-host: per-host timestamp dirs collapse into the earliest one.
+
+    Under the current code, profile_dir_with_phase_suffix always has a
+    dp_rank_N segment. The merge first hoists files up from
+    <phase>/dp_rank_0/plugins/profile/<ts>/ to <phase>/plugins/profile/<ts>/,
+    then collapses the timestamp dirs. Host-id-tagged filenames are
+    preserved (no dp{N}_ prefix is injected because TPU_MULTIPROCESS_DP is
+    off).
+    """
     profiler = PhasedBasedProfiler(profile_dir=str(tmp_path))
     phase_dir = tmp_path / "prefill_heavy"
-    profiler.profile_dir_with_phase_suffix = str(phase_dir)
+    rank_dir = phase_dir / "dp_rank_0"
+    profiler.profile_dir_with_phase_suffix = str(rank_dir)
 
-    profile_path = phase_dir / "plugins" / "profile"
+    profile_path = rank_dir / "plugins" / "profile"
     dir_early = profile_path / "2026_05_06_04_47_36"
     dir_late = profile_path / "2026_05_06_04_47_38"
-
-    # Create the nested timestamped directories
     dir_early.mkdir(parents=True, exist_ok=True)
     dir_late.mkdir(parents=True, exist_ok=True)
+    (dir_early / "node-1-0.xplane.pb").write_text("dummy_trace_data_1")
+    (dir_late / "node-0-0.xplane.pb").write_text("dummy_trace_data_0")
 
-    # Create dummy host files inside each directory
-    file_early = dir_early / "node-1-0.xplane.pb"
-    file_late = dir_late / "node-0-0.xplane.pb"
-    file_early.write_text("dummy_trace_data_1")
-    file_late.write_text("dummy_trace_data_0")
+    profiler._merge_profile_directories()
 
-    # Execute consolidation merge
-    profiler._merge_multihost_profile_directories()
-
-    # Verify that the trailing directory is deleted and all files are merged into the earliest directory
-    assert dir_early.exists()
+    # Files end up at <phase>/plugins/profile/<earliest_ts>/, not under dp_rank_0.
+    merged_dir = phase_dir / "plugins" / "profile" / "2026_05_06_04_47_36"
+    assert merged_dir.exists()
     assert not dir_late.exists()
-    assert (dir_early / "node-1-0.xplane.pb").exists()
-    assert (dir_early / "node-0-0.xplane.pb").exists()
-    assert (dir_early /
+    assert not (rank_dir / "plugins").exists()
+    assert (merged_dir /
             "node-1-0.xplane.pb").read_text() == "dummy_trace_data_1"
-    assert (dir_early /
+    assert (merged_dir /
             "node-0-0.xplane.pb").read_text() == "dummy_trace_data_0"
+
+
+def test_merge_profile_directories_mpmd(tmp_path, monkeypatch):
+    """MPMD: 4 ranks each capture to their own dp_rank_N/plugins/profile/<ts>/
+    with identical filenames; merge hoists each up with dp{N}_ prefix so
+    they coexist in one <phase>/plugins/profile/<earliest_ts>/ dir."""
+    monkeypatch.setenv("TPU_MULTIPROCESS_DP", "1")
+
+    phase_dir = tmp_path / "prefill_heavy"
+    profilers = []
+    for rank in range(4):
+        rank_dir = phase_dir / f"dp_rank_{rank}"
+        profiler = PhasedBasedProfiler(profile_dir=str(tmp_path),
+                                       worker_rank=rank)
+        profiler.profile_dir_with_phase_suffix = str(rank_dir)
+        # Each rank's stop_trace lands in its own second-resolution dir.
+        ts_dir = rank_dir / "plugins" / "profile" / f"2026_05_06_04_47_{36 + rank:02d}"
+        ts_dir.mkdir(parents=True)
+        # Identical filename across ranks — the collision the fix avoids.
+        (ts_dir / "t1v-n-host-w-0.xplane.pb").write_text(f"rank_{rank}_xplane")
+        (ts_dir /
+         "t1v-n-host-w-0.trace.json.gz").write_text(f"rank_{rank}_trace")
+        profilers.append(profiler)
+
+    for profiler in profilers:
+        profiler._merge_profile_directories()
+
+    merged_dir = phase_dir / "plugins" / "profile" / "2026_05_06_04_47_36"
+    assert merged_dir.exists()
+    for rank in range(4):
+        xplane = merged_dir / f"dp{rank}_t1v-n-host-w-0.xplane.pb"
+        trace = merged_dir / f"dp{rank}_t1v-n-host-w-0.trace.json.gz"
+        assert xplane.read_text() == f"rank_{rank}_xplane"
+        assert trace.read_text() == f"rank_{rank}_trace"
+        # Per-rank plugins/ subtree cleaned up; dp_rank_N/ remains for the
+        # batch_composition_stats JSONs (which this test doesn't stage).
+        assert not (phase_dir / f"dp_rank_{rank}" / "plugins").exists()
+    # Trailing timestamp dirs collapsed into the earliest.
+    for rank in range(1, 4):
+        assert not (phase_dir / "plugins" / "profile" /
+                    f"2026_05_06_04_47_{36 + rank:02d}").exists()
