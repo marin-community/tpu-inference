@@ -3,10 +3,10 @@
   "fork_repo": "marin-community/tpu-inference",
   "upstream_repo": "vllm-project/tpu-inference",
   "upstream_branch": "main",
-  "upstream_sha": "15ea910602f0a5fc1d63e00e8e52bd3cb669e446",
-  "upstream_short_sha": "15ea910602f0",
-  "fork_base_sha": "a4ce5693190d7029e29ee6c42c2f736d35c1e7e0",
-  "synced_at_utc": "2026-05-13T20:38:02Z",
-  "sync_workflow": "Manual sync via Claude Code",
+  "upstream_sha": "030695cfb5d97e21ed4390adf82134d65bea27f2",
+  "upstream_short_sha": "030695cfb5d9",
+  "fork_base_sha": "c0c901b2af9b6995beff389cd0c562c16416e56d",
+  "synced_at_utc": "2026-05-25T17:18:27Z",
+  "sync_workflow": "Marin Upstream Sync PR",
   "sync_issue_url": "https://github.com/marin-community/marin/issues/5551"
 }
