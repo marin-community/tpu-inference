@@ -507,3 +507,23 @@ class TestGetModel:
         mock_get_flax.assert_not_called()
         mock_get_vllm.assert_called_once_with(vllm_config, rng, mesh, False)
         assert result == "vllm_model_sentinel"
+
+    @patch.dict(os.environ, {"MODEL_IMPL_TYPE": "auto"}, clear=True)
+    @patch("tpu_inference.models.common.model_loader.get_vllm_model")
+    @patch("tpu_inference.models.common.model_loader.get_flax_model")
+    def test_get_model_auto_resolves_to_flax_nnx_for_grug_moe(
+            self, mock_get_flax, mock_get_vllm, vllm_config, rng, mesh):
+        """
+        Tests that 'auto' resolves to 'flax_nnx' for GrugMoE, whose
+        correctness-first implementation is native JAX.
+        """
+        vllm_config.model_config.hf_config.architectures = [
+            "GrugMoeForCausalLM"
+        ]
+        mock_get_flax.return_value = "flax_model_sentinel"
+
+        result = model_loader.get_model(vllm_config, rng, mesh)
+
+        mock_get_flax.assert_called_once_with(vllm_config, rng, mesh, False)
+        mock_get_vllm.assert_not_called()
+        assert result == "flax_model_sentinel"

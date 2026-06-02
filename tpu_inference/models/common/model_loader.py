@@ -72,6 +72,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     from tpu_inference.models.jax.gemma4_mm import \
         Gemma4ForConditionalGeneration
     from tpu_inference.models.jax.gpt_oss import GptOss
+    from tpu_inference.models.jax.grugmoe import GrugMoeForCausalLM
     from tpu_inference.models.jax.llama3 import LlamaForCausalLM
     from tpu_inference.models.jax.llama4 import Llama4ForCausalLM
     from tpu_inference.models.jax.llama_eagle3 import EagleLlama3ForCausalLM
@@ -91,6 +92,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
         "Qwen2_5_VLForConditionalGeneration"] = Qwen2_5_VLForConditionalGeneration
     _MODEL_REGISTRY["Eagle3LlamaForCausalLM"] = EagleLlama3ForCausalLM
     _MODEL_REGISTRY["GptOssForCausalLM"] = GptOss
+    _MODEL_REGISTRY["GrugMoeForCausalLM"] = GrugMoeForCausalLM
     _MODEL_REGISTRY["Qwen2ForCausalLM"] = Qwen2ForCausalLM
     _MODEL_REGISTRY[
         "Gemma4ForConditionalGeneration"] = Gemma4ForConditionalGeneration
