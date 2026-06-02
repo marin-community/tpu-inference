@@ -51,6 +51,7 @@ _MODEL_REGISTRY = {}
 # "flax_nnx" implementation due to various factors such as performance.
 _VLLM_PREFERRED_ARCHITECTURES: frozenset[str] = frozenset({
     "GptOssForCausalLM",
+    "GrugMoeForCausalLM",
     "Qwen3MoeForCausalLM",
     "KimiK25ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
