@@ -16,13 +16,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, fields
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from jax.sharding import Mesh
+from safetensors.numpy import load_file
 from vllm.config import VllmConfig
 
 from tpu_inference.distributed.jax_parallel_state import get_pp_group
@@ -34,6 +39,16 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
 
 _GATED_NORM_RANK = 128
+_ARTIFACT_CONFIG_FILE = "config.json"
+_ARTIFACT_WEIGHTS_FILE = "model.safetensors"
+_ARTIFACT_MODEL_TYPE = "grug_moe"
+
+
+@dataclass(frozen=True)
+class GrugMoeArtifactLoadReport:
+    consumed: frozenset[str]
+    missing: frozenset[str]
+    unexpected: frozenset[str]
 
 
 def _config_attr(config: Any, names: tuple[str, ...], default: Any = None) -> Any:
@@ -185,6 +200,106 @@ class GrugMoeConfig:
         if self.sliding_window <= 1:
             raise ValueError("sliding_window must be greater than 1")
         return self
+
+
+def _read_artifact_config(artifact_dir: Path) -> dict[str, Any]:
+    config_path = artifact_dir / _ARTIFACT_CONFIG_FILE
+    with config_path.open() as f:
+        config = json.load(f)
+    if config.get("model_type") != _ARTIFACT_MODEL_TYPE:
+        raise ValueError(
+            f"{config_path} must declare model_type={_ARTIFACT_MODEL_TYPE!r}"
+        )
+    return config
+
+
+def _validate_artifact_config(
+    artifact_config: dict[str, Any],
+    expected_config: GrugMoeConfig,
+    *,
+    expected_tie_word_embeddings: bool,
+) -> None:
+    loaded_config = GrugMoeConfig.from_hf_config(
+        SimpleNamespace(**artifact_config)
+    )
+    mismatches = []
+    for field in fields(GrugMoeConfig):
+        if field.name == "head_dim":
+            continue
+        expected_value = getattr(expected_config, field.name)
+        loaded_value = getattr(loaded_config, field.name)
+        if loaded_value != expected_value:
+            mismatches.append(f"{field.name}: artifact={loaded_value!r} model={expected_value!r}")
+    if loaded_config.inferred_head_dim != expected_config.inferred_head_dim:
+        mismatches.append(
+            "head_dim: "
+            f"artifact={loaded_config.inferred_head_dim!r} "
+            f"model={expected_config.inferred_head_dim!r}"
+        )
+
+    tie_word_embeddings = bool(artifact_config.get("tie_word_embeddings", False))
+    if tie_word_embeddings != expected_tie_word_embeddings:
+        mismatches.append(
+            "tie_word_embeddings: "
+            f"artifact={tie_word_embeddings!r} model={expected_tie_word_embeddings!r}"
+        )
+
+    if mismatches:
+        raise ValueError(
+            "GrugMoE inference artifact config does not match the initialized model: "
+            + "; ".join(mismatches)
+        )
+
+
+def _canonical_grugmoe_tensor_names(
+    cfg: GrugMoeConfig,
+    *,
+    tie_word_embeddings: bool,
+) -> frozenset[str]:
+    names = {
+        "model.embed_tokens.weight",
+        "model.embed_norm.weight",
+        "model.embed_gated_norm.down_proj.weight",
+        "model.embed_gated_norm.up_proj.weight",
+        "model.norm.weight",
+        "model.final_gated_norm.down_proj.weight",
+        "model.final_gated_norm.up_proj.weight",
+    }
+    if not tie_word_embeddings:
+        names.add("lm_head.weight")
+
+    for layer_index in range(cfg.num_layers):
+        prefix = f"model.layers.{layer_index}"
+        names.update(
+            {
+                f"{prefix}.input_layernorm.weight",
+                f"{prefix}.attn_gated_norm.down_proj.weight",
+                f"{prefix}.attn_gated_norm.up_proj.weight",
+                f"{prefix}.self_attn.q_proj.weight",
+                f"{prefix}.self_attn.k_proj.weight",
+                f"{prefix}.self_attn.v_proj.weight",
+                f"{prefix}.self_attn.o_proj.weight",
+                f"{prefix}.self_attn.attn_gate.weight",
+                f"{prefix}.post_attention_layernorm.weight",
+                f"{prefix}.mlp_gated_norm.down_proj.weight",
+                f"{prefix}.mlp_gated_norm.up_proj.weight",
+                f"{prefix}.mlp.router.weight",
+                f"{prefix}.mlp.router.bias",
+                f"{prefix}.mlp.experts.gate_proj.weight",
+                f"{prefix}.mlp.experts.up_proj.weight",
+                f"{prefix}.mlp.experts.down_proj.weight",
+            }
+        )
+        if cfg.shared_expert_intermediate_dim > 0:
+            names.update(
+                {
+                    f"{prefix}.shared_expert.gate_proj.weight",
+                    f"{prefix}.shared_expert.up_proj.weight",
+                    f"{prefix}.shared_expert.down_proj.weight",
+                }
+            )
+
+    return frozenset(names)
 
 
 def _init_weight(
@@ -639,16 +754,297 @@ class GrugMoeForCausalLM(JaxModule):
             raise ValueError("token embeddings are not present on this pipeline rank")
         return jnp.einsum("td,vd->tv", hidden_states, self.model.token_embed.value)
 
-    def load_weights(self, rng: jax.Array) -> None:
-        del rng
-        raise NotImplementedError(
-            "GrugMoE checkpoint loading is out of scope for the native JAX "
-            "correctness-first implementation."
+    def _tensor(
+        self,
+        tensors: dict[str, np.ndarray],
+        consumed: set[str],
+        name: str,
+    ) -> jax.Array:
+        consumed.add(name)
+        return jnp.asarray(tensors[name])
+
+    def _assign_param(
+        self,
+        param: nnx.Param,
+        value: jax.Array,
+        *,
+        tensor_name: str,
+    ) -> None:
+        value = jnp.asarray(value, dtype=param.value.dtype)
+        if value.shape != param.value.shape:
+            raise ValueError(
+                f"Loaded shape for {tensor_name}: {value.shape} does not match "
+                f"model shape: {param.value.shape}"
+            )
+        param.value = value
+
+    def _assign_linear_param(
+        self,
+        param: nnx.Param,
+        tensors: dict[str, np.ndarray],
+        consumed: set[str],
+        name: str,
+    ) -> None:
+        self._assign_param(
+            param,
+            jnp.swapaxes(self._tensor(tensors, consumed, name), -1, -2),
+            tensor_name=name,
         )
+
+    def load_inference_artifact(
+        self,
+        artifact_dir: str | Path,
+    ) -> GrugMoeArtifactLoadReport:
+        """Load the canonical GrugMoE inference artifact.
+
+        The artifact is a small accelerator-agnostic directory with
+        `config.json` and `model.safetensors`. Tensor names follow a stable
+        HF/vLLM-style dotted schema, while linear tensors use the usual
+        checkpoint orientation with output features before input features.
+        """
+        if not (self.model.is_first_rank and self.model.is_last_rank):
+            raise NotImplementedError(
+                "GrugMoE inference artifact loading currently supports a full "
+                "model on a single pipeline rank."
+            )
+
+        artifact_path = Path(artifact_dir)
+        artifact_config = _read_artifact_config(artifact_path)
+        _validate_artifact_config(
+            artifact_config,
+            self.model.config,
+            expected_tie_word_embeddings=self.tie_word_embeddings,
+        )
+
+        weights_path = artifact_path / _ARTIFACT_WEIGHTS_FILE
+        tensors = load_file(str(weights_path))
+        expected = _canonical_grugmoe_tensor_names(
+            self.model.config,
+            tie_word_embeddings=self.tie_word_embeddings,
+        )
+        loaded = set(tensors)
+        missing = expected - loaded
+        unexpected = loaded - expected
+        if missing or unexpected:
+            raise ValueError(
+                "GrugMoE inference artifact tensor set mismatch: "
+                f"missing={sorted(missing)} unexpected={sorted(unexpected)}"
+            )
+
+        consumed: set[str] = set()
+        model = self.model
+        self._assign_param(
+            model.token_embed,
+            self._tensor(tensors, consumed, "model.embed_tokens.weight"),
+            tensor_name="model.embed_tokens.weight",
+        )
+        self._assign_param(
+            model.embed_norm.weight,
+            self._tensor(tensors, consumed, "model.embed_norm.weight"),
+            tensor_name="model.embed_norm.weight",
+        )
+        self._assign_linear_param(
+            model.embed_gated_norm.w_down,
+            tensors,
+            consumed,
+            "model.embed_gated_norm.down_proj.weight",
+        )
+        self._assign_linear_param(
+            model.embed_gated_norm.w_up,
+            tensors,
+            consumed,
+            "model.embed_gated_norm.up_proj.weight",
+        )
+
+        for layer_index, layer in enumerate(model.layers):
+            if isinstance(layer, PPMissingLayer):
+                raise NotImplementedError(
+                    "GrugMoE inference artifact loading currently supports a "
+                    "full model on a single pipeline rank."
+                )
+
+            prefix = f"model.layers.{layer_index}"
+            self._assign_param(
+                layer.rms_attn.weight,
+                self._tensor(tensors, consumed, f"{prefix}.input_layernorm.weight"),
+                tensor_name=f"{prefix}.input_layernorm.weight",
+            )
+            self._assign_linear_param(
+                layer.attn_gated_norm.w_down,
+                tensors,
+                consumed,
+                f"{prefix}.attn_gated_norm.down_proj.weight",
+            )
+            self._assign_linear_param(
+                layer.attn_gated_norm.w_up,
+                tensors,
+                consumed,
+                f"{prefix}.attn_gated_norm.up_proj.weight",
+            )
+            self._assign_linear_param(
+                layer.attn.w_q,
+                tensors,
+                consumed,
+                f"{prefix}.self_attn.q_proj.weight",
+            )
+            self._assign_linear_param(
+                layer.attn.w_k,
+                tensors,
+                consumed,
+                f"{prefix}.self_attn.k_proj.weight",
+            )
+            self._assign_linear_param(
+                layer.attn.w_v,
+                tensors,
+                consumed,
+                f"{prefix}.self_attn.v_proj.weight",
+            )
+            self._assign_linear_param(
+                layer.attn.w_o,
+                tensors,
+                consumed,
+                f"{prefix}.self_attn.o_proj.weight",
+            )
+            self._assign_linear_param(
+                layer.attn.attn_gate,
+                tensors,
+                consumed,
+                f"{prefix}.self_attn.attn_gate.weight",
+            )
+            self._assign_param(
+                layer.rms_mlp.weight,
+                self._tensor(
+                    tensors,
+                    consumed,
+                    f"{prefix}.post_attention_layernorm.weight",
+                ),
+                tensor_name=f"{prefix}.post_attention_layernorm.weight",
+            )
+            self._assign_linear_param(
+                layer.mlp_gated_norm.w_down,
+                tensors,
+                consumed,
+                f"{prefix}.mlp_gated_norm.down_proj.weight",
+            )
+            self._assign_linear_param(
+                layer.mlp_gated_norm.w_up,
+                tensors,
+                consumed,
+                f"{prefix}.mlp_gated_norm.up_proj.weight",
+            )
+            self._assign_linear_param(
+                layer.mlp.router,
+                tensors,
+                consumed,
+                f"{prefix}.mlp.router.weight",
+            )
+            self._assign_param(
+                layer.mlp.router_bias,
+                self._tensor(tensors, consumed, f"{prefix}.mlp.router.bias"),
+                tensor_name=f"{prefix}.mlp.router.bias",
+            )
+            gate = jnp.swapaxes(
+                self._tensor(
+                    tensors,
+                    consumed,
+                    f"{prefix}.mlp.experts.gate_proj.weight",
+                ),
+                -1,
+                -2,
+            )
+            up = jnp.swapaxes(
+                self._tensor(
+                    tensors,
+                    consumed,
+                    f"{prefix}.mlp.experts.up_proj.weight",
+                ),
+                -1,
+                -2,
+            )
+            self._assign_param(
+                layer.mlp.w_gate_up,
+                jnp.concatenate([gate, up], axis=-1),
+                tensor_name=f"{prefix}.mlp.experts.gate_proj.weight",
+            )
+            self._assign_linear_param(
+                layer.mlp.w_down,
+                tensors,
+                consumed,
+                f"{prefix}.mlp.experts.down_proj.weight",
+            )
+
+            if self.model.config.shared_expert_intermediate_dim > 0:
+                if layer.shared is None:
+                    raise ValueError(
+                        f"{prefix} is missing the shared expert expected by the config"
+                    )
+                self._assign_linear_param(
+                    layer.shared.w_gate,
+                    tensors,
+                    consumed,
+                    f"{prefix}.shared_expert.gate_proj.weight",
+                )
+                self._assign_linear_param(
+                    layer.shared.w_up,
+                    tensors,
+                    consumed,
+                    f"{prefix}.shared_expert.up_proj.weight",
+                )
+                self._assign_linear_param(
+                    layer.shared.w_down,
+                    tensors,
+                    consumed,
+                    f"{prefix}.shared_expert.down_proj.weight",
+                )
+
+        self._assign_param(
+            model.final_norm.weight,
+            self._tensor(tensors, consumed, "model.norm.weight"),
+            tensor_name="model.norm.weight",
+        )
+        self._assign_linear_param(
+            model.final_gated_norm.w_down,
+            tensors,
+            consumed,
+            "model.final_gated_norm.down_proj.weight",
+        )
+        self._assign_linear_param(
+            model.final_gated_norm.w_up,
+            tensors,
+            consumed,
+            "model.final_gated_norm.up_proj.weight",
+        )
+        if not self.tie_word_embeddings:
+            if isinstance(self.lm_head, PPMissingLayer):
+                raise ValueError("lm_head is not present on this pipeline rank")
+            self._assign_linear_param(
+                self.lm_head.weight,
+                tensors,
+                consumed,
+                "lm_head.weight",
+            )
+
+        unconsumed_expected = expected - consumed
+        if unconsumed_expected:
+            raise ValueError(
+                "GrugMoE inference artifact tensors were expected but not consumed: "
+                f"{sorted(unconsumed_expected)}"
+            )
+
+        return GrugMoeArtifactLoadReport(
+            consumed=frozenset(consumed),
+            missing=frozenset(),
+            unexpected=frozenset(),
+        )
+
+    def load_weights(self, rng: jax.Array) -> GrugMoeArtifactLoadReport:
+        del rng
+        return self.load_inference_artifact(self.vllm_config.model_config.model)
 
 
 __all__ = [
     "GrugMoeAttention",
+    "GrugMoeArtifactLoadReport",
     "GrugMoeConfig",
     "GrugMoeDecoderLayer",
     "GrugMoeDenseMLP",
