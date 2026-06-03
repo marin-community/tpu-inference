@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, fields
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,7 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.sharding import Mesh
-from safetensors.numpy import load_file
+from safetensors import safe_open
 from vllm.config import VllmConfig
 
 from tpu_inference.distributed.jax_parallel_state import get_pp_group
@@ -41,6 +42,7 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
 _GATED_NORM_RANK = 128
 _ARTIFACT_CONFIG_FILE = "config.json"
 _ARTIFACT_WEIGHTS_FILE = "model.safetensors"
+_ARTIFACT_WEIGHTS_INDEX_FILE = "model.safetensors.index.json"
 _ARTIFACT_MODEL_TYPE = "grug_moe"
 
 
@@ -211,6 +213,102 @@ def _read_artifact_config(artifact_dir: Path) -> dict[str, Any]:
             f"{config_path} must declare model_type={_ARTIFACT_MODEL_TYPE!r}"
         )
     return config
+
+
+class _SafetensorsArtifactTensors(Mapping[str, np.ndarray]):
+
+    def __init__(self, artifact_dir: Path,
+                 weight_map: Mapping[str, str]) -> None:
+        self._artifact_dir = artifact_dir
+        self._weight_map = dict(weight_map)
+
+    def __getitem__(self, name: str) -> np.ndarray:
+        shard_name = self._weight_map[name]
+        shard_path = self._artifact_dir / shard_name
+        with safe_open(str(shard_path), framework="np") as f:
+            return f.get_tensor(name)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._weight_map)
+
+    def __len__(self) -> int:
+        return len(self._weight_map)
+
+
+def _read_safetensors_weight_map(index_path: Path) -> dict[str, str]:
+    with index_path.open() as f:
+        index = json.load(f)
+
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"{index_path} must contain a non-empty weight_map")
+
+    invalid = [
+        (name, shard)
+        for name, shard in weight_map.items()
+        if not isinstance(name, str) or not isinstance(shard, str)
+    ]
+    if invalid:
+        raise ValueError(
+            f"{index_path} weight_map entries must map string tensor names to string shard files"
+        )
+
+    return dict(weight_map)
+
+
+def _resolve_safetensors_shard_path(artifact_dir: Path,
+                                    shard_name: str) -> Path:
+    artifact_root = artifact_dir.resolve()
+    shard_path = (artifact_dir / shard_name).resolve()
+    try:
+        shard_path.relative_to(artifact_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Safetensors shard {shard_name!r} must stay within {artifact_dir}"
+        ) from exc
+    if not shard_path.is_file():
+        raise FileNotFoundError(f"Missing safetensors shard: {shard_path}")
+    return shard_path
+
+
+def _validate_sharded_safetensors_index(
+    artifact_dir: Path,
+    weight_map: Mapping[str, str],
+) -> None:
+    shard_to_names: dict[str, set[str]] = {}
+    for name, shard_name in weight_map.items():
+        shard_to_names.setdefault(shard_name, set()).add(name)
+
+    for shard_name, expected_names in shard_to_names.items():
+        shard_path = _resolve_safetensors_shard_path(artifact_dir, shard_name)
+        with safe_open(str(shard_path), framework="np") as f:
+            actual_names = set(f.keys())
+
+        missing = expected_names - actual_names
+        unexpected = actual_names - expected_names
+        if missing or unexpected:
+            raise ValueError(
+                "Safetensors shard does not match its index entry: "
+                f"file={shard_name!r} missing={sorted(missing)} "
+                f"unexpected={sorted(unexpected)}"
+            )
+
+
+def _load_artifact_tensors(artifact_dir: Path) -> Mapping[str, np.ndarray]:
+    index_path = artifact_dir / _ARTIFACT_WEIGHTS_INDEX_FILE
+    if index_path.exists():
+        weight_map = _read_safetensors_weight_map(index_path)
+        _validate_sharded_safetensors_index(artifact_dir, weight_map)
+        return _SafetensorsArtifactTensors(artifact_dir, weight_map)
+
+    weights_path = artifact_dir / _ARTIFACT_WEIGHTS_FILE
+    if not weights_path.is_file():
+        raise FileNotFoundError(
+            f"Expected {weights_path} or {index_path} for GrugMoE weights")
+
+    with safe_open(str(weights_path), framework="np") as f:
+        weight_map = {name: _ARTIFACT_WEIGHTS_FILE for name in f.keys()}
+    return _SafetensorsArtifactTensors(artifact_dir, weight_map)
 
 
 def _validate_artifact_config(
@@ -756,7 +854,7 @@ class GrugMoeForCausalLM(JaxModule):
 
     def _tensor(
         self,
-        tensors: dict[str, np.ndarray],
+        tensors: Mapping[str, np.ndarray],
         consumed: set[str],
         name: str,
     ) -> jax.Array:
@@ -781,7 +879,7 @@ class GrugMoeForCausalLM(JaxModule):
     def _assign_linear_param(
         self,
         param: nnx.Param,
-        tensors: dict[str, np.ndarray],
+        tensors: Mapping[str, np.ndarray],
         consumed: set[str],
         name: str,
     ) -> None:
@@ -797,10 +895,12 @@ class GrugMoeForCausalLM(JaxModule):
     ) -> GrugMoeArtifactLoadReport:
         """Load the canonical GrugMoE inference artifact.
 
-        The artifact is a small accelerator-agnostic directory with
-        `config.json` and `model.safetensors`. Tensor names follow a stable
-        HF/vLLM-style dotted schema, while linear tensors use the usual
-        checkpoint orientation with output features before input features.
+        The artifact is an accelerator-agnostic directory with `config.json`
+        and either `model.safetensors` or the standard HuggingFace sharded
+        safetensors layout: `model.safetensors.index.json` plus
+        `model-*-of-*.safetensors`. Tensor names follow a stable HF/vLLM-style
+        dotted schema, while linear tensors use the usual checkpoint
+        orientation with output features before input features.
         """
         if not (self.model.is_first_rank and self.model.is_last_rank):
             raise NotImplementedError(
@@ -816,8 +916,7 @@ class GrugMoeForCausalLM(JaxModule):
             expected_tie_word_embeddings=self.tie_word_embeddings,
         )
 
-        weights_path = artifact_path / _ARTIFACT_WEIGHTS_FILE
-        tensors = load_file(str(weights_path))
+        tensors = _load_artifact_tensors(artifact_path)
         expected = _canonical_grugmoe_tensor_names(
             self.model.config,
             tie_word_embeddings=self.tie_word_embeddings,
