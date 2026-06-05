@@ -20,7 +20,7 @@ import os
 import re
 import time
 from collections import defaultdict
-from collections.abc import Generator
+from collections.abc import Generator, Mapping, MutableMapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
@@ -599,6 +599,50 @@ def check_all_loaded(params: nnx.State):
     jax.tree.map(_check, params)
 
 
+def _flatten_mapping_state(state: Mapping, prefix: tuple[Any, ...] = ()):
+    for key, value in state.items():
+        path = prefix + (key, )
+        if isinstance(value, Mapping):
+            yield from _flatten_mapping_state(value, path)
+        else:
+            yield path, value
+
+
+def _flat_state_items(state):
+    if hasattr(state, "flat_state"):
+        return state.flat_state()
+    if isinstance(state, Mapping):
+        return list(_flatten_mapping_state(state))
+    raise TypeError(
+        "Expected state with flat_state() or a mapping-backed state, got "
+        f"{type(state).__name__}")
+
+
+def _state_leaf_value(leaf):
+    return leaf.value if hasattr(leaf, "value") else leaf
+
+
+def _set_state_leaf(state, keys, leaf, value):
+    if hasattr(leaf, "value"):
+        leaf.value = value
+        return
+
+    if isinstance(state, MutableMapping):
+        parent = state
+        for key in keys[:-1]:
+            parent = parent[key]
+            if not isinstance(parent, MutableMapping):
+                raise TypeError(
+                    "Cannot update target state leaf through non-mapping "
+                    f"parent at {'.'.join(str(k) for k in keys)}")
+        parent[keys[-1]] = value
+        return
+
+    raise TypeError(
+        "Cannot update target state leaf without .value on non-mutable "
+        f"state {type(state).__name__}")
+
+
 def build_flat_dict(flat_state, mappings):
     """Build a new flat dictionary from the flat state using the provided mappings."""
     new_flat_dict = {}
@@ -620,7 +664,7 @@ def build_flat_dict(flat_state, mappings):
                     else:
                         src_parts.append(part)
                 actual_src = ".".join(src_parts)
-                new_flat_dict[actual_src] = v, sharding
+                new_flat_dict[actual_src] = v, sharding, keys
                 mapped = True
                 break
         if not mapped:
@@ -634,15 +678,15 @@ def transfer_state_with_mappings(src_state,
                                  transpose_keys=None,
                                  shard=None):
     """Transfer state from src_state to tgt_state using the provided mappings."""
-    src_flat = src_state.flat_state()
-    tgt_flat = tgt_state.flat_state()
+    src_flat = _flat_state_items(src_state)
+    tgt_flat = _flat_state_items(tgt_state)
 
     new_src_dict = build_flat_dict(tgt_flat, mappings)
     logger.info(f"{mappings=}")
     logger.info(f"{transpose_keys=}")
     for src_keys, v in src_flat:
         flattened_src_keys = '.'.join(str(k) for k in src_keys)
-        new_v = jnp.copy(v.value)
+        new_v = jnp.copy(_state_leaf_value(v))
         logger.info(
             f"Processing source key: {flattened_src_keys} and value: {new_v.shape} {new_v.dtype}"
         )
@@ -659,7 +703,8 @@ def transfer_state_with_mappings(src_state,
         else:
             v_maybe_t = new_v
 
-        to_update_value = new_src_dict[flattened_src_keys][0].value
+        tgt_leaf, sharding, tgt_keys = new_src_dict[flattened_src_keys]
+        to_update_value = _state_leaf_value(tgt_leaf)
         assert to_update_value.shape == v_maybe_t.shape, \
             f"Shape mismatch for {flattened_src_keys}: {to_update_value.shape} vs {v_maybe_t.shape}"
 
@@ -669,10 +714,11 @@ def transfer_state_with_mappings(src_state,
             )
             v_maybe_t = v_maybe_t.astype(to_update_value.dtype)
 
-        new_src_dict[flattened_src_keys][0].value = shard(
-            v_maybe_t, sharding) if shard else v_maybe_t
+        _set_state_leaf(tgt_state, tgt_keys, tgt_leaf,
+                        shard(v_maybe_t, sharding) if shard else v_maybe_t)
 
-    tgt_state = tgt_state.from_flat_path(tgt_flat)
+    if hasattr(tgt_state, "from_flat_path"):
+        tgt_state = tgt_state.from_flat_path(tgt_flat)
     return tgt_state
 
 

@@ -90,6 +90,62 @@ class WeightTransfer(jtu.JaxTestCase):
             ["bias"].value, 7.0)
         assert jnp.allclose(new_tgt_state["tgt_lm_head"].value, 6.0)
 
+    def test_transfer_state_to_dict_backed_vllm_state(self):
+        rng = nnx.Rngs(0)
+        src_model = SourceModel(rng)
+        _, src_state = nnx.split(src_model)
+
+        src_kernel = jnp.arange(16, dtype=jnp.float32).reshape(4, 4)
+        src_state["layers"]['0']["kernel"].value = src_kernel
+        src_state["layers"]['0']["bias"].value = jnp.ones(
+            (4, ), dtype=jnp.float32) * 7
+        src_state["src_lm_head"].value = jnp.ones(
+            (2, 4), dtype=jnp.float32) * 6
+
+        tgt_state = {
+            "model.layers.0.mlp.up_proj.kernel":
+            jnp.zeros((4, 4), dtype=jnp.bfloat16),
+            "model.layers.0.mlp.up_proj.bias":
+            jnp.zeros((4, ), dtype=jnp.float32),
+            "tgt_lm_head":
+            jnp.zeros((2, 4), dtype=jnp.float32),
+        }
+        mappings = {
+            "layers.*.kernel":
+            ("model.layers.*.mlp.up_proj.kernel", ("x", "y")),
+            "layers.*.bias": ("model.layers.*.mlp.up_proj.bias", ("x", )),
+            "src_lm_head": ("tgt_lm_head", (None, None)),
+        }
+        shard_calls = []
+
+        def shard(value, sharding):
+            shard_calls.append((value, sharding))
+            return value
+
+        new_tgt_state = transfer_state_with_mappings(
+            src_state,
+            tgt_state,
+            mappings,
+            transpose_keys={"kernel": (1, 0)},
+            shard=shard)
+
+        assert new_tgt_state is tgt_state
+        assert new_tgt_state[
+            "model.layers.0.mlp.up_proj.kernel"].dtype == jnp.bfloat16
+        assert jnp.allclose(new_tgt_state["model.layers.0.mlp.up_proj.kernel"],
+                            src_kernel.T.astype(jnp.bfloat16))
+        assert jnp.allclose(new_tgt_state["model.layers.0.mlp.up_proj.bias"],
+                            7.0)
+        assert jnp.allclose(new_tgt_state["tgt_lm_head"], 6.0)
+        assert len(shard_calls) == 3
+        sharding_by_shape = {
+            tuple(value.shape): sharding
+            for value, sharding in shard_calls
+        }
+        assert sharding_by_shape[(4, 4)] == ("x", "y")
+        assert sharding_by_shape[(4, )] == ("x", )
+        assert sharding_by_shape[(2, 4)] == (None, None)
+
 
 # ----- Mocks for dtype test -----
 
