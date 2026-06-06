@@ -151,6 +151,7 @@ class PersistentBatchManager:
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                cached_prompt_logprobs=new_req_data.cached_prompt_logprobs,
             )
 
             req_ids_to_add.append(req_id)
