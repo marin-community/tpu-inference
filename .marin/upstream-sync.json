@@ -1,0 +1,12 @@
+{
+  "status": "recorded",
+  "fork_repo": "marin-community/tpu-inference",
+  "upstream_repo": "vllm-project/tpu-inference",
+  "upstream_branch": "main",
+  "upstream_sha": "15ea910602f0a5fc1d63e00e8e52bd3cb669e446",
+  "upstream_short_sha": "15ea910602f0",
+  "fork_base_sha": "a4ce5693190d7029e29ee6c42c2f736d35c1e7e0",
+  "synced_at_utc": "2026-05-13T20:38:02Z",
+  "sync_workflow": "Manual sync via Claude Code",
+  "sync_issue_url": "https://github.com/marin-community/marin/issues/5551"
+}

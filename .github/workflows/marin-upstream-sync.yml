@@ -1,0 +1,159 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Marin Upstream Sync PR
+
+on:
+  schedule:
+    - cron: '30 15 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: marin-upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Open Upstream Sync PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      GH_TOKEN: ${{ secrets.MARIN_SYNC_TOKEN }}
+      SYNC_BRANCH: sync-upstream-main
+      UPSTREAM_REPO: vllm-project/tpu-inference
+      UPSTREAM_BRANCH: main
+      TRACKING_ISSUE_URL: https://github.com/marin-community/marin/issues/5551
+
+    steps:
+      - name: Check sync token
+        run: |
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "MARIN_SYNC_TOKEN is required to push the sync branch and open the PR." >&2
+            exit 1
+          fi
+
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MARIN_SYNC_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge upstream main and write metadata
+        id: prepare
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch origin main --prune
+          git fetch upstream "${UPSTREAM_BRANCH}" --prune
+
+          UPSTREAM_SHA=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")
+          UPSTREAM_SHORT_SHA=$(git rev-parse --short=12 "upstream/${UPSTREAM_BRANCH}")
+          FORK_BASE_SHA=$(git rev-parse origin/main)
+          RECORDED_SHA=""
+          if [[ -f .marin/upstream-sync.json ]]; then
+            RECORDED_SHA=$(jq -r '.upstream_sha // empty' .marin/upstream-sync.json)
+          fi
+
+          if git merge-base --is-ancestor "${UPSTREAM_SHA}" origin/main && [[ "${RECORDED_SHA}" == "${UPSTREAM_SHA}" ]]; then
+            echo "Fork main already contains upstream ${UPSTREAM_REPO}@${UPSTREAM_SHA} and metadata is current."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git checkout -B "${SYNC_BRANCH}" origin/main
+          git merge --no-ff --no-edit "upstream/${UPSTREAM_BRANCH}"
+
+          mkdir -p .marin
+          jq -n \
+            --arg status "recorded" \
+            --arg fork_repo "${GITHUB_REPOSITORY}" \
+            --arg upstream_repo "${UPSTREAM_REPO}" \
+            --arg upstream_branch "${UPSTREAM_BRANCH}" \
+            --arg upstream_sha "${UPSTREAM_SHA}" \
+            --arg upstream_short_sha "${UPSTREAM_SHORT_SHA}" \
+            --arg fork_base_sha "${FORK_BASE_SHA}" \
+            --arg synced_at_utc "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+            --arg sync_workflow "${GITHUB_WORKFLOW}" \
+            --arg sync_issue_url "${TRACKING_ISSUE_URL}" \
+            '{
+              status: $status,
+              fork_repo: $fork_repo,
+              upstream_repo: $upstream_repo,
+              upstream_branch: $upstream_branch,
+              upstream_sha: $upstream_sha,
+              upstream_short_sha: $upstream_short_sha,
+              fork_base_sha: $fork_base_sha,
+              synced_at_utc: $synced_at_utc,
+              sync_workflow: $sync_workflow,
+              sync_issue_url: $sync_issue_url
+            }' > .marin/upstream-sync.json
+
+          git add .marin/upstream-sync.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Record upstream main sync metadata"
+          fi
+
+          if git diff --quiet origin/main...HEAD; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push sync branch
+        if: steps.prepare.outputs.has_changes == 'true'
+        run: |
+          if git diff --quiet origin/main...HEAD; then
+            echo "No sync PR diff remains."
+            exit 0
+          fi
+          git push --force-with-lease origin "HEAD:${SYNC_BRANCH}"
+
+      - name: Open or update PR
+        if: steps.prepare.outputs.has_changes == 'true'
+        run: |
+          UPSTREAM_SHA=$(jq -r '.upstream_sha' .marin/upstream-sync.json)
+          UPSTREAM_SHORT_SHA=$(jq -r '.upstream_short_sha' .marin/upstream-sync.json)
+          SYNCED_AT=$(jq -r '.synced_at_utc' .marin/upstream-sync.json)
+
+          cat > /tmp/upstream-sync-pr.md <<EOF
+          Weekly automated sync from \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\` into \`${GITHUB_REPOSITORY}@main\`.
+
+          Upstream commit: \`${UPSTREAM_SHA}\` (${UPSTREAM_SHORT_SHA})
+          Synced at: \`${SYNCED_AT}\`
+
+          Tracking issue: ${TRACKING_ISSUE_URL}
+          EOF
+
+          if gh pr view "${SYNC_BRANCH}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh pr edit "${SYNC_BRANCH}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "Sync fork main with upstream tpu-inference main" \
+              --body-file /tmp/upstream-sync-pr.md
+          else
+            gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base main \
+              --head "${SYNC_BRANCH}" \
+              --title "Sync fork main with upstream tpu-inference main" \
+              --body-file /tmp/upstream-sync-pr.md
+          fi

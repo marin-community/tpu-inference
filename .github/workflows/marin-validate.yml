@@ -1,0 +1,194 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Marin Validate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: marin-validate-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  validate:
+    name: Build And Validate Marin Wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      JAX_PLATFORMS: cpu
+      TPU_ACCELERATOR_TYPE: v6e-8
+      TPU_NAME: ci
+      TPU_WORKER_ID: "0"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.12"
+
+      - name: Determine build metadata
+        id: vars
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y%m%d)
+          VERSION="0.0.0.dev${DATE}+${SHORT_SHA}"
+          {
+            echo "SHA=${GITHUB_SHA}"
+            echo "SHORT_SHA=${SHORT_SHA}"
+            echo "DATE=${DATE}"
+            echo "VERSION=${VERSION}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build wheel
+        env:
+          VLLM_VERSION_OVERRIDE: ${{ steps.vars.outputs.VERSION }}
+        run: uv build --wheel
+
+      - name: Write build metadata
+        run: |
+          python - <<'PY'
+          import json
+          import pathlib
+
+          wheel_name = next(pathlib.Path("dist").glob("*.whl")).name
+          upstream_sync_path = pathlib.Path(".marin/upstream-sync.json")
+          if upstream_sync_path.exists():
+              upstream_sync = json.loads(upstream_sync_path.read_text())
+              upstream_sync.setdefault("status", "recorded")
+          else:
+              upstream_sync = {
+                  "status": "missing",
+                  "fork_repo": "marin-community/tpu-inference",
+                  "upstream_repo": "vllm-project/tpu-inference",
+                  "upstream_branch": "main",
+                  "message": (
+                      "No .marin/upstream-sync.json metadata was present "
+                      "when this artifact was validated."
+                  ),
+              }
+
+          payload = {
+              "repo": "marin-community/tpu-inference",
+              "sha": "${{ steps.vars.outputs.SHA }}",
+              "short_sha": "${{ steps.vars.outputs.SHORT_SHA }}",
+              "date": "${{ steps.vars.outputs.DATE }}",
+              "version": "${{ steps.vars.outputs.VERSION }}",
+              "wheel": wheel_name,
+              "upstream_sync": upstream_sync,
+          }
+          pathlib.Path("dist/marin-build.json").write_text(
+              json.dumps(payload, indent=2) + "\n")
+          pathlib.Path("dist/marin-upstream-sync.json").write_text(
+              json.dumps(upstream_sync, indent=2) + "\n")
+          PY
+
+      - name: Syntax-check TPU runner
+        run: python -m py_compile tpu_inference/runner/tpu_runner.py
+
+      - name: Resolve paired vLLM source
+        id: paired_vllm
+        run: |
+          if gh release view marin-nightly -R marin-community/vllm >/dev/null 2>&1; then
+            {
+              echo "SOURCE_KIND=release"
+              echo "SOURCE_REF=marin-nightly"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RUN_ID=$(bash .github/scripts/marin_release.sh resolve-validate-run \
+            "marin-community/vllm" \
+            "marin-validate.yml" \
+            "main" || true)
+
+          if [[ -n "$RUN_ID" ]]; then
+            {
+              echo "SOURCE_KIND=validate"
+              echo "SOURCE_REF=${RUN_ID}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Unable to resolve paired vLLM source. No marin-nightly release or successful marin-validate run found in marin-community/vllm." >&2
+          exit 1
+
+      - name: Download paired vLLM assets
+        run: |
+          if [[ "${{ steps.paired_vllm.outputs.SOURCE_KIND }}" == "release" ]]; then
+            bash .github/scripts/marin_release.sh download-release-assets \
+              "marin-community/vllm" \
+              "${{ steps.paired_vllm.outputs.SOURCE_REF }}" \
+              paired-vllm \
+              "*.whl" \
+              "marin-build.json"
+          else
+            bash .github/scripts/marin_release.sh download-validate-artifact \
+              "marin-community/vllm" \
+              "${{ steps.paired_vllm.outputs.SOURCE_REF }}" \
+              "marin-validate-dist" \
+              paired-vllm
+          fi
+
+      - name: Resolve paired vLLM wheel
+        id: paired_wheel
+        run: |
+          shopt -s nullglob
+          wheels=(paired-vllm/*.whl)
+          if [[ "${#wheels[@]}" -ne 1 ]]; then
+            echo "Expected exactly one paired vLLM wheel, found ${#wheels[@]}." >&2
+            printf '  %s\n' "${wheels[@]}" >&2
+            exit 1
+          fi
+          echo "WHEEL_PATH=${wheels[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract vLLM wheel requirements
+        run: |
+          python .github/scripts/wheel_metadata.py \
+            --wheel "${{ steps.paired_wheel.outputs.WHEEL_PATH }}" \
+            --requirements-out /tmp/vllm-wheel-reqs.txt \
+            --forbid-prefix tpu-inference \
+            --forbid-prefix tpu_inference \
+            --error-on-forbidden
+
+      - name: Install paired wheels in clean environment
+        run: |
+          uv venv .marin-validate
+          . .marin-validate/bin/activate
+          uv pip install -r /tmp/vllm-wheel-reqs.txt dist/*.whl
+          uv pip install --no-deps "${{ steps.paired_wheel.outputs.WHEEL_PATH }}"
+          python -c "import tpu_inference; from tpu_inference.runner.tpu_runner import TPUModelRunner"
+
+      - name: Upload validated wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: marin-validate-dist
+          path: |
+            dist/*.whl
+            dist/marin-build.json
+            dist/marin-upstream-sync.json
+          retention-days: 14

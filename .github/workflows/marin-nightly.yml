@@ -1,0 +1,275 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Marin Nightly Release
+
+on:
+  schedule:
+    - cron: '35 6 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Optional SHA or ref to publish. Defaults to the latest successful marin-validate run on main.
+        required: false
+        type: string
+      vllm_tag:
+        description: Optional vLLM release tag to validate against. Defaults to the marin-nightly alias.
+        required: false
+        type: string
+
+concurrency:
+  group: marin-nightly
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    name: Publish Marin Nightly
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      JAX_PLATFORMS: cpu
+      TPU_ACCELERATOR_TYPE: v6e-8
+      TPU_NAME: ci
+      TPU_WORKER_ID: "0"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.12"
+
+      - name: Resolve requested SHA
+        id: ref
+        run: |
+          TARGET_SHA=""
+          if [[ -n "${{ inputs.ref }}" ]]; then
+            git fetch origin "${{ inputs.ref }}" --depth=1 || true
+            TARGET_SHA=$(git rev-parse "${{ inputs.ref }}^{commit}")
+          fi
+          echo "TARGET_SHA=${TARGET_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve vLLM source tag
+        id: vllm
+        run: |
+          VLLM_TAG="${{ inputs.vllm_tag }}"
+          if [[ -z "$VLLM_TAG" ]]; then
+            VLLM_TAG="marin-nightly"
+          fi
+          echo "VLLM_TAG=${VLLM_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Download validated artifact
+        run: |
+          RUN_ID=$(bash .github/scripts/marin_release.sh resolve-validate-run \
+            "$GITHUB_REPOSITORY" \
+            "marin-validate.yml" \
+            "main" \
+            "${{ steps.ref.outputs.TARGET_SHA }}")
+          bash .github/scripts/marin_release.sh download-validate-artifact \
+            "$GITHUB_REPOSITORY" \
+            "$RUN_ID" \
+            "marin-validate-dist" \
+            validated
+
+      - name: Extract upstream sync metadata
+        run: |
+          jq '.upstream_sync // {
+            "status": "missing",
+            "fork_repo": .repo,
+            "message": "No upstream sync metadata was present in marin-build.json."
+          }' validated/marin-build.json > validated/marin-upstream-sync.json
+
+      - name: Download paired vLLM nightly assets
+        run: |
+          bash .github/scripts/marin_release.sh download-release-assets \
+            "marin-community/vllm" \
+            "${{ steps.vllm.outputs.VLLM_TAG }}" \
+            paired-vllm \
+            "*.whl" \
+            "marin-build.json"
+
+      - name: Resolve paired vLLM wheel
+        id: paired_wheel
+        run: |
+          shopt -s nullglob
+          wheels=(paired-vllm/*.whl)
+          if [[ "${#wheels[@]}" -ne 1 ]]; then
+            echo "Expected exactly one paired vLLM wheel, found ${#wheels[@]}." >&2
+            printf '  %s\n' "${wheels[@]}" >&2
+            exit 1
+          fi
+          echo "WHEEL_PATH=${wheels[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Pair-validate exact nightly wheels
+        run: |
+          python .github/scripts/wheel_metadata.py \
+            --wheel "${{ steps.paired_wheel.outputs.WHEEL_PATH }}" \
+            --requirements-out /tmp/vllm-wheel-reqs.txt \
+            --forbid-prefix tpu-inference \
+            --forbid-prefix tpu_inference \
+            --error-on-forbidden
+
+          uv venv .marin-nightly
+          . .marin-nightly/bin/activate
+          uv pip install -r /tmp/vllm-wheel-reqs.txt validated/*.whl
+          uv pip install --no-deps "${{ steps.paired_wheel.outputs.WHEEL_PATH }}"
+          python -c "import tpu_inference; from tpu_inference.runner.tpu_runner import TPUModelRunner"
+
+      - name: Publish immutable nightly release
+        id: immutable
+        run: |
+          SHORT_SHA=$(jq -r '.short_sha' validated/marin-build.json)
+          DATE=$(jq -r '.date' validated/marin-build.json)
+          SHA=$(jq -r '.sha' validated/marin-build.json)
+          TAG="marin-nightly-${DATE}-${SHORT_SHA}"
+          TITLE="Marin nightly ${DATE} (${SHORT_SHA})"
+
+          cat > /tmp/tpu-nightly-notes.md <<EOF
+          Auto-published nightly release for \`$SHA\`.
+
+          This release reuses the exact wheel produced by the latest successful \`marin-validate.yml\` run on \`main\`.
+
+          $(bash .github/scripts/marin_upstream_sync_notes.sh validated/marin-upstream-sync.json "MERGED WITH UPSTREAM TPU-INFERENCE MAIN")
+
+          Paired \`vllm\` release: \`${{ steps.vllm.outputs.VLLM_TAG }}\`
+          EOF
+
+          bash .github/scripts/marin_release.sh upsert-release \
+            "$GITHUB_REPOSITORY" \
+            "$TAG" \
+            "$SHA" \
+            true \
+            "$TITLE" \
+            /tmp/tpu-nightly-notes.md \
+            validated/*.whl \
+            validated/marin-build.json \
+            validated/marin-upstream-sync.json
+
+          {
+            echo "TAG=${TAG}"
+            echo "SHA=${SHA}"
+            echo "DATE=${DATE}"
+            echo "SHORT_SHA=${SHORT_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Update nightly alias
+        run: |
+          cat > /tmp/tpu-nightly-alias-notes.md <<EOF
+          Moving alias for the latest Marin nightly release.
+
+          Current immutable release: \`${{ steps.immutable.outputs.TAG }}\`
+          Commit: \`${{ steps.immutable.outputs.SHA }}\`
+          EOF
+
+          bash .github/scripts/marin_release.sh move-tag \
+            "$GITHUB_REPOSITORY" \
+            "marin-nightly" \
+            "${{ steps.immutable.outputs.SHA }}"
+
+          bash .github/scripts/marin_release.sh upsert-release \
+            "$GITHUB_REPOSITORY" \
+            "marin-nightly" \
+            "${{ steps.immutable.outputs.SHA }}" \
+            true \
+            "Marin nightly (latest)" \
+            /tmp/tpu-nightly-alias-notes.md \
+            validated/*.whl \
+            validated/marin-build.json
+
+      - name: Create pair manifest
+        id: pair
+        run: |
+          VLLM_SHA=$(jq -r '.sha' paired-vllm/marin-build.json)
+          VLLM_UPSTREAM_SYNC=$(jq -c '.upstream_sync // {"status":"missing","message":"No paired vLLM upstream sync metadata was present."}' paired-vllm/marin-build.json)
+          TPU_UPSTREAM_SYNC=$(jq -c '.upstream_sync // {"status":"missing","message":"No TPU upstream sync metadata was present."}' validated/marin-build.json)
+          RELEASED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          jq -n \
+            --arg release_type "nightly" \
+            --arg released_at "$RELEASED_AT" \
+            --arg vllm_sha "$VLLM_SHA" \
+            --arg vllm_tag "${{ steps.vllm.outputs.VLLM_TAG }}" \
+            --arg tpu_sha "${{ steps.immutable.outputs.SHA }}" \
+            --arg tpu_tag "${{ steps.immutable.outputs.TAG }}" \
+            --argjson vllm_upstream_sync "$VLLM_UPSTREAM_SYNC" \
+            --argjson tpu_upstream_sync "$TPU_UPSTREAM_SYNC" \
+            '{
+              release_type: $release_type,
+              released_at: $released_at,
+              vllm_sha: $vllm_sha,
+              vllm_tag: $vllm_tag,
+              tpu_inference_sha: $tpu_sha,
+              tpu_inference_tag: $tpu_tag,
+              vllm_upstream_sync: $vllm_upstream_sync,
+              tpu_inference_upstream_sync: $tpu_upstream_sync
+            }' > marin-release-pair.json
+
+          {
+            echo "VLLM_TAG=${{ steps.vllm.outputs.VLLM_TAG }}"
+            echo "VLLM_SHA=${VLLM_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Attach paired manifest to nightly releases
+        run: |
+          cat > /tmp/tpu-nightly-paired-notes.md <<EOF
+          Auto-published nightly release for \`${{ steps.immutable.outputs.SHA }}\`.
+
+          $(bash .github/scripts/marin_upstream_sync_notes.sh validated/marin-upstream-sync.json "MERGED WITH UPSTREAM TPU-INFERENCE MAIN")
+
+          Paired \`vllm\` release: \`${{ steps.pair.outputs.VLLM_TAG }}\`
+          EOF
+
+          cat > /tmp/tpu-nightly-alias-paired-notes.md <<EOF
+          Moving alias for the latest Marin nightly release.
+
+          Current immutable release: \`${{ steps.immutable.outputs.TAG }}\`
+
+          $(bash .github/scripts/marin_upstream_sync_notes.sh validated/marin-upstream-sync.json "MERGED WITH UPSTREAM TPU-INFERENCE MAIN")
+
+          Paired \`vllm\` release: \`${{ steps.pair.outputs.VLLM_TAG }}\`
+          EOF
+
+          bash .github/scripts/marin_release.sh upsert-release \
+            "$GITHUB_REPOSITORY" \
+            "${{ steps.immutable.outputs.TAG }}" \
+            "${{ steps.immutable.outputs.SHA }}" \
+            true \
+            "Marin nightly ${{ steps.immutable.outputs.DATE }} (${{ steps.immutable.outputs.SHORT_SHA }})" \
+            /tmp/tpu-nightly-paired-notes.md \
+            validated/*.whl \
+            validated/marin-build.json \
+            validated/marin-upstream-sync.json \
+            marin-release-pair.json
+
+          bash .github/scripts/marin_release.sh upsert-release \
+            "$GITHUB_REPOSITORY" \
+            "marin-nightly" \
+            "${{ steps.immutable.outputs.SHA }}" \
+            true \
+            "Marin nightly (latest)" \
+            /tmp/tpu-nightly-alias-paired-notes.md \
+            validated/*.whl \
+            validated/marin-build.json \
+            validated/marin-upstream-sync.json \
+            marin-release-pair.json

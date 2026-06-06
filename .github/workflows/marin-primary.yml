@@ -1,0 +1,209 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Marin Primary Release
+
+on:
+  schedule:
+    - cron: '20 7 * * *'
+  workflow_dispatch:
+    inputs:
+      nightly_tag:
+        description: Optional nightly tag to promote. Defaults to the marin-nightly alias.
+        required: false
+        type: string
+
+concurrency:
+  group: marin-primary
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    name: Promote Marin Primary
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve nightly source
+        id: source
+        run: |
+          SOURCE_TAG="${{ inputs.nightly_tag }}"
+          if [[ -z "$SOURCE_TAG" ]]; then
+            SOURCE_TAG="marin-nightly"
+          fi
+          echo "SOURCE_TAG=${SOURCE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Download source nightly assets
+        run: |
+          bash .github/scripts/marin_release.sh download-release-assets \
+            "$GITHUB_REPOSITORY" \
+            "${{ steps.source.outputs.SOURCE_TAG }}" \
+            source-nightly \
+            "*.whl" \
+            "marin-build.json" \
+            "marin-release-pair.json"
+
+      - name: Extract upstream sync metadata
+        run: |
+          jq '.upstream_sync // {
+            "status": "missing",
+            "fork_repo": .repo,
+            "message": "No upstream sync metadata was present in marin-build.json."
+          }' source-nightly/marin-build.json > source-nightly/marin-upstream-sync.json
+
+      - name: Evaluate primary eligibility
+        id: eligibility
+        run: |
+          NOW=$(date -u +%s)
+          LATEST_PRIMARY_TAG=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            | jq -r '[.[] | select(.tag_name | startswith("marin-primary-"))][0].tag_name // empty')
+
+          if [[ -z "$LATEST_PRIMARY_TAG" ]]; then
+            echo "eligible=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RELEASE_JSON=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$LATEST_PRIMARY_TAG")
+          PUBLISHED_AT=$(jq -r '.published_at' <<<"$RELEASE_JSON")
+          PUBLISHED_EPOCH=$(date -u -d "$PUBLISHED_AT" +%s)
+          AGE=$((NOW - PUBLISHED_EPOCH))
+
+          if [[ "$AGE" -lt 259200 ]]; then
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Last immutable primary release is younger than 72 hours." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "eligible=true" >> "$GITHUB_OUTPUT"
+
+      - name: Stop when no promotion is due
+        if: steps.eligibility.outputs.eligible != 'true'
+        run: |
+          echo "${{ steps.eligibility.outputs.reason || 'No primary promotion required.' }}"
+
+      - name: Download paired vLLM nightly assets
+        if: steps.eligibility.outputs.eligible == 'true'
+        run: |
+          VLLM_NIGHTLY_TAG=$(jq -r '.vllm_tag' source-nightly/marin-release-pair.json)
+          bash .github/scripts/marin_release.sh download-release-assets \
+            "marin-community/vllm" \
+            "$VLLM_NIGHTLY_TAG" \
+            source-vllm \
+            "*.whl" \
+            "marin-build.json"
+
+      - name: Create primary pair manifest
+        if: steps.eligibility.outputs.eligible == 'true'
+        id: primary
+        run: |
+          DATE=$(date -u +%Y%m%d)
+          VLLM_SHORT_SHA=$(jq -r '.short_sha' source-vllm/marin-build.json)
+          VLLM_SHA=$(jq -r '.sha' source-vllm/marin-build.json)
+          VLLM_TAG=$(jq -r '.vllm_tag' source-nightly/marin-release-pair.json)
+          TPU_SHORT_SHA=$(jq -r '.short_sha' source-nightly/marin-build.json)
+          TPU_SHA=$(jq -r '.sha' source-nightly/marin-build.json)
+          VLLM_UPSTREAM_SYNC=$(jq -c '.upstream_sync // {"status":"missing","message":"No paired vLLM upstream sync metadata was present."}' source-vllm/marin-build.json)
+          TPU_UPSTREAM_SYNC=$(jq -c '.upstream_sync // {"status":"missing","message":"No TPU upstream sync metadata was present."}' source-nightly/marin-build.json)
+          RELEASED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          TPU_PRIMARY_TAG="marin-primary-${DATE}-${TPU_SHORT_SHA}"
+
+          jq -n \
+            --arg release_type "primary" \
+            --arg released_at "$RELEASED_AT" \
+            --arg vllm_sha "$VLLM_SHA" \
+            --arg vllm_tag "$VLLM_TAG" \
+            --arg tpu_sha "$TPU_SHA" \
+            --arg tpu_tag "$TPU_PRIMARY_TAG" \
+            --argjson vllm_upstream_sync "$VLLM_UPSTREAM_SYNC" \
+            --argjson tpu_upstream_sync "$TPU_UPSTREAM_SYNC" \
+            '{
+              release_type: $release_type,
+              released_at: $released_at,
+              vllm_sha: $vllm_sha,
+              vllm_tag: $vllm_tag,
+              tpu_inference_sha: $tpu_sha,
+              tpu_inference_tag: $tpu_tag,
+              vllm_upstream_sync: $vllm_upstream_sync,
+              tpu_inference_upstream_sync: $tpu_upstream_sync
+            }' > marin-release-pair.json
+
+          {
+            echo "DATE=${DATE}"
+            echo "VLLM_SHA=${VLLM_SHA}"
+            echo "VLLM_SHORT_SHA=${VLLM_SHORT_SHA}"
+            echo "VLLM_TAG=${VLLM_TAG}"
+            echo "TPU_SHA=${TPU_SHA}"
+            echo "TPU_SHORT_SHA=${TPU_SHORT_SHA}"
+            echo "TPU_PRIMARY_TAG=${TPU_PRIMARY_TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Promote TPU primary release
+        if: steps.eligibility.outputs.eligible == 'true'
+        run: |
+          cat > /tmp/tpu-primary-notes.md <<EOF
+          Primary promotion of paired nightly source \`${{ steps.source.outputs.SOURCE_TAG }}\`.
+
+          $(bash .github/scripts/marin_upstream_sync_notes.sh source-nightly/marin-upstream-sync.json "MERGED WITH UPSTREAM TPU-INFERENCE MAIN")
+
+          Paired \`vllm\` release: \`${{ steps.primary.outputs.VLLM_TAG }}\`
+          EOF
+
+          cat > /tmp/tpu-primary-alias-notes.md <<EOF
+          Moving alias for the latest Marin primary release.
+
+          Current immutable release: \`${{ steps.primary.outputs.TPU_PRIMARY_TAG }}\`
+
+          $(bash .github/scripts/marin_upstream_sync_notes.sh source-nightly/marin-upstream-sync.json "MERGED WITH UPSTREAM TPU-INFERENCE MAIN")
+
+          Paired \`vllm\` release: \`${{ steps.primary.outputs.VLLM_TAG }}\`
+          EOF
+
+          bash .github/scripts/marin_release.sh upsert-release \
+            "$GITHUB_REPOSITORY" \
+            "${{ steps.primary.outputs.TPU_PRIMARY_TAG }}" \
+            "${{ steps.primary.outputs.TPU_SHA }}" \
+            false \
+            "Marin primary ${{ steps.primary.outputs.DATE }} (${{ steps.primary.outputs.TPU_SHORT_SHA }})" \
+            /tmp/tpu-primary-notes.md \
+            source-nightly/*.whl \
+            source-nightly/marin-build.json \
+            source-nightly/marin-upstream-sync.json \
+            marin-release-pair.json
+
+          bash .github/scripts/marin_release.sh move-tag \
+            "$GITHUB_REPOSITORY" \
+            "marin-primary" \
+            "${{ steps.primary.outputs.TPU_SHA }}"
+
+          bash .github/scripts/marin_release.sh upsert-release \
+            "$GITHUB_REPOSITORY" \
+            "marin-primary" \
+            "${{ steps.primary.outputs.TPU_SHA }}" \
+            false \
+            "Marin primary (latest)" \
+            /tmp/tpu-primary-alias-notes.md \
+            source-nightly/*.whl \
+            source-nightly/marin-build.json \
+            source-nightly/marin-upstream-sync.json \
+            marin-release-pair.json
