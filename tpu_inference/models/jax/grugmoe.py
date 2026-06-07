@@ -55,6 +55,22 @@ class GrugMoeHfConfig(PretrainedConfig):
         architectures: Optional[list[str]] = None,
         **kwargs: Any,
     ) -> None:
+        aliases = {
+            "hidden_size": "hidden_dim",
+            "intermediate_size": "intermediate_dim",
+            "moe_intermediate_size": "intermediate_dim",
+            "shared_expert_intermediate_size": "shared_expert_intermediate_dim",
+            "num_hidden_layers": "num_layers",
+            "num_attention_heads": "num_heads",
+            "num_key_value_heads": "num_kv_heads",
+            "max_position_embeddings": "max_seq_len",
+        }
+        for alias, source in aliases.items():
+            if alias not in kwargs and source in kwargs:
+                kwargs[alias] = kwargs[source]
+            if source not in kwargs and alias in kwargs:
+                kwargs[source] = kwargs[alias]
+
         super().__init__(
             architectures=architectures or ["GrugMoeForCausalLM"],
             **kwargs,
