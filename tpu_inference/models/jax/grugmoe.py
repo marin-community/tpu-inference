@@ -29,6 +29,7 @@ import numpy as np
 from flax import nnx
 from jax.sharding import Mesh
 from safetensors import safe_open
+from transformers import PretrainedConfig
 from vllm.config import VllmConfig
 
 from tpu_inference.distributed.jax_parallel_state import get_pp_group
@@ -44,6 +45,20 @@ _ARTIFACT_CONFIG_FILE = "config.json"
 _ARTIFACT_WEIGHTS_FILE = "model.safetensors"
 _ARTIFACT_WEIGHTS_INDEX_FILE = "model.safetensors.index.json"
 _ARTIFACT_MODEL_TYPE = "grug_moe"
+
+
+class GrugMoeHfConfig(PretrainedConfig):
+    model_type = _ARTIFACT_MODEL_TYPE
+
+    def __init__(
+        self,
+        architectures: Optional[list[str]] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            architectures=architectures or ["GrugMoeForCausalLM"],
+            **kwargs,
+        )
 
 
 @dataclass(frozen=True)
@@ -1149,6 +1164,7 @@ __all__ = [
     "GrugMoeDenseMLP",
     "GrugMoeForCausalLM",
     "GrugMoeGatedNorm",
+    "GrugMoeHfConfig",
     "GrugMoeMLP",
     "GrugMoeModel",
     "GrugMoeRMSNorm",

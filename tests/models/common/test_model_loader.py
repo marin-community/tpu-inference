@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import tempfile
 from unittest.mock import MagicMock, patch
@@ -248,6 +249,45 @@ def test_register_model_vllm_wrapper_methods():
 
     # `load_weights` should be a no-op that returns None.
     assert instance.load_weights() is None
+
+
+def test_register_layers_registers_grugmoe_for_tpu(monkeypatch):
+    monkeypatch.setenv("VLLM_TARGET_DEVICE", "tpu")
+
+    from transformers import AutoConfig
+    from vllm.transformers_utils.config import _CONFIG_REGISTRY
+
+    from tpu_inference.layers.vllm import register_layers
+    from tpu_inference.models.jax.grugmoe import GrugMoeHfConfig
+
+    register_layers()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "config.json"), "w") as f:
+            json.dump(
+                {
+                    "model_type": "grug_moe",
+                    "architectures": ["GrugMoeForCausalLM"],
+                    "vocab_size": 16,
+                },
+                f,
+            )
+
+        hf_config = AutoConfig.from_pretrained(tmpdir)
+
+    assert isinstance(hf_config, GrugMoeHfConfig)
+    assert hf_config.architectures == ["GrugMoeForCausalLM"]
+    assert _CONFIG_REGISTRY["grug_moe"] is GrugMoeHfConfig
+
+    model_config = MagicMock()
+    model_config.model_impl = "auto"
+    model_config.convert_type = "none"
+    model_config.runner_type = None
+    model_info, arch = ModelRegistry.inspect_model_cls(["GrugMoeForCausalLM"],
+                                                       model_config)
+
+    assert arch == "GrugMoeForCausalLM"
+    assert model_info.is_text_generation_model
 
 
 @pytest.mark.parametrize("tie_word_embeddings", [True, False])
