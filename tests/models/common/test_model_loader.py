@@ -269,15 +269,43 @@ def test_register_layers_registers_grugmoe_for_tpu(monkeypatch):
                     "model_type": "grug_moe",
                     "architectures": ["GrugMoeForCausalLM"],
                     "vocab_size": 16,
+                    "hidden_dim": 8,
+                    "intermediate_dim": 16,
+                    "shared_expert_intermediate_dim": 16,
+                    "num_experts": 2,
+                    "num_experts_per_token": 1,
+                    "num_layers": 1,
+                    "num_heads": 1,
+                    "num_kv_heads": 1,
+                    "head_dim": 8,
+                    "max_seq_len": 16,
+                    "sliding_window": 16,
                 },
                 f,
             )
 
         hf_config = AutoConfig.from_pretrained(tmpdir)
+        real_model_config = ModelConfig(
+            model=tmpdir,
+            runner="generate",
+            tokenizer=tmpdir,
+            tokenizer_mode="auto",
+            trust_remote_code=False,
+            dtype="bfloat16",
+            seed=0,
+            skip_tokenizer_init=True,
+            max_model_len=16,
+        )
+        hidden_size = real_model_config.get_hidden_size()
 
     assert isinstance(hf_config, GrugMoeHfConfig)
     assert hf_config.architectures == ["GrugMoeForCausalLM"]
+    assert hf_config.hidden_size == 8
+    assert hf_config.num_attention_heads == 1
+    assert hf_config.num_key_value_heads == 1
+    assert hf_config.num_hidden_layers == 1
     assert _CONFIG_REGISTRY["grug_moe"] is GrugMoeHfConfig
+    assert hidden_size == 8
 
     model_config = MagicMock()
     model_config.model_impl = "auto"
