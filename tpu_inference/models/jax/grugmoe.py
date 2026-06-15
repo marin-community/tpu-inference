@@ -35,7 +35,7 @@ from vllm.config import VllmConfig
 from tpu_inference.distributed.jax_parallel_state import get_pp_group
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.jax import JaxModule
-from tpu_inference.layers.jax.linear import JaxLmHead
+from tpu_inference.layers.jax.linear import JaxEinsum
 from tpu_inference.layers.jax.pp_utils import PPMissingLayer, make_layers
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
@@ -824,9 +824,12 @@ class GrugMoeForCausalLM(JaxModule):
         )
         if not self.tie_word_embeddings:
             if self.model.is_last_rank:
-                self.lm_head = JaxLmHead(
-                    hidden_size=self.model.config.hidden_dim,
-                    vocab_size=self.model.config.vocab_size,
+                self.lm_head = JaxEinsum(
+                    einsum_str="TD,DV->TV",
+                    kernel_shape=(
+                        self.model.config.hidden_dim,
+                        self.model.config.vocab_size,
+                    ),
                     dtype=vllm_config.model_config.dtype,
                     param_dtype=vllm_config.model_config.dtype,
                     rngs=rng,
