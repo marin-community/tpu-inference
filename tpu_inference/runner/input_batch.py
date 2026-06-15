@@ -29,6 +29,10 @@ class CachedRequestState(NewRequestData):
     generator: Optional[Any] = None
     mrope_positions: Optional[jax.Array] = None
     mrope_position_delta: Optional[int] = None
+    # Accumulates prompt logprob chunks across chunked-prefill steps.
+    # Tuple of (token_ids, logprobs, ranks) numpy arrays, each of shape
+    # [num_prompt_tokens - 1, ...]. Set to None when prefill completes.
+    in_progress_prompt_logprobs_cpu: Optional[tuple] = None
 
     def __post_init__(self):
         self.num_prompt_tokens = len(self.prompt_token_ids)
@@ -118,6 +122,7 @@ class InputBatch:
         self.generators: dict[int, Any] = {}
 
         self.num_logprobs: dict[str, int] = {}
+        self.num_prompt_logprobs: dict[str, int] = {}
 
         self.logit_bias: list[Optional[dict[int,
                                             float]]] = [None] * max_num_reqs
@@ -255,6 +260,19 @@ class InputBatch:
 
             if sampling_params.logprobs is not None:
                 self.num_logprobs[req_id] = sampling_params.logprobs
+            if sampling_params.prompt_logprobs is not None:
+                num_k = (self.vocab_size if sampling_params.prompt_logprobs
+                         == -1 else sampling_params.prompt_logprobs)
+                self.num_prompt_logprobs[req_id] = num_k
+                num_prompt_targets = len(request.prompt_token_ids) - 1
+                if num_prompt_targets > 0:
+                    request.in_progress_prompt_logprobs_cpu = (
+                        np.empty((num_prompt_targets, num_k + 1),
+                                 dtype=np.int32),
+                        np.empty((num_prompt_targets, num_k + 1),
+                                 dtype=np.float32),
+                        np.empty(num_prompt_targets, dtype=np.int32),
+                    )
             if sampling_params.logit_bias is not None:
                 self.logit_bias[req_index] = sampling_params.logit_bias
 
@@ -332,6 +350,7 @@ class InputBatch:
         self.min_tokens.pop(req_index, None)
         self.generators.pop(req_index, None)
         self.num_logprobs.pop(req_id, None)
+        self.num_prompt_logprobs.pop(req_id, None)
 
         # It's ok to pop nothing for non-pooling model.
         self.pooling_params.pop(req_id, None)
@@ -501,6 +520,11 @@ class InputBatch:
     @property
     def max_num_logprobs(self) -> Optional[int]:
         return max(self.num_logprobs.values()) if self.num_logprobs else None
+
+    @property
+    def max_num_prompt_logprobs(self) -> Optional[int]:
+        return (max(self.num_prompt_logprobs.values())
+                if self.num_prompt_logprobs else None)
 
     def make_lora_inputs(
         self, num_scheduled_tokens: np.ndarray
