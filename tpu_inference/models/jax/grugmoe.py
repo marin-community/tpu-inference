@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """Correctness-first native JAX implementation of Marin GrugMoE."""
 
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -45,6 +45,104 @@ _ARTIFACT_CONFIG_FILE = "config.json"
 _ARTIFACT_WEIGHTS_FILE = "model.safetensors"
 _ARTIFACT_WEIGHTS_INDEX_FILE = "model.safetensors.index.json"
 _ARTIFACT_MODEL_TYPE = "grug_moe"
+_ROUTING_DEBUG_ENV = "GRUGMOE_ROUTING_DEBUG"
+_ROUTING_DEBUG_LAYER_ENV = "GRUGMOE_ROUTING_DEBUG_LAYER"
+_ROUTING_DEBUG_TOKEN_POSITION_ENV = "GRUGMOE_ROUTING_DEBUG_TOKEN_POSITION"
+_ROUTING_DEBUG_VECTOR_LIMIT_ENV = "GRUGMOE_ROUTING_DEBUG_VECTOR_LIMIT"
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name,
+                          "").strip().lower() not in ("", "0", "false", "no")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _array_debug_summary(value: Any, *, vector_limit: int) -> dict[str, Any]:
+    arr = np.asarray(value)
+    flat = arr.reshape(-1)
+    flat64 = flat.astype(np.float64, copy=False)
+    summary: dict[str, Any] = {
+        "shape": list(arr.shape),
+        "dtype": str(arr.dtype),
+        "size": int(flat.size),
+    }
+    if flat.size:
+        summary.update({
+            "first_values": flat64[:vector_limit].tolist(),
+            "l2": float(np.linalg.norm(flat64)),
+            "max": float(np.max(flat64)),
+            "mean": float(np.mean(flat64)),
+            "min": float(np.min(flat64)),
+        })
+        if flat.size <= vector_limit:
+            summary["values"] = flat64.tolist()
+    else:
+        summary["first_values"] = []
+    return summary
+
+
+def _print_routing_debug_record(
+    *,
+    layer_index: int,
+    token_position: int,
+    vector_limit: int,
+    router_input_hidden_state: Any,
+    router_logits: Any,
+    router_bias: Any,
+    biased_router_logits: Any,
+    topk_with_boundary_logits: Any,
+    topk_with_boundary_expert_ids: Any,
+    topk_expert_ids: Any,
+    combine_weights: Any,
+) -> None:
+    topk_with_boundary_logits_np = np.asarray(topk_with_boundary_logits,
+                                              dtype=np.float64)
+    topk_with_boundary_ids_np = np.asarray(topk_with_boundary_expert_ids,
+                                           dtype=np.int64)
+    topk_expert_ids_np = np.asarray(topk_expert_ids, dtype=np.int64)
+    top_k = int(topk_expert_ids_np.shape[0])
+    payload = {
+        "source":
+        "tpu-inference GrugMoeMLP.route",
+        "layer":
+        int(layer_index),
+        "token_position":
+        int(token_position),
+        "router_input_hidden_state":
+        _array_debug_summary(router_input_hidden_state,
+                             vector_limit=vector_limit),
+        "raw_router_logits":
+        _array_debug_summary(router_logits, vector_limit=vector_limit),
+        "router_bias":
+        _array_debug_summary(router_bias, vector_limit=vector_limit),
+        "biased_router_logits":
+        _array_debug_summary(biased_router_logits, vector_limit=vector_limit),
+        "topk_expert_ids":
+        topk_expert_ids_np.tolist(),
+        "topk_with_boundary_expert_ids":
+        topk_with_boundary_ids_np.tolist(),
+        "topk_with_boundary_logits":
+        topk_with_boundary_logits_np.tolist(),
+        "combine_weights":
+        _array_debug_summary(combine_weights, vector_limit=vector_limit),
+    }
+    if topk_with_boundary_logits_np.shape[0] > top_k:
+        payload["boundary_expert_id"] = int(topk_with_boundary_ids_np[top_k])
+        payload["boundary_logit"] = float(topk_with_boundary_logits_np[top_k])
+        payload["router_margin"] = float(topk_with_boundary_logits_np[top_k -
+                                                                      1] -
+                                         topk_with_boundary_logits_np[top_k])
+    print("tpu_grugmoe_routing_debug=" + json.dumps(payload, sort_keys=True),
+          flush=True)
 
 
 class GrugMoeHfConfig(PretrainedConfig):
@@ -59,7 +157,8 @@ class GrugMoeHfConfig(PretrainedConfig):
             "hidden_size": "hidden_dim",
             "intermediate_size": "intermediate_dim",
             "moe_intermediate_size": "intermediate_dim",
-            "shared_expert_intermediate_size": "shared_expert_intermediate_dim",
+            "shared_expert_intermediate_size":
+            "shared_expert_intermediate_dim",
             "num_hidden_layers": "num_layers",
             "num_attention_heads": "num_heads",
             "num_key_value_heads": "num_kv_heads",
@@ -84,7 +183,9 @@ class GrugMoeArtifactLoadReport:
     unexpected: frozenset[str]
 
 
-def _config_attr(config: Any, names: tuple[str, ...], default: Any = None) -> Any:
+def _config_attr(config: Any,
+                 names: tuple[str, ...],
+                 default: Any = None) -> Any:
     for name in names:
         if hasattr(config, name):
             return getattr(config, name)
@@ -129,23 +230,21 @@ class GrugMoeConfig:
     @classmethod
     def from_hf_config(cls, config: Any) -> "GrugMoeConfig":
         max_seq_len = int(
-            _config_attr(config, ("max_seq_len", "max_position_embeddings"), 4096)
-        )
+            _config_attr(config, ("max_seq_len", "max_position_embeddings"),
+                         4096))
         num_heads = int(
-            _config_attr(config, ("num_heads", "num_attention_heads"), 16)
-        )
+            _config_attr(config, ("num_heads", "num_attention_heads"), 16))
         return cls(
-            vocab_size=int(_config_attr(config, ("vocab_size",))),
+            vocab_size=int(_config_attr(config, ("vocab_size", ))),
             hidden_dim=int(
-                _config_attr(config, ("hidden_dim", "hidden_size"), 2048)
-            ),
+                _config_attr(config, ("hidden_dim", "hidden_size"), 2048)),
             intermediate_dim=int(
                 _config_attr(
                     config,
-                    ("intermediate_dim", "moe_intermediate_size", "intermediate_size"),
+                    ("intermediate_dim", "moe_intermediate_size",
+                     "intermediate_size"),
                     5632,
-                )
-            ),
+                )),
             shared_expert_intermediate_dim=int(
                 _config_attr(
                     config,
@@ -154,37 +253,30 @@ class GrugMoeConfig:
                         "shared_expert_intermediate_size",
                     ),
                     5632,
-                )
-            ),
+                )),
             num_experts=int(
-                _config_attr(config, ("num_experts", "num_local_experts"), 8)
-            ),
+                _config_attr(config, ("num_experts", "num_local_experts"), 8)),
             num_experts_per_token=int(
-                _config_attr(
-                    config, ("num_experts_per_token", "num_experts_per_tok"), 2
-                )
-            ),
+                _config_attr(config,
+                             ("num_experts_per_token", "num_experts_per_tok"),
+                             2)),
             num_layers=int(
-                _config_attr(config, ("num_layers", "num_hidden_layers"), 24)
-            ),
+                _config_attr(config, ("num_layers", "num_hidden_layers"), 24)),
             num_heads=num_heads,
             num_kv_heads=int(
-                _config_attr(
-                    config, ("num_kv_heads", "num_key_value_heads"), num_heads
-                )
-            ),
+                _config_attr(config, ("num_kv_heads", "num_key_value_heads"),
+                             num_heads)),
             head_dim=_config_attr(config, ("head_dim", "attention_head_dim")),
             max_seq_len=max_seq_len,
             sliding_window=int(
-                _config_attr(config, ("sliding_window",), max_seq_len)
-            ),
+                _config_attr(config, ("sliding_window", ), max_seq_len)),
             layer_norm_eps=float(
-                _config_attr(config, ("layer_norm_eps", "rms_norm_eps"), 1e-5)
-            ),
+                _config_attr(config, ("layer_norm_eps", "rms_norm_eps"),
+                             1e-5)),
             initializer_std=float(
-                _config_attr(config, ("initializer_std", "initializer_range"), 0.02)
-            ),
-            qk_mult=float(_config_attr(config, ("qk_mult",), 1.0)),
+                _config_attr(config, ("initializer_std", "initializer_range"),
+                             0.02)),
+            qk_mult=float(_config_attr(config, ("qk_mult", ), 1.0)),
             rope_theta=_rope_theta(config),
         ).validate()
 
@@ -195,8 +287,7 @@ class GrugMoeConfig:
         if self.hidden_dim % self.num_heads != 0:
             raise ValueError(
                 f"hidden_dim={self.hidden_dim} is not divisible by "
-                f"num_heads={self.num_heads}; set head_dim explicitly"
-            )
+                f"num_heads={self.num_heads}; set head_dim explicitly")
         return self.hidden_dim // self.num_heads
 
     def validate(self) -> "GrugMoeConfig":
@@ -207,15 +298,15 @@ class GrugMoeConfig:
         if self.intermediate_dim <= 0:
             raise ValueError("intermediate_dim must be positive")
         if self.shared_expert_intermediate_dim < 0:
-            raise ValueError("shared_expert_intermediate_dim must be non-negative")
+            raise ValueError(
+                "shared_expert_intermediate_dim must be non-negative")
         if self.num_experts <= 0:
             raise ValueError("num_experts must be positive")
         if self.num_experts_per_token <= 0:
             raise ValueError("num_experts_per_token must be positive")
         if self.num_experts_per_token >= self.num_experts:
             raise ValueError(
-                "num_experts_per_token must be < num_experts for QB routing"
-            )
+                "num_experts_per_token must be < num_experts for QB routing")
         if self.num_layers <= 0:
             raise ValueError("num_layers must be positive")
         if self.num_heads <= 0:
@@ -241,15 +332,14 @@ def _read_artifact_config(artifact_dir: Path) -> dict[str, Any]:
         config = json.load(f)
     if config.get("model_type") != _ARTIFACT_MODEL_TYPE:
         raise ValueError(
-            f"{config_path} must declare model_type={_ARTIFACT_MODEL_TYPE!r}"
-        )
+            f"{config_path} must declare model_type={_ARTIFACT_MODEL_TYPE!r}")
     return config
 
 
 class _SafetensorsArtifactTensors(Mapping[str, np.ndarray]):
 
-    def __init__(self, artifact_dir: Path,
-                 weight_map: Mapping[str, str]) -> None:
+    def __init__(self, artifact_dir: Path, weight_map: Mapping[str,
+                                                               str]) -> None:
         self._artifact_dir = artifact_dir
         self._weight_map = dict(weight_map)
 
@@ -274,11 +364,8 @@ def _read_safetensors_weight_map(index_path: Path) -> dict[str, str]:
     if not isinstance(weight_map, dict) or not weight_map:
         raise ValueError(f"{index_path} must contain a non-empty weight_map")
 
-    invalid = [
-        (name, shard)
-        for name, shard in weight_map.items()
-        if not isinstance(name, str) or not isinstance(shard, str)
-    ]
+    invalid = [(name, shard) for name, shard in weight_map.items()
+               if not isinstance(name, str) or not isinstance(shard, str)]
     if invalid:
         raise ValueError(
             f"{index_path} weight_map entries must map string tensor names to string shard files"
@@ -321,8 +408,7 @@ def _validate_sharded_safetensors_index(
             raise ValueError(
                 "Safetensors shard does not match its index entry: "
                 f"file={shard_name!r} missing={sorted(missing)} "
-                f"unexpected={sorted(unexpected)}"
-            )
+                f"unexpected={sorted(unexpected)}")
 
 
 def _load_artifact_tensors(artifact_dir: Path) -> Mapping[str, np.ndarray]:
@@ -349,8 +435,7 @@ def _validate_artifact_config(
     expected_tie_word_embeddings: bool,
 ) -> None:
     loaded_config = GrugMoeConfig.from_hf_config(
-        SimpleNamespace(**artifact_config)
-    )
+        SimpleNamespace(**artifact_config))
     mismatches = []
     for field in fields(GrugMoeConfig):
         if field.name == "head_dim":
@@ -358,15 +443,16 @@ def _validate_artifact_config(
         expected_value = getattr(expected_config, field.name)
         loaded_value = getattr(loaded_config, field.name)
         if loaded_value != expected_value:
-            mismatches.append(f"{field.name}: artifact={loaded_value!r} model={expected_value!r}")
+            mismatches.append(
+                f"{field.name}: artifact={loaded_value!r} model={expected_value!r}"
+            )
     if loaded_config.inferred_head_dim != expected_config.inferred_head_dim:
-        mismatches.append(
-            "head_dim: "
-            f"artifact={loaded_config.inferred_head_dim!r} "
-            f"model={expected_config.inferred_head_dim!r}"
-        )
+        mismatches.append("head_dim: "
+                          f"artifact={loaded_config.inferred_head_dim!r} "
+                          f"model={expected_config.inferred_head_dim!r}")
 
-    tie_word_embeddings = bool(artifact_config.get("tie_word_embeddings", False))
+    tie_word_embeddings = bool(
+        artifact_config.get("tie_word_embeddings", False))
     if tie_word_embeddings != expected_tie_word_embeddings:
         mismatches.append(
             "tie_word_embeddings: "
@@ -376,8 +462,7 @@ def _validate_artifact_config(
     if mismatches:
         raise ValueError(
             "GrugMoE inference artifact config does not match the initialized model: "
-            + "; ".join(mismatches)
-        )
+            + "; ".join(mismatches))
 
 
 def _canonical_grugmoe_tensor_names(
@@ -399,34 +484,30 @@ def _canonical_grugmoe_tensor_names(
 
     for layer_index in range(cfg.num_layers):
         prefix = f"model.layers.{layer_index}"
-        names.update(
-            {
-                f"{prefix}.input_layernorm.weight",
-                f"{prefix}.attn_gated_norm.down_proj.weight",
-                f"{prefix}.attn_gated_norm.up_proj.weight",
-                f"{prefix}.self_attn.q_proj.weight",
-                f"{prefix}.self_attn.k_proj.weight",
-                f"{prefix}.self_attn.v_proj.weight",
-                f"{prefix}.self_attn.o_proj.weight",
-                f"{prefix}.self_attn.attn_gate.weight",
-                f"{prefix}.post_attention_layernorm.weight",
-                f"{prefix}.mlp_gated_norm.down_proj.weight",
-                f"{prefix}.mlp_gated_norm.up_proj.weight",
-                f"{prefix}.mlp.router.weight",
-                f"{prefix}.mlp.router.bias",
-                f"{prefix}.mlp.experts.gate_proj.weight",
-                f"{prefix}.mlp.experts.up_proj.weight",
-                f"{prefix}.mlp.experts.down_proj.weight",
-            }
-        )
+        names.update({
+            f"{prefix}.input_layernorm.weight",
+            f"{prefix}.attn_gated_norm.down_proj.weight",
+            f"{prefix}.attn_gated_norm.up_proj.weight",
+            f"{prefix}.self_attn.q_proj.weight",
+            f"{prefix}.self_attn.k_proj.weight",
+            f"{prefix}.self_attn.v_proj.weight",
+            f"{prefix}.self_attn.o_proj.weight",
+            f"{prefix}.self_attn.attn_gate.weight",
+            f"{prefix}.post_attention_layernorm.weight",
+            f"{prefix}.mlp_gated_norm.down_proj.weight",
+            f"{prefix}.mlp_gated_norm.up_proj.weight",
+            f"{prefix}.mlp.router.weight",
+            f"{prefix}.mlp.router.bias",
+            f"{prefix}.mlp.experts.gate_proj.weight",
+            f"{prefix}.mlp.experts.up_proj.weight",
+            f"{prefix}.mlp.experts.down_proj.weight",
+        })
         if cfg.shared_expert_intermediate_dim > 0:
-            names.update(
-                {
-                    f"{prefix}.shared_expert.gate_proj.weight",
-                    f"{prefix}.shared_expert.up_proj.weight",
-                    f"{prefix}.shared_expert.down_proj.weight",
-                }
-            )
+            names.update({
+                f"{prefix}.shared_expert.gate_proj.weight",
+                f"{prefix}.shared_expert.up_proj.weight",
+                f"{prefix}.shared_expert.down_proj.weight",
+            })
 
     return frozenset(names)
 
@@ -438,8 +519,7 @@ def _init_weight(
     std: float,
 ) -> nnx.Param:
     value = std * jax.random.truncated_normal(
-        rngs.params(), -3.0, 3.0, shape, dtype=jnp.float32
-    )
+        rngs.params(), -3.0, 3.0, shape, dtype=jnp.float32)
     return nnx.Param(value.astype(dtype))
 
 
@@ -463,7 +543,8 @@ def _align_kv_heads(x: jax.Array, num_q_heads: int) -> jax.Array:
         return x
     repeat = num_q_heads // num_kv_heads
     expanded = jnp.expand_dims(x, axis=2)
-    expanded = jnp.broadcast_to(expanded, (x.shape[0], num_kv_heads, repeat, x.shape[2]))
+    expanded = jnp.broadcast_to(expanded,
+                                (x.shape[0], num_kv_heads, repeat, x.shape[2]))
     return expanded.reshape(x.shape[0], num_q_heads, x.shape[2])
 
 
@@ -476,16 +557,16 @@ def _apply_rotary(
     theta: float,
 ) -> tuple[jax.Array, jax.Array]:
     half_dim = head_dim // 2
-    inv_freq = 1.0 / (
-        theta ** (jnp.arange(0, half_dim, dtype=jnp.float32) / half_dim)
-    )
+    inv_freq = 1.0 / (theta**(jnp.arange(0, half_dim, dtype=jnp.float32) /
+                              half_dim))
     angles = positions.astype(jnp.float32)[:, None] * inv_freq[None, :]
     cos = jnp.cos(angles)[:, None, :]
     sin = jnp.sin(angles)[:, None, :]
 
     def apply(x: jax.Array) -> jax.Array:
         x1, x2 = jnp.split(x, 2, axis=-1)
-        return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
+        return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin],
+                               axis=-1)
 
     return apply(q), apply(k)
 
@@ -493,7 +574,7 @@ def _apply_rotary(
 class GrugMoeRMSNorm(JaxModule):
 
     def __init__(self, dim: int, eps: float, dtype: jnp.dtype) -> None:
-        self.weight = nnx.Param(jnp.ones((dim,), dtype=dtype))
+        self.weight = nnx.Param(jnp.ones((dim, ), dtype=dtype))
         self.eps = eps
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -509,21 +590,18 @@ class GrugMoeGatedNorm(JaxModule):
         dtype: jnp.dtype,
         rng: nnx.Rngs,
     ) -> None:
-        self.w_down = _init_weight(
-            rng, (hidden_dim, _GATED_NORM_RANK), dtype, initializer_std
-        )
-        self.w_up = _init_weight(
-            rng, (_GATED_NORM_RANK, hidden_dim), dtype, initializer_std
-        )
+        self.w_down = _init_weight(rng, (hidden_dim, _GATED_NORM_RANK), dtype,
+                                   initializer_std)
+        self.w_up = _init_weight(rng, (_GATED_NORM_RANK, hidden_dim), dtype,
+                                 initializer_std)
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        gate_hidden = jnp.einsum(
-            "...d,dr->...r", x.astype(jnp.float32), self.w_down.value.astype(jnp.float32)
-        )
+        gate_hidden = jnp.einsum("...d,dr->...r", x.astype(jnp.float32),
+                                 self.w_down.value.astype(jnp.float32))
         gate_hidden = jax.nn.silu(gate_hidden)
         gate = jax.nn.sigmoid(
-            jnp.einsum("...r,rd->...d", gate_hidden, self.w_up.value.astype(jnp.float32))
-        )
+            jnp.einsum("...r,rd->...d", gate_hidden,
+                       self.w_up.value.astype(jnp.float32)))
         return x * gate.astype(x.dtype)
 
 
@@ -537,25 +615,37 @@ class GrugMoeDenseMLP(JaxModule):
         dtype: jnp.dtype,
         rng: nnx.Rngs,
     ) -> None:
-        self.w_gate = _init_weight(rng, (hidden_dim, intermediate_dim), dtype, initializer_std)
-        self.w_up = _init_weight(rng, (hidden_dim, intermediate_dim), dtype, initializer_std)
-        self.w_down = _init_weight(rng, (intermediate_dim, hidden_dim), dtype, initializer_std)
+        self.w_gate = _init_weight(rng, (hidden_dim, intermediate_dim), dtype,
+                                   initializer_std)
+        self.w_up = _init_weight(rng, (hidden_dim, intermediate_dim), dtype,
+                                 initializer_std)
+        self.w_down = _init_weight(rng, (intermediate_dim, hidden_dim), dtype,
+                                   initializer_std)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         gate = jnp.einsum("td,df->tf", x, self.w_gate.value)
         up = jnp.einsum("td,df->tf", x, self.w_up.value)
-        return jnp.einsum("tf,fd->td", jax.nn.silu(gate) * up, self.w_down.value)
+        return jnp.einsum("tf,fd->td",
+                          jax.nn.silu(gate) * up, self.w_down.value)
 
 
 class GrugMoeMLP(JaxModule):
     """QB-routed MoE with sigmoid combine weights."""
 
-    def __init__(self, cfg: GrugMoeConfig, dtype: jnp.dtype, rng: nnx.Rngs) -> None:
+    def __init__(
+        self,
+        cfg: GrugMoeConfig,
+        dtype: jnp.dtype,
+        rng: nnx.Rngs,
+        *,
+        layer_index: int = -1,
+    ) -> None:
         self.cfg = cfg
-        self.router = _init_weight(
-            rng, (cfg.hidden_dim, cfg.num_experts), dtype, cfg.initializer_std
-        )
-        self.router_bias = nnx.Param(jnp.zeros((cfg.num_experts,), dtype=jnp.float32))
+        self.layer_index = int(layer_index)
+        self.router = _init_weight(rng, (cfg.hidden_dim, cfg.num_experts),
+                                   dtype, cfg.initializer_std)
+        self.router_bias = nnx.Param(
+            jnp.zeros((cfg.num_experts, ), dtype=jnp.float32))
         self.w_gate_up = _init_weight(
             rng,
             (cfg.num_experts, cfg.hidden_dim, 2 * cfg.intermediate_dim),
@@ -570,18 +660,59 @@ class GrugMoeMLP(JaxModule):
         )
 
     def route(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
-        router_logits = jnp.einsum(
-            "td,de->te", x.astype(jnp.float32), self.router.value.astype(jnp.float32)
-        )
+        router_logits = jnp.einsum("td,de->te", x.astype(jnp.float32),
+                                   self.router.value.astype(jnp.float32))
         biased_logits = router_logits + jax.lax.stop_gradient(
-            self.router_bias.value.astype(jnp.float32)
-        )
-        _, selected = jax.lax.top_k(
-            biased_logits, self.cfg.num_experts_per_token + 1
-        )
-        selected = selected[:, : self.cfg.num_experts_per_token]
+            self.router_bias.value.astype(jnp.float32))
+        topk_with_boundary_logits, selected_with_boundary = jax.lax.top_k(
+            biased_logits, self.cfg.num_experts_per_token + 1)
+        selected = selected_with_boundary[:, :self.cfg.num_experts_per_token]
         unbiased_topk = jnp.take_along_axis(router_logits, selected, axis=-1)
         combine_weights = jax.nn.sigmoid(unbiased_topk).astype(x.dtype)
+        if _env_flag(_ROUTING_DEBUG_ENV) and self.layer_index == _env_int(
+                _ROUTING_DEBUG_LAYER_ENV, 0):
+            token_position = _env_int(_ROUTING_DEBUG_TOKEN_POSITION_ENV, 0)
+            vector_limit = max(0, _env_int(_ROUTING_DEBUG_VECTOR_LIMIT_ENV,
+                                           16))
+            if 0 <= token_position < int(x.shape[0]):
+
+                def _callback(
+                    router_input_hidden_state,
+                    token_router_logits,
+                    router_bias,
+                    token_biased_router_logits,
+                    token_topk_with_boundary_logits,
+                    token_topk_with_boundary_expert_ids,
+                    token_topk_expert_ids,
+                    token_combine_weights,
+                ) -> None:
+                    _print_routing_debug_record(
+                        layer_index=self.layer_index,
+                        token_position=token_position,
+                        vector_limit=vector_limit,
+                        router_input_hidden_state=router_input_hidden_state,
+                        router_logits=token_router_logits,
+                        router_bias=router_bias,
+                        biased_router_logits=token_biased_router_logits,
+                        topk_with_boundary_logits=
+                        token_topk_with_boundary_logits,
+                        topk_with_boundary_expert_ids=
+                        token_topk_with_boundary_expert_ids,
+                        topk_expert_ids=token_topk_expert_ids,
+                        combine_weights=token_combine_weights,
+                    )
+
+                jax.debug.callback(
+                    _callback,
+                    x[token_position],
+                    router_logits[token_position],
+                    self.router_bias.value,
+                    biased_logits[token_position],
+                    topk_with_boundary_logits[token_position],
+                    selected_with_boundary[token_position],
+                    selected[token_position],
+                    combine_weights[token_position],
+                )
         return selected.astype(jnp.int32), combine_weights
 
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -590,31 +721,32 @@ class GrugMoeMLP(JaxModule):
         w13_out = jnp.einsum("td,tkdf->tkf", x, expert_w13)
         gate, up = jnp.split(w13_out, [self.cfg.intermediate_dim], axis=-1)
         expert_w2 = self.w_down.value[selected]
-        expert_out = jnp.einsum("tki,tkid->tkd", jax.nn.silu(gate) * up, expert_w2)
+        expert_out = jnp.einsum("tki,tkid->tkd",
+                                jax.nn.silu(gate) * up, expert_w2)
         out = jnp.sum(expert_out * combine_weights[..., None], axis=1)
         return out.astype(x.dtype), selected
 
 
 class GrugMoeAttention(JaxModule):
 
-    def __init__(self, cfg: GrugMoeConfig, dtype: jnp.dtype, rng: nnx.Rngs) -> None:
+    def __init__(self, cfg: GrugMoeConfig, dtype: jnp.dtype,
+                 rng: nnx.Rngs) -> None:
         self.cfg = cfg
         head_dim = cfg.inferred_head_dim
-        self.w_q = _init_weight(
-            rng, (cfg.hidden_dim, cfg.num_heads * head_dim), dtype, cfg.initializer_std
-        )
-        self.w_k = _init_weight(
-            rng, (cfg.hidden_dim, cfg.num_kv_heads * head_dim), dtype, cfg.initializer_std
-        )
-        self.w_v = _init_weight(
-            rng, (cfg.hidden_dim, cfg.num_kv_heads * head_dim), dtype, cfg.initializer_std
-        )
-        self.w_o = _init_weight(
-            rng, (cfg.num_heads * head_dim, cfg.hidden_dim), dtype, cfg.initializer_std
-        )
+        self.w_q = _init_weight(rng,
+                                (cfg.hidden_dim, cfg.num_heads * head_dim),
+                                dtype, cfg.initializer_std)
+        self.w_k = _init_weight(rng,
+                                (cfg.hidden_dim, cfg.num_kv_heads * head_dim),
+                                dtype, cfg.initializer_std)
+        self.w_v = _init_weight(rng,
+                                (cfg.hidden_dim, cfg.num_kv_heads * head_dim),
+                                dtype, cfg.initializer_std)
+        self.w_o = _init_weight(rng,
+                                (cfg.num_heads * head_dim, cfg.hidden_dim),
+                                dtype, cfg.initializer_std)
         self.attn_gate = nnx.Param(
-            jnp.zeros((cfg.hidden_dim, cfg.num_heads), dtype=jnp.float32)
-        )
+            jnp.zeros((cfg.hidden_dim, cfg.num_heads), dtype=jnp.float32))
 
     def __call__(
         self,
@@ -623,21 +755,23 @@ class GrugMoeAttention(JaxModule):
         sliding_window: int,
     ) -> jax.Array:
         head_dim = self.cfg.inferred_head_dim
-        q = jnp.einsum("td,dh->th", x, self.w_q.value).reshape(
-            x.shape[0], self.cfg.num_heads, head_dim
-        )
-        k = jnp.einsum("td,dh->th", x, self.w_k.value).reshape(
-            x.shape[0], self.cfg.num_kv_heads, head_dim
-        )
-        v = jnp.einsum("td,dh->th", x, self.w_v.value).reshape(
-            x.shape[0], self.cfg.num_kv_heads, head_dim
-        )
+        q = jnp.einsum("td,dh->th", x,
+                       self.w_q.value).reshape(x.shape[0], self.cfg.num_heads,
+                                               head_dim)
+        k = jnp.einsum("td,dh->th", x,
+                       self.w_k.value).reshape(x.shape[0],
+                                               self.cfg.num_kv_heads, head_dim)
+        v = jnp.einsum("td,dh->th", x,
+                       self.w_v.value).reshape(x.shape[0],
+                                               self.cfg.num_kv_heads, head_dim)
 
         q = _rms_norm(q)
         k = _rms_norm(k)
-        q, k = _apply_rotary(
-            q, k, positions, head_dim=head_dim, theta=self.cfg.rope_theta
-        )
+        q, k = _apply_rotary(q,
+                             k,
+                             positions,
+                             head_dim=head_dim,
+                             theta=self.cfg.rope_theta)
         q = q * self.cfg.qk_mult
         k = _align_kv_heads(k, self.cfg.num_heads)
         v = _align_kv_heads(v, self.cfg.num_heads)
@@ -649,18 +783,18 @@ class GrugMoeAttention(JaxModule):
             k_pos <= q_pos,
             k_pos >= q_pos - (sliding_window - 1),
         )
-        scores = jnp.where(mask[None, :, :], scores, jnp.array(-1e9, dtype=scores.dtype))
-        weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(v.dtype)
+        scores = jnp.where(mask[None, :, :], scores,
+                           jnp.array(-1e9, dtype=scores.dtype))
+        weights = jax.nn.softmax(scores.astype(jnp.float32),
+                                 axis=-1).astype(v.dtype)
         attn_out = jnp.einsum("hqk,khd->qhd", weights, v)
 
         dot = jnp.sum(attn_out * v, axis=-1, keepdims=True)
         v_norm_sq = jnp.sum(v * v, axis=-1, keepdims=True)
         attn_out = attn_out - (dot / (v_norm_sq + 1e-6)) * v
         gate = 2 * jax.nn.sigmoid(
-            jnp.einsum(
-                "td,dn->tn", x.astype(jnp.float32), self.attn_gate.value.astype(jnp.float32)
-            )
-        )
+            jnp.einsum("td,dn->tn", x.astype(jnp.float32),
+                       self.attn_gate.value.astype(jnp.float32)))
         attn_out = gate[..., None].astype(attn_out.dtype) * attn_out
         attn_out = attn_out.reshape(x.shape[0], self.cfg.num_heads * head_dim)
         return jnp.einsum("th,hd->td", attn_out, self.w_o.value)
@@ -668,28 +802,32 @@ class GrugMoeAttention(JaxModule):
 
 class GrugMoeDecoderLayer(JaxModule):
 
-    def __init__(self, cfg: GrugMoeConfig, dtype: jnp.dtype, rng: nnx.Rngs) -> None:
-        self.rms_attn = GrugMoeRMSNorm(cfg.hidden_dim, cfg.layer_norm_eps, dtype)
-        self.attn_gated_norm = GrugMoeGatedNorm(
-            cfg.hidden_dim, cfg.initializer_std, dtype, rng
-        )
+    def __init__(
+        self,
+        cfg: GrugMoeConfig,
+        dtype: jnp.dtype,
+        rng: nnx.Rngs,
+        *,
+        layer_index: int = -1,
+    ) -> None:
+        self.rms_attn = GrugMoeRMSNorm(cfg.hidden_dim, cfg.layer_norm_eps,
+                                       dtype)
+        self.attn_gated_norm = GrugMoeGatedNorm(cfg.hidden_dim,
+                                                cfg.initializer_std, dtype,
+                                                rng)
         self.attn = GrugMoeAttention(cfg, dtype, rng)
-        self.rms_mlp = GrugMoeRMSNorm(cfg.hidden_dim, cfg.layer_norm_eps, dtype)
-        self.mlp_gated_norm = GrugMoeGatedNorm(
-            cfg.hidden_dim, cfg.initializer_std, dtype, rng
-        )
-        self.mlp = GrugMoeMLP(cfg, dtype, rng)
-        self.shared = (
-            GrugMoeDenseMLP(
-                cfg.hidden_dim,
-                cfg.shared_expert_intermediate_dim,
-                cfg.initializer_std,
-                dtype,
-                rng,
-            )
-            if cfg.shared_expert_intermediate_dim > 0
-            else None
-        )
+        self.rms_mlp = GrugMoeRMSNorm(cfg.hidden_dim, cfg.layer_norm_eps,
+                                      dtype)
+        self.mlp_gated_norm = GrugMoeGatedNorm(cfg.hidden_dim,
+                                               cfg.initializer_std, dtype, rng)
+        self.mlp = GrugMoeMLP(cfg, dtype, rng, layer_index=layer_index)
+        self.shared = (GrugMoeDenseMLP(
+            cfg.hidden_dim,
+            cfg.shared_expert_intermediate_dim,
+            cfg.initializer_std,
+            dtype,
+            rng,
+        ) if cfg.shared_expert_intermediate_dim > 0 else None)
 
     def __call__(
         self,
@@ -726,9 +864,8 @@ class GrugMoeModel(JaxModule):
         self.is_first_rank = get_pp_group().is_first_rank
         self.is_last_rank = get_pp_group().is_last_rank
 
-        if self.is_first_rank or (
-            getattr(hf_config, "tie_word_embeddings", False) and self.is_last_rank
-        ):
+        if self.is_first_rank or (getattr(hf_config, "tie_word_embeddings",
+                                          False) and self.is_last_rank):
             self.token_embed = _init_weight(
                 rng,
                 (self.config.vocab_size, self.config.hidden_dim),
@@ -738,37 +875,31 @@ class GrugMoeModel(JaxModule):
         else:
             self.token_embed = PPMissingLayer()
 
-        self.embed_norm = GrugMoeRMSNorm(
-            self.config.hidden_dim, self.config.layer_norm_eps, self.dtype
-        )
-        self.embed_gated_norm = GrugMoeGatedNorm(
-            self.config.hidden_dim, self.config.initializer_std, self.dtype, rng
-        )
+        self.embed_norm = GrugMoeRMSNorm(self.config.hidden_dim,
+                                         self.config.layer_norm_eps,
+                                         self.dtype)
+        self.embed_gated_norm = GrugMoeGatedNorm(self.config.hidden_dim,
+                                                 self.config.initializer_std,
+                                                 self.dtype, rng)
         self.start_layer, self.end_layer, self.layers = make_layers(
             self.config.num_layers,
-            lambda _layer_index: GrugMoeDecoderLayer(self.config, self.dtype, rng),
+            lambda _layer_index: GrugMoeDecoderLayer(
+                self.config, self.dtype, rng, layer_index=_layer_index),
         )
-        self.final_norm = (
-            GrugMoeRMSNorm(
-                self.config.hidden_dim, self.config.layer_norm_eps, self.dtype
-            )
-            if self.is_last_rank
-            else PPMissingLayer()
-        )
-        self.final_gated_norm = (
-            GrugMoeGatedNorm(
-                self.config.hidden_dim,
-                self.config.initializer_std,
-                self.dtype,
-                rng,
-            )
-            if self.is_last_rank
-            else PPMissingLayer()
-        )
+        self.final_norm = (GrugMoeRMSNorm(
+            self.config.hidden_dim, self.config.layer_norm_eps, self.dtype)
+                           if self.is_last_rank else PPMissingLayer())
+        self.final_gated_norm = (GrugMoeGatedNorm(
+            self.config.hidden_dim,
+            self.config.initializer_std,
+            self.dtype,
+            rng,
+        ) if self.is_last_rank else PPMissingLayer())
 
     def embed_input_ids(self, input_ids: jax.Array) -> jax.Array:
         if isinstance(self.token_embed, PPMissingLayer):
-            raise ValueError("token embeddings are not present on this pipeline rank")
+            raise ValueError(
+                "token embeddings are not present on this pipeline rank")
         return self.token_embed.value[input_ids]
 
     def __call__(
@@ -788,7 +919,7 @@ class GrugMoeModel(JaxModule):
         x = self.embed_gated_norm(self.embed_norm(x))
         positions = attention_metadata.input_positions
         if positions.ndim != 1:
-            positions = jnp.reshape(positions, (-1,))
+            positions = jnp.reshape(positions, (-1, ))
 
         short_window = self.config.sliding_window // 2
         new_kv_caches: list[Optional[jax.Array]] = []
@@ -799,20 +930,23 @@ class GrugMoeModel(JaxModule):
                 new_kv_caches.append(kv_cache)
                 continue
             layer_window = self.config.sliding_window if i % 4 == 3 else short_window
-            kv_cache, x, expert_ids = layer(kv_cache, x, positions, layer_window)
+            kv_cache, x, expert_ids = layer(kv_cache, x, positions,
+                                            layer_window)
             new_kv_caches.append(kv_cache)
             all_expert_ids.append(expert_ids)
 
         if self.is_last_rank:
             x = self.final_gated_norm(self.final_norm(x))
 
-        stacked_expert_ids = jnp.stack(all_expert_ids, axis=0) if all_expert_ids else None
+        stacked_expert_ids = jnp.stack(all_expert_ids,
+                                       axis=0) if all_expert_ids else None
         return new_kv_caches, x, stacked_expert_ids
 
 
 class GrugMoeForCausalLM(JaxModule):
 
-    def __init__(self, vllm_config: VllmConfig, rng_key: jax.Array, mesh: Mesh) -> None:
+    def __init__(self, vllm_config: VllmConfig, rng_key: jax.Array,
+                 mesh: Mesh) -> None:
         self.vllm_config = vllm_config
         rng = nnx.Rngs(rng_key)
         self.mesh = mesh
@@ -820,8 +954,7 @@ class GrugMoeForCausalLM(JaxModule):
 
         hf_config = vllm_config.model_config.hf_config
         self.tie_word_embeddings = bool(
-            getattr(hf_config, "tie_word_embeddings", False)
-        )
+            getattr(hf_config, "tie_word_embeddings", False))
         if not self.tie_word_embeddings:
             if self.model.is_last_rank:
                 self.lm_head = JaxEinsum(
@@ -852,22 +985,20 @@ class GrugMoeForCausalLM(JaxModule):
         is_last_rank: bool = True,
         *args,
     ) -> tuple[
-        list[Optional[jax.Array]],
-        jax.Array | JaxIntermediateTensors,
-        list[jax.Array],
-        Optional[jax.Array],
+            list[Optional[jax.Array]],
+            jax.Array | JaxIntermediateTensors,
+            list[jax.Array],
+            Optional[jax.Array],
     ]:
         del args
         if not is_first_rank:
             assert intermediate_tensors is not None
             inputs_embeds = intermediate_tensors["hidden_states"]
         kv_caches, hidden_states, expert_ids = self.model(
-            kv_caches, input_ids, attention_metadata, inputs_embeds
-        )
+            kv_caches, input_ids, attention_metadata, inputs_embeds)
         if not is_last_rank:
             hidden_states = JaxIntermediateTensors(
-                tensors={"hidden_states": hidden_states}
-            )
+                tensors={"hidden_states": hidden_states})
         return kv_caches, hidden_states, [], expert_ids
 
     def embed_input_ids(
@@ -880,11 +1011,14 @@ class GrugMoeForCausalLM(JaxModule):
         return self.model.embed_input_ids(input_ids)
 
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
-        if hasattr(self, "lm_head") and not isinstance(self.lm_head, PPMissingLayer):
+        if hasattr(self,
+                   "lm_head") and not isinstance(self.lm_head, PPMissingLayer):
             return self.lm_head(hidden_states)
         if isinstance(self.model.token_embed, PPMissingLayer):
-            raise ValueError("token embeddings are not present on this pipeline rank")
-        return jnp.einsum("td,vd->tv", hidden_states, self.model.token_embed.value)
+            raise ValueError(
+                "token embeddings are not present on this pipeline rank")
+        return jnp.einsum("td,vd->tv", hidden_states,
+                          self.model.token_embed.value)
 
     def _tensor(
         self,
@@ -906,8 +1040,7 @@ class GrugMoeForCausalLM(JaxModule):
         if value.shape != param.value.shape:
             raise ValueError(
                 f"Loaded shape for {tensor_name}: {value.shape} does not match "
-                f"model shape: {param.value.shape}"
-            )
+                f"model shape: {param.value.shape}")
         param.value = value
 
     def _assign_linear_param(
@@ -939,8 +1072,7 @@ class GrugMoeForCausalLM(JaxModule):
         if not (self.model.is_first_rank and self.model.is_last_rank):
             raise NotImplementedError(
                 "GrugMoE inference artifact loading currently supports a full "
-                "model on a single pipeline rank."
-            )
+                "model on a single pipeline rank.")
 
         artifact_path = Path(artifact_dir)
         artifact_config = _read_artifact_config(artifact_path)
@@ -961,8 +1093,7 @@ class GrugMoeForCausalLM(JaxModule):
         if missing or unexpected:
             raise ValueError(
                 "GrugMoE inference artifact tensor set mismatch: "
-                f"missing={sorted(missing)} unexpected={sorted(unexpected)}"
-            )
+                f"missing={sorted(missing)} unexpected={sorted(unexpected)}")
 
         consumed: set[str] = set()
         model = self.model
@@ -993,13 +1124,13 @@ class GrugMoeForCausalLM(JaxModule):
             if isinstance(layer, PPMissingLayer):
                 raise NotImplementedError(
                     "GrugMoE inference artifact loading currently supports a "
-                    "full model on a single pipeline rank."
-                )
+                    "full model on a single pipeline rank.")
 
             prefix = f"model.layers.{layer_index}"
             self._assign_param(
                 layer.rms_attn.weight,
-                self._tensor(tensors, consumed, f"{prefix}.input_layernorm.weight"),
+                self._tensor(tensors, consumed,
+                             f"{prefix}.input_layernorm.weight"),
                 tensor_name=f"{prefix}.input_layernorm.weight",
             )
             self._assign_linear_param(
@@ -1149,7 +1280,8 @@ class GrugMoeForCausalLM(JaxModule):
         )
         if not self.tie_word_embeddings:
             if isinstance(self.lm_head, PPMissingLayer):
-                raise ValueError("lm_head is not present on this pipeline rank")
+                raise ValueError(
+                    "lm_head is not present on this pipeline rank")
             self._assign_linear_param(
                 self.lm_head.weight,
                 tensors,
@@ -1161,8 +1293,7 @@ class GrugMoeForCausalLM(JaxModule):
         if unconsumed_expected:
             raise ValueError(
                 "GrugMoE inference artifact tensors were expected but not consumed: "
-                f"{sorted(unconsumed_expected)}"
-            )
+                f"{sorted(unconsumed_expected)}")
 
         return GrugMoeArtifactLoadReport(
             consumed=frozenset(consumed),
@@ -1172,7 +1303,8 @@ class GrugMoeForCausalLM(JaxModule):
 
     def load_weights(self, rng: jax.Array) -> GrugMoeArtifactLoadReport:
         del rng
-        return self.load_inference_artifact(self.vllm_config.model_config.model)
+        return self.load_inference_artifact(
+            self.vllm_config.model_config.model)
 
 
 __all__ = [
