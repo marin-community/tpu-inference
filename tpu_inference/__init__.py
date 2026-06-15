@@ -65,18 +65,3 @@ else:
         logger.error(
             f"Error occurred while logging TPU info: {e}. Are you running on CPU?"
         )
-
-
-def _register_vllm_layers_if_available() -> None:
-    try:
-        from tpu_inference.layers.vllm import register_layers
-    except ModuleNotFoundError as exc:
-        if exc.name == "vllm":
-            logger.debug("Skipping vLLM layer registration because vLLM is not installed.")
-            return
-        raise
-
-    register_layers()
-
-
-_register_vllm_layers_if_available()
