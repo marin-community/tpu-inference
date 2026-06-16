@@ -621,6 +621,7 @@ class GrugMoeAttention(JaxModule):
         x: jax.Array,
         positions: jax.Array,
         sliding_window: int,
+        query_start_loc: Optional[jax.Array] = None,
     ) -> jax.Array:
         head_dim = self.cfg.inferred_head_dim
         q = jnp.einsum("td,dh->th", x, self.w_q.value).reshape(
@@ -643,11 +644,10 @@ class GrugMoeAttention(JaxModule):
         v = _align_kv_heads(v, self.cfg.num_heads)
 
         scores = jnp.einsum("qhd,khd->hqk", q * (head_dim**-0.5), k)
-        q_pos = positions[:, None]
-        k_pos = positions[None, :]
-        mask = jnp.logical_and(
-            k_pos <= q_pos,
-            k_pos >= q_pos - (sliding_window - 1),
+        mask = _dense_attention_mask(
+            positions=positions,
+            sliding_window=sliding_window,
+            query_start_loc=query_start_loc,
         )
         scores = jnp.where(mask[None, :, :], scores, jnp.array(-1e9, dtype=scores.dtype))
         weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(v.dtype)
@@ -697,9 +697,10 @@ class GrugMoeDecoderLayer(JaxModule):
         x: jax.Array,
         positions: jax.Array,
         sliding_window: int,
+        query_start_loc: Optional[jax.Array] = None,
     ) -> tuple[Optional[jax.Array], jax.Array, jax.Array]:
         attn_in = self.attn_gated_norm(self.rms_attn(x))
-        x = x + self.attn(attn_in, positions, sliding_window)
+        x = x + self.attn(attn_in, positions, sliding_window, query_start_loc)
         mlp_in = self.mlp_gated_norm(self.rms_mlp(x))
         mlp_out, expert_ids = self.mlp(mlp_in)
         if self.shared is not None:
@@ -799,7 +800,9 @@ class GrugMoeModel(JaxModule):
                 new_kv_caches.append(kv_cache)
                 continue
             layer_window = self.config.sliding_window if i % 4 == 3 else short_window
-            kv_cache, x, expert_ids = layer(kv_cache, x, positions, layer_window)
+            kv_cache, x, expert_ids = layer(kv_cache, x, positions,
+                                            layer_window,
+                                            attention_metadata.query_start_loc)
             new_kv_caches.append(kv_cache)
             all_expert_ids.append(expert_ids)
 
