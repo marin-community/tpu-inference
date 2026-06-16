@@ -49,6 +49,10 @@ _ROUTING_DEBUG_ENV = "GRUGMOE_ROUTING_DEBUG"
 _ROUTING_DEBUG_LAYER_ENV = "GRUGMOE_ROUTING_DEBUG_LAYER"
 _ROUTING_DEBUG_TOKEN_POSITION_ENV = "GRUGMOE_ROUTING_DEBUG_TOKEN_POSITION"
 _ROUTING_DEBUG_VECTOR_LIMIT_ENV = "GRUGMOE_ROUTING_DEBUG_VECTOR_LIMIT"
+_FORWARD_DEBUG_ENV = "GRUGMOE_FORWARD_DEBUG"
+_FORWARD_DEBUG_LAYER_ENV = "GRUGMOE_FORWARD_DEBUG_LAYER"
+_FORWARD_DEBUG_TOKEN_POSITION_ENV = "GRUGMOE_FORWARD_DEBUG_TOKEN_POSITION"
+_FORWARD_DEBUG_VECTOR_LIMIT_ENV = "GRUGMOE_FORWARD_DEBUG_VECTOR_LIMIT"
 
 
 def _env_flag(name: str) -> bool:
@@ -143,6 +147,82 @@ def _print_routing_debug_record(
                                          topk_with_boundary_logits_np[top_k])
     print("tpu_grugmoe_routing_debug=" + json.dumps(payload, sort_keys=True),
           flush=True)
+
+
+def _print_forward_debug_record(
+    *,
+    stage: str,
+    layer_index: Optional[int],
+    token_position: int,
+    vector_limit: int,
+    values: Mapping[str, Any],
+) -> None:
+    payload: dict[str, Any] = {
+        "source": "tpu-inference GrugMoeModel.forward",
+        "stage": stage,
+        "layer": None if layer_index is None else int(layer_index),
+        "token_position": int(token_position),
+        "values": {
+            name: _array_debug_summary(value, vector_limit=vector_limit)
+            for name, value in values.items()
+        },
+    }
+    print("tpu_grugmoe_forward_debug=" + json.dumps(payload, sort_keys=True),
+          flush=True)
+
+
+def _emit_forward_token_debug(
+    *,
+    stage: str,
+    layer_index: Optional[int],
+    token_position: int,
+    vector_limit: int,
+    value: jax.Array,
+) -> None:
+    if not _env_flag(_FORWARD_DEBUG_ENV):
+        return
+    if token_position < 0 or token_position >= int(value.shape[0]):
+        return
+
+    def _callback(token_value) -> None:
+        _print_forward_debug_record(
+            stage=stage,
+            layer_index=layer_index,
+            token_position=token_position,
+            vector_limit=vector_limit,
+            values={"token": token_value},
+        )
+
+    jax.debug.callback(_callback, value[token_position])
+
+
+def _dense_attention_mask(
+    *,
+    positions: jax.Array,
+    sliding_window: int,
+    query_start_loc: Optional[jax.Array],
+) -> jax.Array:
+    q_pos = positions[:, None]
+    k_pos = positions[None, :]
+    position_mask = jnp.logical_and(
+        k_pos <= q_pos,
+        k_pos >= q_pos - (sliding_window - 1),
+    )
+    if query_start_loc is None:
+        return position_mask
+
+    token_idx = jnp.arange(positions.shape[0], dtype=query_start_loc.dtype)
+    req_starts = query_start_loc[:-1]
+    req_ends = query_start_loc[1:]
+    valid_req = req_ends > req_starts
+    token_in_req = jnp.logical_and(
+        token_idx[:, None] >= req_starts[None, :],
+        token_idx[:, None] < req_ends[None, :],
+    )
+    token_in_req = jnp.logical_and(token_in_req, valid_req[None, :])
+    same_req = jnp.any(token_in_req[:, None, :] & token_in_req[None, :, :],
+                       axis=-1)
+    return jnp.logical_and(position_mask, same_req)
 
 
 class GrugMoeHfConfig(PretrainedConfig):
@@ -810,6 +890,7 @@ class GrugMoeDecoderLayer(JaxModule):
         *,
         layer_index: int = -1,
     ) -> None:
+        self.layer_index = int(layer_index)
         self.rms_attn = GrugMoeRMSNorm(cfg.hidden_dim, cfg.layer_norm_eps,
                                        dtype)
         self.attn_gated_norm = GrugMoeGatedNorm(cfg.hidden_dim,
@@ -836,13 +917,61 @@ class GrugMoeDecoderLayer(JaxModule):
         positions: jax.Array,
         sliding_window: int,
     ) -> tuple[Optional[jax.Array], jax.Array, jax.Array]:
+        debug_token_position = _env_int(_FORWARD_DEBUG_TOKEN_POSITION_ENV, 0)
+        debug_vector_limit = max(
+            0, _env_int(_FORWARD_DEBUG_VECTOR_LIMIT_ENV, 16))
+        emit_layer_debug = (_env_flag(_FORWARD_DEBUG_ENV)
+                            and self.layer_index == _env_int(
+                                _FORWARD_DEBUG_LAYER_ENV, 0))
         attn_in = self.attn_gated_norm(self.rms_attn(x))
-        x = x + self.attn(attn_in, positions, sliding_window)
+        if emit_layer_debug:
+            _emit_forward_token_debug(
+                stage="layer_attn_input",
+                layer_index=self.layer_index,
+                token_position=debug_token_position,
+                vector_limit=debug_vector_limit,
+                value=attn_in,
+            )
+        attn_out = self.attn(attn_in, positions, sliding_window)
+        if emit_layer_debug:
+            _emit_forward_token_debug(
+                stage="layer_attn_output",
+                layer_index=self.layer_index,
+                token_position=debug_token_position,
+                vector_limit=debug_vector_limit,
+                value=attn_out,
+            )
+        x = x + attn_out
+        if emit_layer_debug:
+            _emit_forward_token_debug(
+                stage="layer_post_attn_residual",
+                layer_index=self.layer_index,
+                token_position=debug_token_position,
+                vector_limit=debug_vector_limit,
+                value=x,
+            )
         mlp_in = self.mlp_gated_norm(self.rms_mlp(x))
+        if emit_layer_debug:
+            _emit_forward_token_debug(
+                stage="layer_mlp_input",
+                layer_index=self.layer_index,
+                token_position=debug_token_position,
+                vector_limit=debug_vector_limit,
+                value=mlp_in,
+            )
         mlp_out, expert_ids = self.mlp(mlp_in)
         if self.shared is not None:
             mlp_out = mlp_out + self.shared(mlp_in)
-        return kv_cache, x + mlp_out, expert_ids
+        x = x + mlp_out
+        if emit_layer_debug:
+            _emit_forward_token_debug(
+                stage="layer_output",
+                layer_index=self.layer_index,
+                token_position=debug_token_position,
+                vector_limit=debug_vector_limit,
+                value=x,
+            )
+        return kv_cache, x, expert_ids
 
 
 class GrugMoeModel(JaxModule):
@@ -920,6 +1049,42 @@ class GrugMoeModel(JaxModule):
         positions = attention_metadata.input_positions
         if positions.ndim != 1:
             positions = jnp.reshape(positions, (-1, ))
+        if _env_flag(_FORWARD_DEBUG_ENV):
+            token_position = _env_int(_FORWARD_DEBUG_TOKEN_POSITION_ENV, 0)
+            vector_limit = max(0, _env_int(_FORWARD_DEBUG_VECTOR_LIMIT_ENV,
+                                           16))
+            if input_ids is not None:
+
+                def _input_callback(input_ids_value, positions_value,
+                                    query_start_loc_value,
+                                    seq_lens_value) -> None:
+                    _print_forward_debug_record(
+                        stage="model_inputs",
+                        layer_index=None,
+                        token_position=token_position,
+                        vector_limit=vector_limit,
+                        values={
+                            "input_ids": input_ids_value,
+                            "positions": positions_value,
+                            "query_start_loc": query_start_loc_value,
+                            "seq_lens": seq_lens_value,
+                        },
+                    )
+
+                jax.debug.callback(
+                    _input_callback,
+                    input_ids,
+                    positions,
+                    attention_metadata.query_start_loc,
+                    attention_metadata.seq_lens,
+                )
+            _emit_forward_token_debug(
+                stage="embedding_output",
+                layer_index=None,
+                token_position=token_position,
+                vector_limit=vector_limit,
+                value=x,
+            )
 
         short_window = self.config.sliding_window // 2
         new_kv_caches: list[Optional[jax.Array]] = []
@@ -937,6 +1102,16 @@ class GrugMoeModel(JaxModule):
 
         if self.is_last_rank:
             x = self.final_gated_norm(self.final_norm(x))
+            if _env_flag(_FORWARD_DEBUG_ENV):
+                _emit_forward_token_debug(
+                    stage="final_hidden",
+                    layer_index=None,
+                    token_position=_env_int(_FORWARD_DEBUG_TOKEN_POSITION_ENV,
+                                            0),
+                    vector_limit=max(
+                        0, _env_int(_FORWARD_DEBUG_VECTOR_LIMIT_ENV, 16)),
+                    value=x,
+                )
 
         stacked_expert_ids = jnp.stack(all_expert_ids,
                                        axis=0) if all_expert_ids else None
