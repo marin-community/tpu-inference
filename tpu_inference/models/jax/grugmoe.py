@@ -833,6 +833,7 @@ class GrugMoeAttention(JaxModule):
         x: jax.Array,
         positions: jax.Array,
         sliding_window: int,
+        query_start_loc: Optional[jax.Array] = None,
     ) -> jax.Array:
         head_dim = self.cfg.inferred_head_dim
         q = jnp.einsum("td,dh->th", x,
@@ -857,11 +858,10 @@ class GrugMoeAttention(JaxModule):
         v = _align_kv_heads(v, self.cfg.num_heads)
 
         scores = jnp.einsum("qhd,khd->hqk", q * (head_dim**-0.5), k)
-        q_pos = positions[:, None]
-        k_pos = positions[None, :]
-        mask = jnp.logical_and(
-            k_pos <= q_pos,
-            k_pos >= q_pos - (sliding_window - 1),
+        mask = _dense_attention_mask(
+            positions=positions,
+            sliding_window=sliding_window,
+            query_start_loc=query_start_loc,
         )
         scores = jnp.where(mask[None, :, :], scores,
                            jnp.array(-1e9, dtype=scores.dtype))
@@ -916,6 +916,7 @@ class GrugMoeDecoderLayer(JaxModule):
         x: jax.Array,
         positions: jax.Array,
         sliding_window: int,
+        query_start_loc: Optional[jax.Array] = None,
     ) -> tuple[Optional[jax.Array], jax.Array, jax.Array]:
         debug_token_position = _env_int(_FORWARD_DEBUG_TOKEN_POSITION_ENV, 0)
         debug_vector_limit = max(
@@ -932,7 +933,8 @@ class GrugMoeDecoderLayer(JaxModule):
                 vector_limit=debug_vector_limit,
                 value=attn_in,
             )
-        attn_out = self.attn(attn_in, positions, sliding_window)
+        attn_out = self.attn(attn_in, positions, sliding_window,
+                             query_start_loc)
         if emit_layer_debug:
             _emit_forward_token_debug(
                 stage="layer_attn_output",
@@ -1096,7 +1098,8 @@ class GrugMoeModel(JaxModule):
                 continue
             layer_window = self.config.sliding_window if i % 4 == 3 else short_window
             kv_cache, x, expert_ids = layer(kv_cache, x, positions,
-                                            layer_window)
+                                            layer_window,
+                                            attention_metadata.query_start_loc)
             new_kv_caches.append(kv_cache)
             all_expert_ids.append(expert_ids)
 
