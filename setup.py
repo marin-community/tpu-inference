@@ -66,7 +66,7 @@ def get_requirements() -> List[str]:
 
 
 def get_version():
-    return os.getenv("VLLM_VERSION_OVERRIDE", "0.0.0").strip()
+    return os.getenv("VLLM_VERSION_OVERRIDE", "0.22.1").strip()
 
 
 setup(
