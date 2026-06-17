@@ -23,5 +23,7 @@ runai-model-streamer[s3,gcs]==0.15.9
 gcsfs==2026.1.0
 hypothesis==6.151.9
 sortedcontainers==2.4.0
-# Upstream pins to 5.5.3 https://github.com/vllm-project/vllm/blob/de3fe8dc62f3d77eb8dab8125ca90436f606bccb/requirements/test/nightly-torch.txt#L32
-transformers>=5.8.0
+# Marin/Levanter currently stay on Transformers 4.x, while the selected vLLM
+# LKG only requires >=4.56. Keep source installs lockable with Marin without
+# forcing all training paths onto Transformers 5.x.
+transformers>=4.57.1,<5.0
