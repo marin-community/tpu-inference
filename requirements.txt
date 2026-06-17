@@ -15,7 +15,10 @@ fastapi[standard]<0.137.0
 flax==0.12.4
 torchax==0.0.11
 qwix==0.1.2
-torchvision==0.25.0
+# Marin's TPU-vLLM stack resolves torch==2.11.0 with torchvision==0.26.x.
+# Keep this line broad enough for that CPU wheel pair while staying on the
+# matching TorchVision minor.
+torchvision>=0.26.0,<0.27
 pathwaysutils
 parameterized
 numba==0.62.1
