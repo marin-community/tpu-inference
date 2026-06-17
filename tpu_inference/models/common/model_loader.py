@@ -71,8 +71,6 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     # would cause JAX init failure when using multi hosts with Ray.
 
     from tpu_inference.models.jax.deepseek_v3 import DeepseekV3ForCausalLM
-    from tpu_inference.models.jax.gemma4_mm import \
-        Gemma4ForConditionalGeneration
     from tpu_inference.models.jax.gpt_oss import GptOss
     from tpu_inference.models.jax.llama3 import LlamaForCausalLM
     from tpu_inference.models.jax.llama4 import Llama4ForCausalLM
@@ -83,6 +81,19 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
         Qwen2_5_VLForConditionalGeneration
     from tpu_inference.models.jax.qwen3 import Qwen3ForCausalLM
     from tpu_inference.models.jax.qwen3_moe import Qwen3MoeForCausalLM
+    # Gemma4 depends on transformers.models.gemma4, which is only available in
+    # Transformers 5. Marin currently resolves Transformers 4, so skip just this
+    # registration while preserving all other architecture imports.
+    try:
+        from tpu_inference.models.jax.gemma4_mm import \
+            Gemma4ForConditionalGeneration
+    except ModuleNotFoundError as exc:
+        if exc.name != "transformers.models.gemma4":
+            raise
+        logger.warning(
+            "Skipping Gemma4 registration because transformers.models.gemma4 "
+            "requires Transformers 5.")
+        Gemma4ForConditionalGeneration = None
     _MODEL_REGISTRY["Llama4ForCausalLM"] = Llama4ForCausalLM
     _MODEL_REGISTRY["DeepseekV3ForCausalLM"] = DeepseekV3ForCausalLM
     _MODEL_REGISTRY["LlamaForCausalLM"] = LlamaForCausalLM
@@ -94,8 +105,9 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     _MODEL_REGISTRY["Eagle3LlamaForCausalLM"] = EagleLlama3ForCausalLM
     _MODEL_REGISTRY["GptOssForCausalLM"] = GptOss
     _MODEL_REGISTRY["Qwen2ForCausalLM"] = Qwen2ForCausalLM
-    _MODEL_REGISTRY[
-        "Gemma4ForConditionalGeneration"] = Gemma4ForConditionalGeneration
+    if Gemma4ForConditionalGeneration is not None:
+        _MODEL_REGISTRY[
+            "Gemma4ForConditionalGeneration"] = Gemma4ForConditionalGeneration
 
     architectures = getattr(config, "architectures", [])
     for arch in architectures:
