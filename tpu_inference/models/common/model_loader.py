@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import importlib.util
 from typing import Any, Optional
 
 import jax
@@ -71,9 +72,6 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     # would cause JAX init failure when using multi hosts with Ray.
 
     from tpu_inference.models.jax.deepseek_v3 import DeepseekV3ForCausalLM
-    from tpu_inference.models.jax.gemma4_mm import \
-        Gemma4ForConditionalGeneration
-    from tpu_inference.models.jax.gemma4_mtp import Gemma4MTPForCausalLM
     from tpu_inference.models.jax.gpt_oss import GptOss
     from tpu_inference.models.jax.llama3 import LlamaForCausalLM
     from tpu_inference.models.jax.llama4 import Llama4ForCausalLM
@@ -84,6 +82,19 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
         Qwen2_5_VLForConditionalGeneration
     from tpu_inference.models.jax.qwen3 import Qwen3ForCausalLM
     from tpu_inference.models.jax.qwen3_moe import Qwen3MoeForCausalLM
+    # Gemma4 depends on transformers.models.gemma4, which is only available in
+    # Transformers 5. Marin currently resolves Transformers 4, so skip just
+    # these registrations while preserving all other architecture imports.
+    if importlib.util.find_spec("transformers.models.gemma4") is not None:
+        from tpu_inference.models.jax.gemma4_mm import \
+            Gemma4ForConditionalGeneration
+        from tpu_inference.models.jax.gemma4_mtp import Gemma4MTPForCausalLM
+    else:
+        logger.warning(
+            "Skipping Gemma4 registrations because transformers.models.gemma4 "
+            "requires Transformers 5.")
+        Gemma4ForConditionalGeneration = None
+        Gemma4MTPForCausalLM = None
     _MODEL_REGISTRY["Llama4ForCausalLM"] = Llama4ForCausalLM
     _MODEL_REGISTRY["DeepseekV3ForCausalLM"] = DeepseekV3ForCausalLM
     _MODEL_REGISTRY["LlamaForCausalLM"] = LlamaForCausalLM
@@ -95,9 +106,11 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     _MODEL_REGISTRY["Eagle3LlamaForCausalLM"] = EagleLlama3ForCausalLM
     _MODEL_REGISTRY["GptOssForCausalLM"] = GptOss
     _MODEL_REGISTRY["Qwen2ForCausalLM"] = Qwen2ForCausalLM
-    _MODEL_REGISTRY[
-        "Gemma4ForConditionalGeneration"] = Gemma4ForConditionalGeneration
-    _MODEL_REGISTRY["Gemma4MTPModel"] = Gemma4MTPForCausalLM
+    if Gemma4ForConditionalGeneration is not None:
+        _MODEL_REGISTRY[
+            "Gemma4ForConditionalGeneration"] = Gemma4ForConditionalGeneration
+    if Gemma4MTPForCausalLM is not None:
+        _MODEL_REGISTRY["Gemma4MTPModel"] = Gemma4MTPForCausalLM
 
     architectures = getattr(config, "architectures", [])
     for arch in architectures:
