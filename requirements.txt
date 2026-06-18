@@ -26,7 +26,7 @@ runai-model-streamer[s3,gcs]==0.15.9
 gcsfs==2026.1.0
 hypothesis==6.151.9
 sortedcontainers==2.4.0
-# Marin/Levanter currently stay on Transformers 4.x, while the selected vLLM
-# LKG only requires >=4.56. Keep source installs lockable with Marin without
-# forcing all training paths onto Transformers 5.x.
-transformers>=4.57.1,<5.0
+# Marin resolves this package with the TPU-vLLM stack under Transformers 5.
+# Keep the lower bound aligned with Marin/Levanter while allowing the selected
+# vLLM LKG's Transformers 5-compatible range.
+transformers>=4.57.1,<6.0
