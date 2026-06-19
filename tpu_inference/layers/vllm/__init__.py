@@ -40,6 +40,8 @@ def _register_grugmoe() -> None:
     from vllm.transformers_utils.config import _CONFIG_REGISTRY
 
     from tpu_inference.models.common.model_loader import register_model
+    # GrugMoE needs runner-owned JAX KV-cache and routed-expert plumbing, so
+    # the Marin fork carries it in-tree instead of loading it as a vLLM plugin.
     from tpu_inference.models.jax.grugmoe import (GrugMoeForCausalLM,
                                                   GrugMoeHfConfig)
 

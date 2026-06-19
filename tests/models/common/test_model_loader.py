@@ -258,7 +258,9 @@ def test_register_layers_registers_grugmoe_for_tpu(monkeypatch):
     from vllm.transformers_utils.config import _CONFIG_REGISTRY
 
     from tpu_inference.layers.vllm import register_layers
-    from tpu_inference.models.jax.grugmoe import GrugMoeHfConfig
+    from tpu_inference.models.jax.grugmoe import (GrugMoeAttentionMode,
+                                                  GrugMoeConfig,
+                                                  GrugMoeHfConfig)
 
     register_layers()
 
@@ -280,6 +282,7 @@ def test_register_layers_registers_grugmoe_for_tpu(monkeypatch):
                     "head_dim": 8,
                     "max_seq_len": 16,
                     "sliding_window": 16,
+                    "grugmoe_attention_mode": "dense",
                 },
                 f,
             )
@@ -304,6 +307,9 @@ def test_register_layers_registers_grugmoe_for_tpu(monkeypatch):
     assert hf_config.num_attention_heads == 1
     assert hf_config.num_key_value_heads == 1
     assert hf_config.num_hidden_layers == 1
+    assert hf_config.grugmoe_attention_mode == "dense"
+    assert GrugMoeConfig.from_hf_config(
+        hf_config).attention_mode == GrugMoeAttentionMode.DENSE
     assert _CONFIG_REGISTRY["grug_moe"] is GrugMoeHfConfig
     assert hidden_size == 8
 
@@ -316,6 +322,29 @@ def test_register_layers_registers_grugmoe_for_tpu(monkeypatch):
 
     assert arch == "GrugMoeForCausalLM"
     assert model_info.is_text_generation_model
+
+
+def test_grugmoe_attention_mode_rejects_unknown_values():
+    from tpu_inference.models.jax.grugmoe import GrugMoeConfig, GrugMoeHfConfig
+
+    hf_config = GrugMoeHfConfig(
+        vocab_size=16,
+        hidden_dim=8,
+        intermediate_dim=16,
+        shared_expert_intermediate_dim=16,
+        num_experts=2,
+        num_experts_per_token=1,
+        num_layers=1,
+        num_heads=1,
+        num_kv_heads=1,
+        head_dim=8,
+        max_seq_len=16,
+        sliding_window=16,
+        grugmoe_attention_mode="debug-env",
+    )
+
+    with pytest.raises(ValueError, match="grugmoe_attention_mode"):
+        GrugMoeConfig.from_hf_config(hf_config)
 
 
 @pytest.mark.parametrize("tie_word_embeddings", [True, False])
