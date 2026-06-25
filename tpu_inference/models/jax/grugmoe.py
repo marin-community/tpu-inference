@@ -132,8 +132,6 @@ class GrugMoeHfConfig(PretrainedConfig):
 @dataclass(frozen=True)
 class GrugMoeArtifactLoadReport:
     consumed: frozenset[str]
-    missing: frozenset[str]
-    unexpected: frozenset[str]
 
 
 def _config_attr(config: Any,
@@ -626,9 +624,8 @@ class GrugMoeMLP(JaxModule):
                                    self.router.value.astype(jnp.float32))
         biased_logits = router_logits + jax.lax.stop_gradient(
             self.router_bias.value.astype(jnp.float32))
-        _topk_with_boundary_logits, selected_with_boundary = jax.lax.top_k(
-            biased_logits, self.cfg.num_experts_per_token + 1)
-        selected = selected_with_boundary[:, :self.cfg.num_experts_per_token]
+        _, selected = jax.lax.top_k(biased_logits,
+                                    self.cfg.num_experts_per_token)
         unbiased_topk = jnp.take_along_axis(router_logits, selected, axis=-1)
         combine_weights = jax.nn.sigmoid(unbiased_topk).astype(x.dtype)
         return selected.astype(jnp.int32), combine_weights
@@ -975,21 +972,20 @@ class GrugMoeForCausalLM(JaxModule):
         hf_config = vllm_config.model_config.hf_config
         self.tie_word_embeddings = bool(
             getattr(hf_config, "tie_word_embeddings", False))
-        if not self.tie_word_embeddings:
-            if self.model.is_last_rank:
-                self.lm_head = JaxEinsum(
-                    einsum_str="TD,DV->TV",
-                    kernel_shape=(
-                        self.model.config.hidden_dim,
-                        self.model.config.vocab_size,
-                    ),
-                    dtype=vllm_config.model_config.dtype,
-                    param_dtype=vllm_config.model_config.dtype,
-                    rngs=rng,
-                    prefix="lm_head",
-                )
-            else:
-                self.lm_head = PPMissingLayer()
+        if self.tie_word_embeddings or not self.model.is_last_rank:
+            self.lm_head = PPMissingLayer()
+        else:
+            self.lm_head = JaxEinsum(
+                einsum_str="TD,DV->TV",
+                kernel_shape=(
+                    self.model.config.hidden_dim,
+                    self.model.config.vocab_size,
+                ),
+                dtype=vllm_config.model_config.dtype,
+                param_dtype=vllm_config.model_config.dtype,
+                rngs=rng,
+                prefix="lm_head",
+            )
 
     def __call__(
         self,
@@ -1031,8 +1027,7 @@ class GrugMoeForCausalLM(JaxModule):
         return self.model.embed_input_ids(input_ids)
 
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
-        if hasattr(self,
-                   "lm_head") and not isinstance(self.lm_head, PPMissingLayer):
+        if not isinstance(self.lm_head, PPMissingLayer):
             return self.lm_head(hidden_states)
         if isinstance(self.model.token_embed, PPMissingLayer):
             raise ValueError(
@@ -1309,17 +1304,7 @@ class GrugMoeForCausalLM(JaxModule):
                 "lm_head.weight",
             )
 
-        unconsumed_expected = expected - consumed
-        if unconsumed_expected:
-            raise ValueError(
-                "GrugMoE inference artifact tensors were expected but not consumed: "
-                f"{sorted(unconsumed_expected)}")
-
-        return GrugMoeArtifactLoadReport(
-            consumed=frozenset(consumed),
-            missing=frozenset(),
-            unexpected=frozenset(),
-        )
+        return GrugMoeArtifactLoadReport(consumed=frozenset(consumed))
 
     def load_weights(self, rng: jax.Array) -> GrugMoeArtifactLoadReport:
         del rng

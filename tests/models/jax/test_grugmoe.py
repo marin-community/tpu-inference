@@ -15,6 +15,7 @@
 import json
 from types import SimpleNamespace
 
+import jax
 import jax.numpy as jnp
 import pytest
 
@@ -79,6 +80,58 @@ def test_grugmoe_applies_embed_norm_on_first_pp_rank():
     assert jnp.array_equal(hidden_states, jnp.full_like(inputs_embeds, 11.0))
     assert model.embed_norm.calls == 1
     assert model.embed_gated_norm.calls == 1
+
+
+def test_grugmoe_route_selects_configured_top_k_experts():
+    mlp = object.__new__(grugmoe.GrugMoeMLP)
+    object.__setattr__(mlp, "cfg", SimpleNamespace(num_experts_per_token=2))
+    object.__setattr__(
+        mlp,
+        "router",
+        SimpleNamespace(
+            value=jnp.asarray(
+                [
+                    [1.0, 0.0, 2.0],
+                    [0.0, 1.0, -1.0],
+                ]
+            )
+        ),
+    )
+    object.__setattr__(
+        mlp,
+        "router_bias",
+        SimpleNamespace(value=jnp.asarray([0.0, 2.0, -10.0])),
+    )
+
+    selected, combine_weights = mlp.route(jnp.asarray([[1.0, 2.0]]))
+
+    expected_weights = jax.nn.sigmoid(jnp.asarray([[2.0, 1.0]]))
+    assert selected.tolist() == [[1, 0]]
+    assert jnp.allclose(combine_weights, expected_weights)
+
+
+def test_compute_logits_uses_tied_token_embeddings_when_lm_head_is_missing():
+    model = object.__new__(grugmoe.GrugMoeForCausalLM)
+    object.__setattr__(model, "lm_head", grugmoe.PPMissingLayer())
+    object.__setattr__(
+        model,
+        "model",
+        SimpleNamespace(
+            token_embed=SimpleNamespace(
+                value=jnp.asarray(
+                    [
+                        [1.0, 2.0],
+                        [3.0, 4.0],
+                        [5.0, 6.0],
+                    ]
+                )
+            )
+        ),
+    )
+
+    logits = model.compute_logits(jnp.asarray([[10.0, 100.0]]))
+
+    assert jnp.array_equal(logits, jnp.asarray([[210.0, 430.0, 650.0]]))
 
 
 def test_grugmoe_artifact_config_requires_schema_version(tmp_path):
