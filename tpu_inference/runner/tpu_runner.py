@@ -42,7 +42,8 @@ from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
                              DraftTokenIds, KVConnectorOutput, LogprobsLists,
-                             LogprobsTensors, ModelRunnerOutput)
+                             LogprobsTensors, ModelRunnerOutput,
+                             RoutedExpertsLists)
 from vllm.v1.request import Request
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.kv_connector_model_runner_mixin import \
@@ -118,6 +119,7 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
                  prompt_logprobs_async_data: Optional[
                      "PromptLogprobsAsyncData"] = None,
                  expert_indices: Optional[jax.Array] = None,
+                 routed_experts_slot_mapping: Optional[np.ndarray] = None,
                  total_num_scheduled_tokens: int = 0,
                  spec_decode_metadata: Optional[SpecDecodeMetadata] = None,
                  runner=None):
@@ -129,6 +131,7 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         self._logprobs_tensors = logprobs_tensors
         self._prompt_logprobs_async_data = prompt_logprobs_async_data
         self._expert_indices = expert_indices
+        self._routed_experts_slot_mapping = routed_experts_slot_mapping
         self._total_num_scheduled_tokens = total_num_scheduled_tokens
         self._spec_decode_metadata = spec_decode_metadata
         self._runner = runner
@@ -154,9 +157,10 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         if self._expert_indices is not None:
             expert_indices_cpu = np.asarray(
                 jax.device_get(self._expert_indices))
-            expert_indices_cpu = expert_indices_cpu[:, :self.
-                                                    _total_num_scheduled_tokens, :]
-            self._model_runner_output.expert_indices = expert_indices_cpu
+            expert_indices_cpu = expert_indices_cpu[
+                :, :self._total_num_scheduled_tokens, :]
+            self._model_runner_output.routed_experts = _make_routed_experts(
+                expert_indices_cpu, self._routed_experts_slot_mapping)
 
         return self._model_runner_output
 
@@ -177,6 +181,18 @@ class AsyncPreResults:
     spec_decode_num_rejected_tokens: Optional[
         jax.Array] = None  # [max_num_reqs]
     spec_decode_metadata: Optional[SpecDecodeMetadata] = None
+
+
+def _make_routed_experts(
+    expert_indices_cpu: np.ndarray,
+    slot_mapping: Optional[np.ndarray],
+) -> Optional[RoutedExpertsLists]:
+    if slot_mapping is None:
+        return None
+    return RoutedExpertsLists(
+        routing_data=np.transpose(expert_indices_cpu, (1, 0, 2)),
+        slot_mapping=slot_mapping,
+    )
 
 
 @dataclass
@@ -854,6 +870,42 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             kv_connector_output, logits_indices_selector, padded_num_reqs,
             expert_indices, full_hidden_states, full_logits, req_ids_dp)
 
+    def _routed_experts_slot_mapping(
+        self,
+        scheduler_output: "VllmSchedulerOutput",
+        req_ids: list[str],
+    ) -> Optional[np.ndarray]:
+        if not self.kv_cache_config.kv_cache_groups:
+            return None
+
+        block_table = self.input_batch.block_table[0].get_cpu_tensor()
+        total = scheduler_output.total_num_scheduled_tokens
+        slot_mapping = np.empty((total, ), dtype=np.int64)
+
+        offset = 0
+        for req_id in req_ids:
+            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            if num_tokens == 0:
+                continue
+
+            req_index = self.input_batch.req_id_to_index[req_id]
+            start = int(self.input_batch.num_computed_tokens_cpu[req_index])
+            positions = np.arange(start, start + num_tokens, dtype=np.int64)
+            block_numbers = positions // self.block_size
+            block_offsets = positions % self.block_size
+            block_ids = block_table[req_index,
+                                    block_numbers].astype(np.int64, copy=False)
+
+            slot_mapping[offset:offset + num_tokens] = (
+                block_ids * self.block_size + block_offsets)
+            offset += num_tokens
+
+        if offset != total:
+            raise ValueError(
+                "routed experts slot mapping length does not match scheduled tokens: "
+                f"{offset=} {total=}")
+        return slot_mapping
+
     def _modify_prev_results(self):
         # If copy to host has not been done, we just wait.
         # device_get should return immediately as we have scheduled it in previous function call.
@@ -1235,6 +1287,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             req_id is not None for req_id in
             self.input_batch.req_ids[:num_reqs]), "req_ids contains None"
         req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
+        routed_experts_slot_mapping = (
+            self._routed_experts_slot_mapping(scheduler_output, req_ids)
+            if expert_indices is not None else None)
 
         prompt_logprobs_dict = {}
         for req_id in self.input_batch.req_ids[:num_reqs]:
@@ -1321,6 +1376,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 logprobs_tensors=logprobs,
                 prompt_logprobs_async_data=prompt_logprobs_async,
                 expert_indices=expert_indices,
+                routed_experts_slot_mapping=routed_experts_slot_mapping,
                 total_num_scheduled_tokens=scheduler_output.
                 total_num_scheduled_tokens,
                 spec_decode_metadata=spec_decode_metadata,
@@ -1371,42 +1427,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         if expert_indices is not None:
             expert_indices_cpu = np.asarray(jax.device_get(expert_indices))
-
-            routed_experts_dict = {}
-            current_token_offset = 0
-            for req_id in self.input_batch.req_ids[:num_reqs]:
-                req_state = self.requests[req_id]
-                num_tokens_scheduled = scheduler_output.num_scheduled_tokens[
-                    req_id]
-                start_idx = current_token_offset
-                end_idx = start_idx + num_tokens_scheduled
-                current_token_offset = end_idx
-
-                # Shape: (num_tokens_scheduled, num_layers, top_k)
-                step_experts = expert_indices_cpu[:, start_idx:
-                                                  end_idx, :].transpose(
-                                                      1, 0, 2)
-
-                if not hasattr(req_state, "_routed_experts_buf"):
-                    _, layers, top_k = step_experts.shape
-                    req_state._routed_experts_buf = np.zeros(
-                        (self.max_model_len, layers, top_k),
-                        dtype=step_experts.dtype)
-                    req_state._routed_experts_len = 0
-
-                offset = req_state._routed_experts_len
-                allowed = min(num_tokens_scheduled,
-                              self.max_model_len - offset)
-                if allowed > 0:
-                    req_state._routed_experts_buf[offset:offset + allowed] = (
-                        step_experts[:allowed])
-                    req_state._routed_experts_len += allowed
-
-                routed_experts_dict[
-                    req_id] = req_state._routed_experts_buf[:req_state.
-                                                            _routed_experts_len]
-
-            model_runner_output.routed_experts_dict = routed_experts_dict
+            expert_indices_cpu = expert_indices_cpu[
+                :, :scheduler_output.total_num_scheduled_tokens, :]
+            model_runner_output.routed_experts = _make_routed_experts(
+                expert_indices_cpu, routed_experts_slot_mapping)
 
         return model_runner_output
 

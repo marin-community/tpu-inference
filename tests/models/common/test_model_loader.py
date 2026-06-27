@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import tempfile
 from unittest.mock import MagicMock, patch
@@ -248,6 +249,102 @@ def test_register_model_vllm_wrapper_methods():
 
     # `load_weights` should be a no-op that returns None.
     assert instance.load_weights() is None
+
+
+def test_register_layers_registers_grugmoe_for_tpu(monkeypatch):
+    monkeypatch.setenv("VLLM_TARGET_DEVICE", "tpu")
+
+    from transformers import AutoConfig
+    from vllm.transformers_utils.config import _CONFIG_REGISTRY
+
+    from tpu_inference.layers.vllm import register_layers
+    from tpu_inference.models.jax.grugmoe import (GrugMoeAttentionMode,
+                                                  GrugMoeConfig,
+                                                  GrugMoeHfConfig)
+
+    register_layers()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "config.json"), "w") as f:
+            json.dump(
+                {
+                    "model_type": "grug_moe",
+                    "architectures": ["GrugMoeForCausalLM"],
+                    "vocab_size": 16,
+                    "hidden_dim": 8,
+                    "intermediate_dim": 16,
+                    "shared_expert_intermediate_dim": 16,
+                    "num_experts": 2,
+                    "num_experts_per_token": 1,
+                    "num_layers": 1,
+                    "num_heads": 1,
+                    "num_kv_heads": 1,
+                    "head_dim": 8,
+                    "max_seq_len": 16,
+                    "sliding_window": 16,
+                    "grugmoe_attention_mode": "dense",
+                },
+                f,
+            )
+
+        hf_config = AutoConfig.from_pretrained(tmpdir)
+        real_model_config = ModelConfig(
+            model=tmpdir,
+            runner="generate",
+            tokenizer=tmpdir,
+            tokenizer_mode="auto",
+            trust_remote_code=False,
+            dtype="bfloat16",
+            seed=0,
+            skip_tokenizer_init=True,
+            max_model_len=16,
+        )
+        hidden_size = real_model_config.get_hidden_size()
+
+    assert isinstance(hf_config, GrugMoeHfConfig)
+    assert hf_config.architectures == ["GrugMoeForCausalLM"]
+    assert hf_config.hidden_size == 8
+    assert hf_config.num_attention_heads == 1
+    assert hf_config.num_key_value_heads == 1
+    assert hf_config.num_hidden_layers == 1
+    assert hf_config.grugmoe_attention_mode == "dense"
+    assert GrugMoeConfig.from_hf_config(
+        hf_config).attention_mode == GrugMoeAttentionMode.DENSE
+    assert _CONFIG_REGISTRY["grug_moe"] is GrugMoeHfConfig
+    assert hidden_size == 8
+
+    model_config = MagicMock()
+    model_config.model_impl = "auto"
+    model_config.convert_type = "none"
+    model_config.runner_type = None
+    model_info, arch = ModelRegistry.inspect_model_cls(["GrugMoeForCausalLM"],
+                                                       model_config)
+
+    assert arch == "GrugMoeForCausalLM"
+    assert model_info.is_text_generation_model
+
+
+def test_grugmoe_attention_mode_rejects_unknown_values():
+    from tpu_inference.models.jax.grugmoe import GrugMoeConfig, GrugMoeHfConfig
+
+    hf_config = GrugMoeHfConfig(
+        vocab_size=16,
+        hidden_dim=8,
+        intermediate_dim=16,
+        shared_expert_intermediate_dim=16,
+        num_experts=2,
+        num_experts_per_token=1,
+        num_layers=1,
+        num_heads=1,
+        num_kv_heads=1,
+        head_dim=8,
+        max_seq_len=16,
+        sliding_window=16,
+        grugmoe_attention_mode="debug-env",
+    )
+
+    with pytest.raises(ValueError, match="grugmoe_attention_mode"):
+        GrugMoeConfig.from_hf_config(hf_config)
 
 
 @pytest.mark.parametrize("tie_word_embeddings", [True, False])
