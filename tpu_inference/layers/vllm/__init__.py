@@ -11,10 +11,49 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import importlib.util
+import os
+
 from tpu_inference.layers.vllm import backends as backends
 from tpu_inference.layers.vllm import custom_ops as custom_ops
 from tpu_inference.layers.vllm import ops as ops
 from tpu_inference.layers.vllm import quantization as quantization
+
+
+def _is_tpu_stack_active() -> bool:
+    if os.getenv("VLLM_TARGET_DEVICE", "").lower() == "tpu":
+        return True
+
+    jax_platforms = {
+        platform.strip().lower()
+        for platform in os.getenv("JAX_PLATFORMS", "").split(",")
+    }
+    if jax_platforms & {"tpu", "proxy"}:
+        return True
+
+    return importlib.util.find_spec("libtpu") is not None
+
+
+def _register_grugmoe() -> None:
+    from transformers import AutoConfig
+    from vllm import ModelRegistry
+    from vllm.transformers_utils.config import _CONFIG_REGISTRY
+
+    from tpu_inference.models.common.model_loader import register_model
+    # GrugMoE needs runner-owned JAX KV-cache and routed-expert plumbing, so
+    # the Marin fork carries it in-tree instead of loading it as a vLLM plugin.
+    from tpu_inference.models.jax.grugmoe import (GrugMoeForCausalLM,
+                                                  GrugMoeHfConfig)
+
+    _CONFIG_REGISTRY[GrugMoeHfConfig.model_type] = GrugMoeHfConfig
+    AutoConfig.register(
+        GrugMoeHfConfig.model_type,
+        GrugMoeHfConfig,
+        exist_ok=True,
+    )
+
+    if "GrugMoeForCausalLM" not in ModelRegistry.get_supported_archs():
+        register_model("GrugMoeForCausalLM", GrugMoeForCausalLM)
 
 
 # NOTE: this function is the entry_points target for the vllm general plugin.
@@ -24,3 +63,6 @@ def register_layers():
     # that vLLM invokes at startup, before any model is loaded.
     from tpu_inference.models.vllm.experimental import register_models
     register_models()
+
+    if _is_tpu_stack_active():
+        _register_grugmoe()
