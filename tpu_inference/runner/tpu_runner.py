@@ -71,6 +71,7 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
 from tpu_inference.models.jax.utils.weight_utils import (
     shard_put, transfer_state_with_mappings)
+from tpu_inference.runner import token_decision
 from tpu_inference.runner import utils as runner_utils
 from tpu_inference.runner.compilation_manager import CompilationManager
 from tpu_inference.runner.decode_loop import TpuSamplingState, continue_decode
@@ -97,6 +98,12 @@ logger = init_logger(__name__)
 logging.getLogger("torchax.tensor").setLevel(logging.ERROR)
 
 INVALID_TOKEN_ID = -1
+
+# Joint-decode token-decision callback (Marin overlay). When a callback is
+# registered in tpu_inference.runner.token_decision, the runner passes each
+# step's per-request top-k logits to it and forces the returned tokens into
+# the sampler. No-op when unregistered.
+
 # Smallest output size
 MIN_NUM_SEQS = 8
 
@@ -1552,6 +1559,35 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         self._continue_decode_output = output
         return None
+    def _topk_by_request_id(
+        self,
+        req_ids: list[str],
+        logits: jax.Array,
+        logits_indices_selector: Optional[List[int]] = None,
+    ) -> dict[str, list[dict[str, float | int]]]:
+        top_k = token_decision.TOP_K
+        # Run top_k on the bucketed logits shape, then reorder rows on CPU.
+        top_logits, top_token_ids = jax.lax.top_k(logits, top_k)
+        top_logits_cpu = np.asarray(jax.device_get(top_logits))
+        top_token_ids_cpu = np.asarray(jax.device_get(top_token_ids))
+        if logits_indices_selector is not None:
+            top_logits_cpu = top_logits_cpu[logits_indices_selector]
+            top_token_ids_cpu = top_token_ids_cpu[logits_indices_selector]
+        top_logits_cpu = top_logits_cpu[:len(req_ids)]
+        top_token_ids_cpu = top_token_ids_cpu[:len(req_ids)]
+        return {
+            req_id: [
+                {
+                    "token_id": int(token_id),
+                    "logit": float(logit),
+                }
+                for token_id, logit in zip(
+                    top_token_ids_cpu[index],
+                    top_logits_cpu[index],
+                )
+            ]
+            for index, req_id in enumerate(req_ids)
+        }
 
     def _sample_from_logits(
         self,
@@ -1583,8 +1619,50 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             step_rng = self.rng_params_for_sampling
 
         processed_bonus_logits = None
+        token_decision_callback = token_decision.CALLBACK
+        if token_decision_callback is not None and spec_decode_metadata is not None:
+            raise NotImplementedError(
+                "Token decision callback is not supported with speculative "
+                "decoding")
+
         if spec_decode_metadata is None:
             logits = logits.astype(jnp.float32)
+            if token_decision_callback is not None:
+                num_reqs = self.input_batch.num_reqs
+                assert all(
+                    req_id is not None
+                    for req_id in self.input_batch.req_ids[:num_reqs]
+                ), "req_ids contains None"
+                req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
+                forced_token_map = token_decision_callback(
+                    req_ids,
+                    self._topk_by_request_id(req_ids, logits,
+                                             logits_indices_selector))
+
+                forced_token_ids = [INVALID_TOKEN_ID] * logits.shape[0]
+                for index, req_id in enumerate(req_ids):
+                    token_id = forced_token_map.get(req_id, INVALID_TOKEN_ID)
+                    slot = (int(logits_indices_selector[index])
+                            if logits_indices_selector is not None else index)
+                    forced_token_ids[slot] = token_id
+
+                active_forced_token_ids = [
+                    token_id for token_id in forced_token_ids
+                    if token_id != INVALID_TOKEN_ID
+                ]
+                if any(token_id < 0 or token_id >= logits.shape[-1]
+                       for token_id in active_forced_token_ids):
+                    raise ValueError(
+                        "Token decision callback returned a token id outside "
+                        f"the vocabulary range [0, {logits.shape[-1]})")
+
+                forced = jnp.asarray(forced_token_ids)
+                has_forced = forced != INVALID_TOKEN_ID
+                rows = jnp.arange(logits.shape[0])
+                safe_forced = jnp.where(has_forced, forced, 0)
+                forced_logits = jnp.full_like(logits, -jnp.inf)
+                forced_logits = forced_logits.at[rows, safe_forced].set(0.0)
+                logits = jnp.where(has_forced[:, None], forced_logits, logits)
             with self.maybe_forbid_compile:
                 next_tokens, processed_logits = sample(
                     step_rng,
