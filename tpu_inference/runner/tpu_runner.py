@@ -99,11 +99,6 @@ logging.getLogger("torchax.tensor").setLevel(logging.ERROR)
 
 INVALID_TOKEN_ID = -1
 
-# Joint-decode token-decision callback (Marin overlay). When a callback is
-# registered in tpu_inference.runner.token_decision, the runner passes each
-# step's per-request top-k logits to it and forces the returned tokens into
-# the sampler. No-op when unregistered.
-
 # Smallest output size
 MIN_NUM_SEQS = 8
 
