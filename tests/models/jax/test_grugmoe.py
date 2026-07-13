@@ -232,6 +232,56 @@ def test_grugmoe_attention_uses_full_context_and_no_rope_on_long_layers():
     assert long.qk_mult_scale == 1.25
 
 
+def test_grugmoe_production_attention_uses_fp32_rpa_accumulators(monkeypatch):
+    cfg = grugmoe.GrugMoeConfig(
+        vocab_size=32,
+        hidden_dim=8,
+        intermediate_dim=8,
+        shared_expert_intermediate_dim=0,
+        num_layers=1,
+        num_heads=1,
+        num_kv_heads=1,
+        head_dim=8,
+        max_seq_len=16,
+        sliding_window=8,
+    )
+    mesh = Mesh(np.asarray(jax.devices("cpu")[:1]), ("model", ))
+    attention = grugmoe.GrugMoeAttention(cfg,
+                                         jnp.bfloat16,
+                                         nnx.Rngs(0),
+                                         mesh,
+                                         is_long=False)
+    x = jnp.ones((2, cfg.hidden_dim), dtype=jnp.bfloat16)
+    kv_cache = jnp.zeros((1, 1, 1, 1, cfg.inferred_head_dim),
+                         dtype=jnp.bfloat16)
+    metadata = SimpleNamespace(
+        input_positions=jnp.arange(2),
+        block_tables=jnp.zeros((2, 1), dtype=jnp.int32),
+        seq_lens=jnp.ones((2, ), dtype=jnp.int32),
+        query_start_loc=jnp.arange(3, dtype=jnp.int32),
+        request_distribution=jnp.asarray([0, 2, 2], dtype=jnp.int32),
+    )
+    captured = {}
+
+    def fake_shared_attention(cache, q, k, v, _metadata, _mesh, _head_dim,
+                              **kwargs):
+        captured.update(kwargs)
+        return cache, jnp.ones_like(q, dtype=jnp.float32)
+
+    monkeypatch.setattr(grugmoe, "shared_attention", fake_shared_attention)
+    monkeypatch.setattr(
+        attention,
+        "_exclusive_self_attention_output",
+        lambda _x, attn_out, _v: attn_out,
+    )
+
+    _new_cache, output = attention._production_attention(
+        kv_cache, x, metadata.input_positions, metadata)
+
+    assert captured["out_dtype"] == jnp.float32
+    assert output.dtype == jnp.bfloat16
+
+
 def test_grugmoe_long_layer_schedule_includes_every_fourth_and_final_layer():
     assert grugmoe._is_long_layer(3, 6)
     assert grugmoe._is_long_layer(5, 6)

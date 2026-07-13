@@ -945,7 +945,12 @@ class GrugMoeAttention(JaxModule):
             self.mesh,
             self.cfg.inferred_head_dim,
             attention_chunk_size=self.sliding_window,
+            # RPA otherwise stores its online-softmax normalizer and output
+            # accumulator in BF16.  The Levanter reference keeps the softmax
+            # reduction in FP32 before rounding the attention result to BF16.
+            out_dtype=jnp.float32,
         )
+        attn_out = attn_out.astype(x.dtype)
         return new_kv_cache, self._exclusive_self_attention_output(
             x, attn_out, v)
 
