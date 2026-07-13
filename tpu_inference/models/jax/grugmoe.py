@@ -786,6 +786,8 @@ class GrugMoeMLP(JaxModule):
             router_logits=router_logits,
             expert_logits_correction_bias=self.router_bias.value,
             topk_weights_sum=_ROUTER_COMBINE_WEIGHT_SUM,
+            activation_input_dtype=x.dtype,
+            expert_reduction_dtype=jnp.float32,
         )
         _, selected = jax.lax.top_k(
             router_logits +
@@ -930,6 +932,10 @@ class GrugMoeAttention(JaxModule):
         attention_metadata: AttentionMetadata,
     ) -> tuple[jax.Array, jax.Array]:
         q, k, v = self._project_qkv(x, positions)
+        # Match Levanter's BF16 reference order: scale Q in the model dtype
+        # before QK, round QK logits to BF16 before the FP32 softmax, and round
+        # the softmax numerators before PV. RPA's online state stays in FP32.
+        q = (q * (self.cfg.inferred_head_dim**-0.5)).astype(x.dtype)
         kv_cache = _require_production_attention_metadata(
             kv_cache, attention_metadata)
         # Rotary math can promote K to fp32 while vLLM allocates bf16 KV cache;
@@ -945,10 +951,13 @@ class GrugMoeAttention(JaxModule):
             self.mesh,
             self.cfg.inferred_head_dim,
             attention_chunk_size=self.sliding_window,
+            sm_scale=1.0,
             # RPA otherwise stores its online-softmax normalizer and output
             # accumulator in BF16.  The Levanter reference keeps the softmax
             # reduction in FP32 before rounding the attention result to BF16.
             out_dtype=jnp.float32,
+            logits_dtype=x.dtype,
+            weights_dtype=x.dtype,
         )
         attn_out = attn_out.astype(x.dtype)
         return new_kv_cache, self._exclusive_self_attention_output(

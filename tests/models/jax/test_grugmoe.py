@@ -232,7 +232,8 @@ def test_grugmoe_attention_uses_full_context_and_no_rope_on_long_layers():
     assert long.qk_mult_scale == 1.25
 
 
-def test_grugmoe_production_attention_uses_fp32_rpa_accumulators(monkeypatch):
+def test_grugmoe_production_attention_matches_levanter_bf16_policy(
+        monkeypatch):
     cfg = grugmoe.GrugMoeConfig(
         vocab_size=32,
         hidden_dim=8,
@@ -266,6 +267,7 @@ def test_grugmoe_production_attention_uses_fp32_rpa_accumulators(monkeypatch):
     def fake_shared_attention(cache, q, k, v, _metadata, _mesh, _head_dim,
                               **kwargs):
         captured.update(kwargs)
+        captured["q"] = q
         return cache, jnp.ones_like(q, dtype=jnp.float32)
 
     monkeypatch.setattr(grugmoe, "shared_attention", fake_shared_attention)
@@ -275,10 +277,18 @@ def test_grugmoe_production_attention_uses_fp32_rpa_accumulators(monkeypatch):
         lambda _x, attn_out, _v: attn_out,
     )
 
+    unscaled_q, _k, _v = attention._project_qkv(x, metadata.input_positions)
     _new_cache, output = attention._production_attention(
         kv_cache, x, metadata.input_positions, metadata)
 
     assert captured["out_dtype"] == jnp.float32
+    assert captured["logits_dtype"] == jnp.bfloat16
+    assert captured["weights_dtype"] == jnp.bfloat16
+    assert captured["sm_scale"] == 1.0
+    assert jnp.array_equal(
+        captured["q"],
+        (unscaled_q * (cfg.inferred_head_dim**-0.5)).astype(jnp.bfloat16),
+    )
     assert output.dtype == jnp.bfloat16
 
 
@@ -309,10 +319,14 @@ def test_grugmoe_forwards_qb_bias_to_distributed_experts():
             router_logits,
             expert_logits_correction_bias,
             topk_weights_sum,
+            activation_input_dtype,
+            expert_reduction_dtype,
         ):
             self.router_logits = router_logits
             self.correction_bias = expert_logits_correction_bias
             self.topk_weights_sum = topk_weights_sum
+            self.activation_input_dtype = activation_input_dtype
+            self.expert_reduction_dtype = expert_reduction_dtype
             return x
 
     quant_method = _CapturingQuantMethod()
@@ -347,6 +361,8 @@ def test_grugmoe_forwards_qb_bias_to_distributed_experts():
                            jnp.asarray([[1.0, 2.0, 0.0]]))
     assert quant_method.correction_bias is correction_bias
     assert quant_method.topk_weights_sum == 2.5
+    assert quant_method.activation_input_dtype == x.dtype
+    assert quant_method.expert_reduction_dtype == jnp.float32
 
 
 def test_compute_logits_uses_tied_token_embeddings_when_lm_head_is_missing():

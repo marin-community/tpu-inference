@@ -90,9 +90,13 @@ def test_gmm_backend_forwards_logit_correction_bias(monkeypatch):
         {
             "expert_logits_correction_bias": correction_bias,
             "topk_weights_sum": 2.5,
+            "activation_input_dtype": jnp.bfloat16,
+            "expert_reduction_dtype": jnp.float32,
         },
     )
 
     assert output is hidden_states
     assert captured["expert_logits_correction_bias"] is correction_bias
     assert captured["topk_weights_sum"] == 2.5
+    assert captured["activation_input_dtype"] == jnp.bfloat16
+    assert captured["expert_reduction_dtype"] == jnp.float32

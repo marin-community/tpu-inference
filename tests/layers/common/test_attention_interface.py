@@ -313,6 +313,8 @@ def _run_sharded_rpa_capturing_kwargs(
     *,
     head_dim=128,
     out_dtype=None,
+    logits_dtype=None,
+    weights_dtype=None,
 ):
     """Helper: run `sharded_ragged_paged_attention` with a stubbed
     `ragged_paged_attention` (the module-level binding) and a passthrough
@@ -361,6 +363,8 @@ def _run_sharded_rpa_capturing_kwargs(
         attention_sink=None,
         sm_scale=1.0,
         out_dtype=out_dtype,
+        logits_dtype=logits_dtype,
+        weights_dtype=weights_dtype,
         update_kv_cache=update_kv_cache,
     )
     return captured
@@ -380,7 +384,23 @@ def test_sharded_rpa_forwards_update_kv_cache_when_not_hd64(
         f"non-hd64 path must forward update_kv_cache=False; got {captured!r}")
 
 
-def test_sharded_rpa_does_not_forward_out_dtype_to_hd64(monkeypatch, gqa_mesh):
+def test_sharded_rpa_forwards_precision_dtypes_when_not_hd64(
+        monkeypatch, gqa_mesh):
+    captured = _run_sharded_rpa_capturing_kwargs(
+        monkeypatch,
+        gqa_mesh,
+        out_dtype=jnp.float32,
+        logits_dtype=jnp.bfloat16,
+        weights_dtype=jnp.bfloat16,
+    )
+
+    assert captured["out_dtype"] == jnp.float32
+    assert captured["logits_dtype"] == jnp.bfloat16
+    assert captured["weights_dtype"] == jnp.bfloat16
+
+
+def test_sharded_rpa_does_not_forward_precision_dtypes_to_hd64(
+        monkeypatch, gqa_mesh):
     captured = _run_sharded_rpa_capturing_kwargs(
         monkeypatch,
         gqa_mesh,
@@ -388,16 +408,18 @@ def test_sharded_rpa_does_not_forward_out_dtype_to_hd64(monkeypatch, gqa_mesh):
     )
 
     assert "out_dtype" not in captured
+    assert "logits_dtype" not in captured
+    assert "weights_dtype" not in captured
 
 
-def test_sharded_rpa_rejects_custom_accumulator_dtype_on_hd64(
+def test_sharded_rpa_rejects_custom_precision_dtype_on_hd64(
         monkeypatch, gqa_mesh):
-    with pytest.raises(NotImplementedError, match="accumulator dtypes"):
+    with pytest.raises(NotImplementedError, match="precision dtypes"):
         _run_sharded_rpa_capturing_kwargs(
             monkeypatch,
             gqa_mesh,
             head_dim=64,
-            out_dtype=jnp.float32,
+            logits_dtype=jnp.bfloat16,
         )
 
 

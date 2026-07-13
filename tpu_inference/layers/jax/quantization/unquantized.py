@@ -277,13 +277,16 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
 
         return True
 
-    def apply_jax(self,
-                  layer: JaxMoE,
-                  x: jax.Array,
-                  *,
-                  router_logits: jax.Array,
-                  expert_logits_correction_bias: jax.Array | None = None,
-                  topk_weights_sum: float | None = None) -> jax.Array:
+    def apply_jax(
+            self,
+            layer: JaxMoE,
+            x: jax.Array,
+            *,
+            router_logits: jax.Array,
+            expert_logits_correction_bias: jax.Array | None = None,
+            topk_weights_sum: float | None = None,
+            activation_input_dtype: jnp.dtype | None = None,
+            expert_reduction_dtype: jnp.dtype | None = None) -> jax.Array:
         """Forward pass for MoE layer.
         Args:
             layer: The MoE layer to apply.
@@ -340,6 +343,10 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
                 "expert_logits_correction_bias"] = expert_logits_correction_bias
         if topk_weights_sum is not None:
             backend_kwargs["topk_weights_sum"] = topk_weights_sum
+        if activation_input_dtype is not None:
+            backend_kwargs["activation_input_dtype"] = activation_input_dtype
+        if expert_reduction_dtype is not None:
+            backend_kwargs["expert_reduction_dtype"] = expert_reduction_dtype
         return moe_apply(layer, x_TD, router_logits, weights,
                          layer.moe_backend, layer.mesh, backend_kwargs)
 

@@ -225,6 +225,7 @@ class GmmConfigs:
     acc_dtype: jnp.dtype
     zero_init: bool
     fuse_act: str | None
+    fuse_act_input_dtype: jnp.dtype | None
 
     @property
     def num_quant_blocks_per_tile_k(self) -> int:
@@ -530,6 +531,13 @@ def inner_kernel(
                 tiled_rhs_bias = tiled_rhs_ref.get_bias()
                 acc += tiled_rhs_bias.astype(acc.dtype)
 
+            if cfgs.fuse_act_input_dtype is not None:
+                # Match an unfused BF16 projection followed by the activation:
+                # round the projection at the materialization boundary, then
+                # perform the transcendental math in the accumulator dtype.
+                activation_compute_dtype = acc.dtype
+                acc = acc.astype(
+                    cfgs.fuse_act_input_dtype).astype(activation_compute_dtype)
             acc = apply_act_fn(acc, cfgs.fuse_act)
 
             gm_id = pl.program_id(1)
@@ -1092,6 +1100,7 @@ def get_scope_name(cfgs: GmmConfigs) -> str:
     tiles = cfgs.tiles
     return (
         f"gmm_v2-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}-act_{cfgs.fuse_act}"
+        f"-act_input_{cfgs.fuse_act_input_dtype}"
         f"-n_{dims.size_n}-tm_{tiles.tile_m}-tk_{tiles.tile_k}-tn_{tiles.tile_n}"
     )
 
@@ -1111,11 +1120,15 @@ def make_gmm_configs(
     maybe_quantize_lhs: bool,
     zero_initialize: bool,
     fuse_act: str | None = None,
+    fuse_act_input_dtype: jnp.dtype | None = None,
 ):
     """Fills the GMM config for the GMM kernel."""
 
     dims = validate_inputs(lhs, rhs, rhs_scale, rhs_bias, group_sizes,
                            group_offset, fuse_act)
+    if fuse_act_input_dtype is not None and fuse_act is None:
+        raise ValueError(
+            "fuse_act_input_dtype requires a fused activation function")
 
     if rhs_scale is not None:
         has_scale = True
@@ -1188,6 +1201,8 @@ def make_gmm_configs(
         acc_dtype=jnp.dtype(acc_dtype),
         zero_init=zero_initialize,
         fuse_act=fuse_act,
+        fuse_act_input_dtype=(None if fuse_act_input_dtype is None else
+                              jnp.dtype(fuse_act_input_dtype)),
     )
 
 
@@ -1211,6 +1226,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
     "maybe_quantize_lhs",
     "zero_initialize",
     "fuse_act",
+    "fuse_act_input_dtype",
 ])
 def gmm_v2(
     lhs: jax.Array,  # [size_m, size_k]
@@ -1229,6 +1245,7 @@ def gmm_v2(
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
     fuse_act: str | None = None,
+    fuse_act_input_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1251,6 +1268,8 @@ def gmm_v2(
         maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
         zero_initialize: Whether to initialize unvisited output elements to zero.
         fuse_act: Activation function to fuse with GMM, None if no fusion.
+        fuse_act_input_dtype: If set, round the matmul accumulators to this
+            dtype before applying the fused activation.
 
     Returns:
         Output of shape [size_m, size_n].
@@ -1281,6 +1300,7 @@ def gmm_v2(
         maybe_quantize_lhs=maybe_quantize_lhs,
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
+        fuse_act_input_dtype=fuse_act_input_dtype,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles

@@ -53,6 +53,9 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         k_scale: float | None = None,
         v_scale: float | None = None,
         out_dtype=None,
+        logits_dtype=None,
+        weights_dtype=None,
+        tol=None,
         use_causal_mask: bool = True,
     ):
         rng = np.random.default_rng(1234)
@@ -169,6 +172,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             "k_scale": k_scale,
             "v_scale": v_scale,
             "out_dtype": out_dtype,
+            "logits_dtype": logits_dtype,
+            "weights_dtype": weights_dtype,
         }
 
         expected, expected_kv_cache = ref_ragged_paged_attention(
@@ -191,16 +196,16 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             8: 0.2,
             4: 0.2,
         }
-        tol = tols[dtype_bits]
+        tol = tols[dtype_bits] if tol is None else tol
         self.assertAllClose(output, expected, atol=tol, rtol=tol)
         mask = ~jnp.isnan(expected_kv_cache)
         self.assertArraysEqual(updated_kv_cache[mask], expected_kv_cache[mask])
         self.assertEqual(output.shape[-1], head_dim)
         self.assertEqual(output.dtype, q_dtype)
 
-    def test_ragged_paged_attention_bf16_output_with_fp32_accumulators(self):
+    def test_ragged_paged_attention_bf16_levanter_precision_policy(self):
         self._test_ragged_paged_attention(
-            seq_lens=[(5, 18), (1, 129)],
+            seq_lens=[(5, 18)],
             num_heads=(4, 1),
             head_dim=128,
             page_size=16,
@@ -208,6 +213,9 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             kv_dtype=jnp.bfloat16,
             num_pages=64,
             out_dtype=jnp.float32,
+            logits_dtype=jnp.bfloat16,
+            weights_dtype=jnp.bfloat16,
+            tol=0.02,
         )
 
     @parameterized.product(

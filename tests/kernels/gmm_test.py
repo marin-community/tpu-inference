@@ -738,6 +738,27 @@ class GmmTest(jtu.JaxTestCase):
 
         self.assertArraysAllClose(actual, expected, atol=atol, rtol=rtol)
 
+    def test_gmm_fused_activation_can_round_projection_before_silu(self):
+        key = jax.random.key(0)
+        lhs = jax.random.uniform(key, (128, 512), jnp.bfloat16, -1, 1)
+        rhs = jax.random.uniform(key, (16, 512, 512), jnp.bfloat16, -1, 1)
+        group_sizes = get_group_sizes(128, 16)
+
+        projected = reference_gmm(lhs, rhs, group_sizes)
+        expected = apply_act_fn(projected.astype(jnp.float32),
+                                "silu").astype(jnp.bfloat16)
+        actual = gmm_v2(
+            lhs,
+            rhs,
+            group_sizes,
+            fuse_act="silu",
+            fuse_act_input_dtype=jnp.bfloat16,
+        )
+        baseline = gmm_v2(lhs, rhs, group_sizes, fuse_act="silu")
+
+        self.assertArraysAllClose(actual, expected, atol=5e-2, rtol=5e-2)
+        self.assertFalse(jnp.array_equal(actual, baseline))
+
 
 if __name__ == "__main__":
     absltest.main(testLoader=jtu.JaxTestLoader())

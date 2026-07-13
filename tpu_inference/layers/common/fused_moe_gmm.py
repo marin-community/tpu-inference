@@ -105,6 +105,7 @@ def gmm_wrapper(lhs,
                 group_sizes,
                 group_offset,
                 fuse_act=None,
+                fuse_act_input_dtype=None,
                 preferred_element_type=None):
     gmm_res = gmm_v2(
         lhs=lhs,
@@ -115,6 +116,7 @@ def gmm_wrapper(lhs,
         group_offset=group_offset[0],
         zero_initialize=False,
         fuse_act=fuse_act,
+        fuse_act_input_dtype=fuse_act_input_dtype,
         preferred_element_type=preferred_element_type,
     )
     return gmm_res
@@ -147,6 +149,8 @@ def moe_gmm_local(x: jax.Array,
                   topk_weights: jax.Array,
                   *,
                   activation: str,
+                  activation_input_dtype: jnp.dtype | None = None,
+                  expert_reduction_dtype: jnp.dtype | None = None,
                   topk: int,
                   parallelism: Literal["tp", "ep"],
                   enable_rs_kernel: bool = False,
@@ -158,7 +162,6 @@ def moe_gmm_local(x: jax.Array,
     """
 
     assert parallelism in ["tp", "ep"]
-
     # GMM1 computes x @ (W_up | W_gate) together and activation, output is [tokens,padded_intermediate_size]
     gmm1_res = gmm_wrapper(
         x,
@@ -168,6 +171,7 @@ def moe_gmm_local(x: jax.Array,
         group_sizes,
         group_offset,
         fuse_act=activation,
+        fuse_act_input_dtype=activation_input_dtype,
         preferred_element_type=x.dtype,
     )
 
@@ -180,6 +184,9 @@ def moe_gmm_local(x: jax.Array,
     gmm1_res = gmm1_res[:, :w2.shape[1]]  # trim to hidden size if padded
     gmm2_res = gmm_wrapper(gmm1_res, w2, w2_scale, w2_bias, group_sizes,
                            group_offset)
+    preserve_topk_slots = expert_reduction_dtype is not None
+    reduction_dtype = (gmm2_res.dtype if not preserve_topk_slots else
+                       jnp.dtype(expert_reduction_dtype))
 
     batch_size = gmm2_res.shape[0]
     local_group_size = w1.shape[0]
@@ -197,7 +204,17 @@ def moe_gmm_local(x: jax.Array,
     reduction_axis = (ShardingAxisName.MLP_TENSOR
                       if parallelism == "tp" else ShardingAxisName.EXPERT)
 
-    if local_group_size < group_sizes.size:
+    if preserve_topk_slots:
+        # Each top-k slot is owned by exactly one expert shard. Keep the slots
+        # separate through the collective, then combine them in fixed routing
+        # order below. This matches Sonic's FP32 gather-sum and avoids a
+        # device-dependent collective reduction tree over nonzero partial sums.
+        token_hidden_full = gmm2_res[topk_argsort_revert_indices]
+        cur_sorted = token_hidden_full.reshape(
+            (-1, topk, gmm2_res.shape[-1])).astype(reduction_dtype)
+        cur_topk_weights = topk_weights[..., None].astype(reduction_dtype)
+        out = jnp.where(mask, cur_sorted * cur_topk_weights, 0.0)
+    elif local_group_size < group_sizes.size:
         if batch_size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
             # for small batch size.
@@ -209,9 +226,11 @@ def moe_gmm_local(x: jax.Array,
                 num_tokens, topk)
             onehot = jax.nn.one_hot(revert_indices,
                                     batch_size,
-                                    dtype=gmm2_res.dtype)
-            combine = (onehot * topk_weights[..., None] * mask).sum(axis=1)
-            out = combine @ gmm2_res
+                                    dtype=reduction_dtype)
+            combine = (onehot *
+                       topk_weights[..., None].astype(reduction_dtype) *
+                       mask).sum(axis=1)
+            out = combine @ gmm2_res.astype(reduction_dtype)
         else:
             out = ragged_gather_reduce(gmm2_res, topk_argsort_revert_indices,
                                        topk_weights.reshape(-1),
@@ -219,13 +238,24 @@ def moe_gmm_local(x: jax.Array,
     else:
         token_hidden_full = gmm2_res[topk_argsort_revert_indices]
         cur_sorted = token_hidden_full.reshape((-1, topk, gmm2_res.shape[-1]))
-        cur_topk_weights = jnp.expand_dims(topk_weights, axis=-1)
-        cur_weighted = cur_sorted * cur_topk_weights
+        cur_topk_weights = jnp.expand_dims(topk_weights,
+                                           axis=-1).astype(reduction_dtype)
+        cur_weighted = cur_sorted.astype(reduction_dtype) * cur_topk_weights
         cur_masked = jnp.where(mask, cur_weighted, 0.0)
         out = cur_masked.sum(axis=-2)
 
-    # Then global reduction on all ranks for all tokens and all experts
-    if enable_rs_kernel:
+    # Then global reduction on all ranks for all tokens and all experts.
+    if preserve_topk_slots:
+        if enable_rs_kernel or scatter_results:
+            raise NotImplementedError(
+                "Ordered top-k expert reduction does not support reduce-scatter"
+            )
+        out = jax.lax.psum(out, axis_name=reduction_axis)
+        combined = out[:, 0]
+        for slot in range(1, topk):
+            combined = combined + out[:, slot]
+        out = combined.astype(x.dtype)
+    elif enable_rs_kernel:
         reduction_axes = reduction_axis if isinstance(
             reduction_axis, tuple) else (reduction_axis, )
         num_devices = 1
@@ -292,6 +322,8 @@ def tensor_parallel_gmm(
     topk_weights: jax.Array,
     *,
     activation: str,
+    activation_input_dtype: jnp.dtype | None = None,
+    expert_reduction_dtype: jnp.dtype | None = None,
     topk: int,
     mesh: Mesh,
     enable_rs_kernel: bool = False,
@@ -324,6 +356,8 @@ def tensor_parallel_gmm(
         functools.partial(
             moe_gmm_local,
             activation=activation,
+            activation_input_dtype=activation_input_dtype,
+            expert_reduction_dtype=expert_reduction_dtype,
             topk=topk,
             parallelism="tp",
             enable_rs_kernel=False,
@@ -374,6 +408,8 @@ def expert_parallel_gmm(
     topk_weights: jax.Array,
     *,
     activation: str,
+    activation_input_dtype: jnp.dtype | None = None,
+    expert_reduction_dtype: jnp.dtype | None = None,
     topk: int,
     mesh: Mesh,
     enable_rs_kernel: bool = False,
@@ -405,6 +441,8 @@ def expert_parallel_gmm(
         functools.partial(
             moe_gmm_local,
             activation=activation,
+            activation_input_dtype=activation_input_dtype,
+            expert_reduction_dtype=expert_reduction_dtype,
             topk=topk,
             parallelism="ep",
             onehot_moe_permute_threshold=onehot_moe_permute_threshold,
@@ -527,6 +565,8 @@ def _normalize_topk_weights(
     "onehot_moe_permute_threshold",
     "scatter_results",
     "topk_weights_sum",
+    "activation_input_dtype",
+    "expert_reduction_dtype",
 ))
 def fused_moe_func(
     hidden_states: jax.Array,
@@ -551,6 +591,8 @@ def fused_moe_func(
     expert_score_correction_bias: jax.Array | None = None,
     expert_logits_correction_bias: jax.Array | None = None,
     topk_weights_sum: float | None = None,
+    activation_input_dtype: jnp.dtype | None = None,
+    expert_reduction_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
     """Route tokens in hidden_states into each experts based on routing.
 
@@ -704,6 +746,8 @@ def fused_moe_func(
             topk_argsort_revert_indices,
             topk_weights,
             activation=activation,
+            activation_input_dtype=activation_input_dtype,
+            expert_reduction_dtype=expert_reduction_dtype,
             topk=topk,
             mesh=mesh,
             enable_rs_kernel=actual_enable_rs_kernel,
@@ -723,6 +767,8 @@ def fused_moe_func(
             topk_argsort_revert_indices,
             topk_weights,
             activation=activation,
+            activation_input_dtype=activation_input_dtype,
+            expert_reduction_dtype=expert_reduction_dtype,
             topk=topk,
             mesh=mesh,
             enable_rs_kernel=actual_enable_rs_kernel,

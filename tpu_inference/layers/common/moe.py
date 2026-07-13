@@ -165,6 +165,10 @@ def moe_apply(
                         "expert_logits_correction_bias", None),
                     topk_weights_sum=extra_backend_kwargs.get(
                         "topk_weights_sum", None),
+                    activation_input_dtype=extra_backend_kwargs.get(
+                        "activation_input_dtype", None),
+                    expert_reduction_dtype=extra_backend_kwargs.get(
+                        "expert_reduction_dtype", None),
                 )
             case MoEBackend.DENSE_MAT:
                 # NOTE: circular import avoidance

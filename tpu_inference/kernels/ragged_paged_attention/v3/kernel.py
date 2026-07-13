@@ -82,6 +82,8 @@ def ref_ragged_paged_attention(
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     out_dtype: Any = None,
+    logits_dtype: Any = None,
+    weights_dtype: Any = None,
     mask_value: float | None = None,
     q_scale: float | None = None,
     k_scale: float | None = None,
@@ -184,6 +186,8 @@ def ref_ragged_paged_attention(
             attn *= q_scale
         if soft_cap is not None:
             attn = soft_cap * jnp.tanh(attn / soft_cap)
+        if logits_dtype is not None:
+            attn = attn.astype(logits_dtype).astype(out_dtype)
 
         if use_causal_mask:
             q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(
@@ -193,7 +197,8 @@ def ref_ragged_paged_attention(
             if sliding_window is not None:
                 mask = jnp.logical_and(mask, q_span < kv_span + sliding_window)
             attn = jnp.where(mask, attn, mask_value)
-        attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
+        attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype if weights_dtype is
+                                                    None else weights_dtype)
 
         out = jnp.einsum("hqk,khd->qhd", attn, v).astype(out_dtype)
         if v_scale is not None:
@@ -322,6 +327,8 @@ def _ragged_paged_attention_kernel_loop(
     sm_scale: float,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
+    logits_dtype: Any = None,
+    weights_dtype: Any = None,
     mask_value: float | None = None,
     q_scale: float | None = None,
     k_scale: float | None = None,
@@ -465,6 +472,8 @@ def _ragged_paged_attention_kernel_loop(
 
         if soft_cap is not None:
             s = soft_cap * jnp.tanh(s / soft_cap)
+        if logits_dtype is not None:
+            s = s.astype(logits_dtype).astype(out_dtype)
 
         int_ty = jnp.int32
         max_kv_len = pages_per_seq * page_size
@@ -510,12 +519,22 @@ def _ragged_paged_attention_kernel_loop(
         l_prev = l_ref[...]
         l_ref[...] = exp_m_diff * l_prev + p_rowsum
 
-        return p, v, exp_m_diff
+        p_scale = None
+        if weights_dtype is not None:
+            # Normalize within this KV compute block before rounding, matching
+            # the dense attention order exactly when the sequence fits in one
+            # block. Reapply the normalizer after PV so online accumulation is
+            # mathematically unchanged before rounding.
+            safe_p_rowsum = jnp.where(p_rowsum == 0, 1, p_rowsum)
+            p = (p / safe_p_rowsum).astype(weights_dtype)
+            p_scale = p_rowsum
+        return p, v, exp_m_diff, p_scale
 
     def flash_attention_step2_pv(
             p,  # [actual_bq_csz * num_q_heads_per_kv_head, bkv_csz]
             v,  # [bkv_csz, head_dim]
             exp_m_diff,  # [actual_bq_csz * num_q_heads_per_kv_head, 128]
+            p_scale,  # [actual_bq_csz * num_q_heads_per_kv_head, 1] or None
             o_ref,  # [actual_bq_csz * num_q_heads_per_kv_head, head_dim]
     ):
         assert len(p.shape) == 2
@@ -529,6 +548,8 @@ def _ragged_paged_attention_kernel_loop(
                                head_dim)
         pv = jnp.matmul(p, v, preferred_element_type=jnp.float32)
 
+        if p_scale is not None:
+            pv *= p_scale
         if v_scale is not None:
             pv *= v_scale
         # if converting the type too early, there will be accuracy issue.
@@ -1013,6 +1034,7 @@ def _ragged_paged_attention_kernel_loop(
                     prev_p = None
                     prev_v = None
                     prev_exp_m_diff = None
+                    prev_p_scale = None
                     bkv_start = idx * bkv_csz
 
                     for bq_start in range(0, actual_bq_sz, actual_bq_csz):
@@ -1036,7 +1058,7 @@ def _ragged_paged_attention_kernel_loop(
                             # `step2_pv` for the previous KV head, which depends on the
                             # softmax output, is overlapped with `step1_qk_softmax` for the
                             # current KV head, reducing overall wait times.
-                            cur_p, cur_v, cur_exp_m_diff = flash_attention_step1_qk_softmax(
+                            cur_p, cur_v, cur_exp_m_diff, cur_p_scale = flash_attention_step1_qk_softmax(
                                 bq_c,
                                 bk_c,
                                 bv_c,
@@ -1051,12 +1073,14 @@ def _ragged_paged_attention_kernel_loop(
                                     prev_p,
                                     prev_v,
                                     prev_exp_m_diff,
+                                    prev_p_scale,
                                     acc_ref.at[*prev_lm_slice],
                                 )
                             prev_lm_slice = lm_slice
                             prev_p = cur_p
                             prev_v = cur_v
                             prev_exp_m_diff = cur_exp_m_diff
+                            prev_p_scale = cur_p_scale
 
                     # Execute pv of last iteration.
                     assert prev_lm_slice is not None
@@ -1064,6 +1088,7 @@ def _ragged_paged_attention_kernel_loop(
                         prev_p,
                         prev_v,
                         prev_exp_m_diff,
+                        prev_p_scale,
                         acc_ref.at[*prev_lm_slice],
                     )
 
@@ -1242,6 +1267,8 @@ def dynamic_validate_inputs(
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     out_dtype: Any = None,
+    logits_dtype: Any = None,
+    weights_dtype: Any = None,
     mask_value: float | None = None,
     q_scale: float | None = None,
     k_scale: float | None = None,
@@ -1270,6 +1297,8 @@ def dynamic_validate_inputs(
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         out_dtype=out_dtype,
+        logits_dtype=logits_dtype,
+        weights_dtype=weights_dtype,
         mask_value=mask_value,
         q_scale=q_scale,
         k_scale=k_scale,
@@ -1337,6 +1366,8 @@ def static_validate_inputs(
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     out_dtype: Any = None,
+    logits_dtype: Any = None,
+    weights_dtype: Any = None,
     mask_value: float | None = None,
     q_scale: float | None = None,
     k_scale: float | None = None,
@@ -1488,6 +1519,8 @@ def static_validate_inputs(
     del sm_scale
     del mask_value
     del out_dtype
+    del logits_dtype
+    del weights_dtype
     del q_scale
     del k_scale
     del v_scale
@@ -1568,6 +1601,8 @@ def get_default_block_sizes(
         "sliding_window",
         "soft_cap",
         "out_dtype",
+        "logits_dtype",
+        "weights_dtype",
         "mask_value",
         "q_scale",
         "k_scale",
@@ -1603,6 +1638,8 @@ def ragged_paged_attention(
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     out_dtype: Any = None,
+    logits_dtype: Any = None,
+    weights_dtype: Any = None,
     mask_value: float | None = None,
     q_scale: float | None = None,
     k_scale: float | None = None,
@@ -1648,6 +1685,11 @@ def ragged_paged_attention(
       better performance or higher for better accuracy. The output remains in
       the query dtype because it aliases the query buffer. If None, it uses
       q.dtype.
+    logits_dtype: if set, round scaled QK logits to this dtype before the
+      softmax. The default keeps logits in the matmul output dtype.
+    weights_dtype: if set, normalize each KV compute block and round its
+      softmax weights to this dtype before the value matmul. The online
+      normalizer remains in ``out_dtype``.
     mask_value: mask value for causal mask.
     q_scale: the scale for the query.
     k_scale: the scale for the key.
@@ -1695,6 +1737,8 @@ def ragged_paged_attention(
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         out_dtype=out_dtype,
+        logits_dtype=logits_dtype,
+        weights_dtype=weights_dtype,
         mask_value=mask_value,
         q_scale=q_scale,
         k_scale=k_scale,
@@ -1818,6 +1862,8 @@ def ragged_paged_attention(
                 sm_scale=sm_scale,
                 sliding_window=sliding_window,
                 soft_cap=soft_cap,
+                logits_dtype=logits_dtype,
+                weights_dtype=weights_dtype,
                 mask_value=mask_value,
                 q_scale=q_scale,
                 k_scale=k_scale,

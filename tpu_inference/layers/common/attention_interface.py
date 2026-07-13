@@ -346,6 +346,8 @@ def sharded_ragged_paged_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     out_dtype: Any = None,
+    logits_dtype: Any = None,
+    weights_dtype: Any = None,
     update_kv_cache: bool = True,
 ):
     """Shards along KV heads."""
@@ -399,10 +401,16 @@ def sharded_ragged_paged_attention(
         raise NotImplementedError(
             "update_kv_cache=False (KV-share) is not supported on the "
             "head_dim==64 RPA kernel.")
-    if use_hd64 and out_dtype is not None:
+    if use_hd64 and any(value is not None
+                        for value in (out_dtype, logits_dtype, weights_dtype)):
         raise NotImplementedError(
-            "Custom RPA accumulator dtypes are not supported on the "
+            "Custom RPA precision dtypes are not supported on the "
             "head_dim==64 RPA kernel.")
+    if envs.USE_BATCHED_RPA_KERNEL and any(
+            value is not None for value in (logits_dtype, weights_dtype)):
+        raise NotImplementedError(
+            "Custom RPA logits and weights dtypes are not supported by the "
+            "experimental batched RPA kernel.")
 
     def _ragged_paged_attention(*args):
         kwargs = dict(
@@ -416,6 +424,10 @@ def sharded_ragged_paged_attention(
         # kernels, but not by the specialized hd64 signature.
         if not use_hd64:
             kwargs["out_dtype"] = out_dtype
+            if logits_dtype is not None:
+                kwargs["logits_dtype"] = logits_dtype
+            if weights_dtype is not None:
+                kwargs["weights_dtype"] = weights_dtype
             kwargs["update_kv_cache"] = update_kv_cache
         return func(*args, **kwargs)
 
@@ -442,6 +454,8 @@ def attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     out_dtype: Any = None,
+    logits_dtype: Any = None,
+    weights_dtype: Any = None,
     sinks: jax.Array | None = None,
     update_kv_cache: bool = True,
 ) -> Tuple[jax.Array, jax.Array]:
@@ -483,6 +497,8 @@ def attention(
         k_scale=k_scale,
         v_scale=v_scale,
         out_dtype=out_dtype,
+        logits_dtype=logits_dtype,
+        weights_dtype=weights_dtype,
         update_kv_cache=update_kv_cache,
     )
 
