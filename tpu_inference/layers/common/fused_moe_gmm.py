@@ -477,26 +477,22 @@ def _select_topk_weights_and_indices(
     topk_weights = apply_scoring_fn(scoring_fn, gating_output)
     if hash_based_topk_indices is not None:
         topk_indices = hash_based_topk_indices
-        topk_weights = jnp.take_along_axis(topk_weights,
-                                           topk_indices,
-                                           axis=-1)
+        topk_weights = jnp.take_along_axis(topk_weights, topk_indices, axis=-1)
     elif envs.MOE_APPROX_TOPK:
         topk_weights, topk_indices = jax.lax.approx_max_k(
             topk_weights,
             k=topk,
             recall_target=envs.MOE_APPROX_TOPK_RECALL_TARGET)
     elif expert_logits_correction_bias is not None:
-        _, topk_indices = jax.lax.top_k(
-            gating_output + expert_logits_correction_bias[None, :], k=topk)
-        topk_weights = jnp.take_along_axis(topk_weights,
-                                           topk_indices,
-                                           axis=-1)
+        _, topk_indices = jax.lax.top_k(gating_output +
+                                        expert_logits_correction_bias[None, :],
+                                        k=topk)
+        topk_weights = jnp.take_along_axis(topk_weights, topk_indices, axis=-1)
     elif expert_score_correction_bias is not None:
-        _, topk_indices = jax.lax.top_k(
-            topk_weights + expert_score_correction_bias[None, :], k=topk)
-        topk_weights = jnp.take_along_axis(topk_weights,
-                                           topk_indices,
-                                           axis=-1)
+        _, topk_indices = jax.lax.top_k(topk_weights +
+                                        expert_score_correction_bias[None, :],
+                                        k=topk)
+        topk_weights = jnp.take_along_axis(topk_weights, topk_indices, axis=-1)
     else:
         topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
     return topk_weights, topk_indices

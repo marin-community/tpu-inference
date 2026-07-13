@@ -18,8 +18,8 @@ import jax
 import jax.numpy as jnp
 
 from tpu_inference.layers.common import moe as common_moe
-from tpu_inference.layers.common.fused_moe_gmm import \
-    _normalize_topk_weights, _select_topk_weights_and_indices
+from tpu_inference.layers.common.fused_moe_gmm import (
+    _normalize_topk_weights, _select_topk_weights_and_indices)
 from tpu_inference.layers.common.moe import MoEBackend
 
 

@@ -277,15 +277,13 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
 
         return True
 
-    def apply_jax(
-            self,
-            layer: JaxMoE,
-            x: jax.Array,
-            *,
-            router_logits: jax.Array,
-            expert_logits_correction_bias: jax.Array | None = None,
-            topk_weights_sum: float | None = None
-    ) -> jax.Array:
+    def apply_jax(self,
+                  layer: JaxMoE,
+                  x: jax.Array,
+                  *,
+                  router_logits: jax.Array,
+                  expert_logits_correction_bias: jax.Array | None = None,
+                  topk_weights_sum: float | None = None) -> jax.Array:
         """Forward pass for MoE layer.
         Args:
             layer: The MoE layer to apply.
