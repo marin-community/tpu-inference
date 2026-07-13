@@ -306,13 +306,19 @@ def test_sharded_ragged_paged_attention_gqa_incompatible_raises_error(
         )
 
 
-def _run_sharded_rpa_capturing_kwargs(monkeypatch, gqa_mesh, update_kv_cache):
+def _run_sharded_rpa_capturing_kwargs(
+    monkeypatch,
+    gqa_mesh,
+    update_kv_cache=True,
+    *,
+    head_dim=128,
+    out_dtype=None,
+):
     """Helper: run `sharded_ragged_paged_attention` with a stubbed
     `ragged_paged_attention` (the module-level binding) and a passthrough
     `jax.shard_map`. Returns the kwargs forwarded by the closure to the
     underlying kernel.
     """
-    head_dim = 128  # non-hd64
     num_kv_heads = 4
     q = jnp.ones((TOTAL_TOKENS, NUM_HEADS, head_dim))
     k = jnp.ones((TOTAL_TOKENS, num_kv_heads, head_dim))
@@ -330,10 +336,11 @@ def _run_sharded_rpa_capturing_kwargs(monkeypatch, gqa_mesh, update_kv_cache):
         captured.update(kwargs)
         return jnp.ones_like(q), kv_cache
 
+    kernel_name = ("ragged_paged_attention_hd64"
+                   if head_dim == 64 else "ragged_paged_attention")
     monkeypatch.setattr(
-        "tpu_inference.layers.common.attention_interface.ragged_paged_attention",
-        fake_kernel,
-    )
+        f"tpu_inference.layers.common.attention_interface.{kernel_name}",
+        fake_kernel)
 
     # Passthrough shard_map so the closure actually executes.
     def passthrough_shard_map(inner_fn, **_):
@@ -353,6 +360,7 @@ def _run_sharded_rpa_capturing_kwargs(monkeypatch, gqa_mesh, update_kv_cache):
         distribution=distribution,
         attention_sink=None,
         sm_scale=1.0,
+        out_dtype=out_dtype,
         update_kv_cache=update_kv_cache,
     )
     return captured
@@ -370,6 +378,27 @@ def test_sharded_rpa_forwards_update_kv_cache_when_not_hd64(
 
     assert captured.get("update_kv_cache") is False, (
         f"non-hd64 path must forward update_kv_cache=False; got {captured!r}")
+
+
+def test_sharded_rpa_does_not_forward_out_dtype_to_hd64(monkeypatch, gqa_mesh):
+    captured = _run_sharded_rpa_capturing_kwargs(
+        monkeypatch,
+        gqa_mesh,
+        head_dim=64,
+    )
+
+    assert "out_dtype" not in captured
+
+
+def test_sharded_rpa_rejects_custom_accumulator_dtype_on_hd64(
+        monkeypatch, gqa_mesh):
+    with pytest.raises(NotImplementedError, match="accumulator dtypes"):
+        _run_sharded_rpa_capturing_kwargs(
+            monkeypatch,
+            gqa_mesh,
+            head_dim=64,
+            out_dtype=jnp.float32,
+        )
 
 
 def test_batched_rpa_wrapper_accepts_update_kv_cache():

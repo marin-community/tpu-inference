@@ -399,6 +399,10 @@ def sharded_ragged_paged_attention(
         raise NotImplementedError(
             "update_kv_cache=False (KV-share) is not supported on the "
             "head_dim==64 RPA kernel.")
+    if use_hd64 and out_dtype is not None:
+        raise NotImplementedError(
+            "Custom RPA accumulator dtypes are not supported on the "
+            "head_dim==64 RPA kernel.")
 
     def _ragged_paged_attention(*args):
         kwargs = dict(
@@ -407,12 +411,11 @@ def sharded_ragged_paged_attention(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
-            out_dtype=out_dtype,
         )
-        # update_kv_cache is supported by both the v3 default and batched
-        # RPA kernels; only the hd64 path doesn't accept it. Default True
-        # is a no-op so we don't forward it to the hd64 signature.
+        # These options are supported by the v3 default and batched RPA
+        # kernels, but not by the specialized hd64 signature.
         if not use_hd64:
+            kwargs["out_dtype"] = out_dtype
             kwargs["update_kv_cache"] = update_kv_cache
         return func(*args, **kwargs)
 
