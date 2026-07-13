@@ -52,6 +52,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         q_scale: float | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
+        out_dtype=None,
         use_causal_mask: bool = True,
     ):
         rng = np.random.default_rng(1234)
@@ -167,6 +168,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             "q_scale": q_scale,
             "k_scale": k_scale,
             "v_scale": v_scale,
+            "out_dtype": out_dtype,
         }
 
         expected, expected_kv_cache = ref_ragged_paged_attention(
@@ -194,6 +196,19 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         mask = ~jnp.isnan(expected_kv_cache)
         self.assertArraysEqual(updated_kv_cache[mask], expected_kv_cache[mask])
         self.assertEqual(output.shape[-1], head_dim)
+        self.assertEqual(output.dtype, q_dtype)
+
+    def test_ragged_paged_attention_bf16_output_with_fp32_accumulators(self):
+        self._test_ragged_paged_attention(
+            seq_lens=[(5, 18), (1, 129)],
+            num_heads=(4, 1),
+            head_dim=128,
+            page_size=16,
+            q_dtype=jnp.bfloat16,
+            kv_dtype=jnp.bfloat16,
+            num_pages=64,
+            out_dtype=jnp.float32,
+        )
 
     @parameterized.product(
         dtype=[jnp.float32, jnp.bfloat16],

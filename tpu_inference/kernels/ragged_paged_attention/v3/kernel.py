@@ -199,7 +199,7 @@ def ref_ragged_paged_attention(
         if v_scale is not None:
             out *= v_scale
 
-        outputs.append(out)
+        outputs.append(out.astype(queries.dtype))
 
     result = jnp.concatenate(outputs, axis=0)
     return result, kv_cache
@@ -1072,7 +1072,7 @@ def _ragged_paged_attention_kernel_loop(
             l = broadcast_minor(l_ref[...], acc.shape)  # noqa
             out = (acc * pl.reciprocal(l, approx=True) if
                    (l.dtype == jnp.float32 and out_dtype != jnp.float32) else
-                   lax.div(acc, l)).astype(out_dtype)
+                   lax.div(acc, l)).astype(q_dtype)
 
             # Wait for previous bo to be fully sent before storing new bo.
             bo_sem_idx = sem_ids_ref[2]
@@ -1644,9 +1644,10 @@ def ragged_paged_attention(
     sm_scale: the softmax scale which will be applied to the Q@K^T.
     sliding_window: the sliding window size for the attention.
     soft_cap: the logit soft cap for the attention.
-    out_dtype: the dtype of the output and the accumulator for matmul. Set
-      lower for better performance, set higher for better accuracy. If None, it
-      uses q.dtype.
+    out_dtype: the dtype of the softmax and matmul accumulators. Set lower for
+      better performance or higher for better accuracy. The output remains in
+      the query dtype because it aliases the query buffer. If None, it uses
+      q.dtype.
     mask_value: mask value for causal mask.
     q_scale: the scale for the query.
     k_scale: the scale for the key.
