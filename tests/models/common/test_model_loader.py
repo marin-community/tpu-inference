@@ -134,6 +134,14 @@ def test_get_model_architecture_unsupported():
         model_loader._get_model_architecture(config)
 
 
+def test_get_model_architecture_supports_grugmoe():
+    from tpu_inference.models.jax.grugmoe import GrugMoeForCausalLM
+
+    config = PretrainedConfig(architectures=["GrugMoeForCausalLM"])
+
+    assert model_loader._get_model_architecture(config) is GrugMoeForCausalLM
+
+
 @pytest.fixture(autouse=True)
 def clear_model_registry_after_test():
     """Clear the model registry after each test to prevent side effects."""

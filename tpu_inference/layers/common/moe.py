@@ -161,6 +161,10 @@ def moe_apply(
                         "hash_based_topk_indices", None),
                     expert_score_correction_bias=extra_backend_kwargs.get(
                         "e_score_correction_bias", None),
+                    expert_logits_correction_bias=extra_backend_kwargs.get(
+                        "expert_logits_correction_bias", None),
+                    topk_weights_sum=extra_backend_kwargs.get(
+                        "topk_weights_sum", None),
                 )
             case MoEBackend.DENSE_MAT:
                 # NOTE: circular import avoidance

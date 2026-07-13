@@ -16,6 +16,11 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import posixpath
+import shutil
+import tempfile
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, fields
 from enum import StrEnum
@@ -27,7 +32,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from fsspec.core import url_to_fs
 from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 from safetensors import safe_open
 from transformers import PretrainedConfig
 from vllm.config import VllmConfig
@@ -36,11 +43,17 @@ from tpu_inference.distributed.jax_parallel_state import get_pp_group
 from tpu_inference.layers.common.attention_interface import \
     attention as shared_attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.common.utils import cpu_mesh_context
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.linear import JaxEinsum
+from tpu_inference.layers.jax.moe.moe import JaxMoE
+from tpu_inference.layers.jax.moe.utils import (get_expert_parallelism,
+                                                select_moe_backend)
 from tpu_inference.layers.jax.pp_utils import PPMissingLayer, make_layers
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
+from tpu_inference.models.jax.utils.weight_utils import shard_put
 
 _GATED_NORM_RANK = 128
 _ARTIFACT_CONFIG_FILE = "config.json"
@@ -50,6 +63,10 @@ _ARTIFACT_MODEL_TYPE = "grug_moe"
 _ARTIFACT_SCHEMA_VERSION_CONFIG_KEY = "grugmoe_artifact_schema_version"
 _ARTIFACT_SCHEMA_VERSION = 1
 _ATTENTION_MODE_CONFIG_KEY = "grugmoe_attention_mode"
+_ARTIFACT_WEIGHTS_URI_CONFIG_KEY = "grugmoe_weights_uri"
+_ROUTER_COMBINE_WEIGHT_SUM = 2.5
+
+logger = logging.getLogger(__name__)
 
 
 class GrugMoeAttentionMode(StrEnum):
@@ -72,15 +89,17 @@ def _parse_attention_mode(value: Any) -> GrugMoeAttentionMode:
 def _dense_attention_mask(
     *,
     positions: jax.Array,
-    sliding_window: int,
+    sliding_window: int | None,
     query_start_loc: Optional[jax.Array],
 ) -> jax.Array:
     q_pos = positions[:, None]
     k_pos = positions[None, :]
-    position_mask = jnp.logical_and(
-        k_pos <= q_pos,
-        k_pos >= q_pos - (sliding_window - 1),
-    )
+    position_mask = k_pos <= q_pos
+    if sliding_window is not None:
+        position_mask = jnp.logical_and(
+            position_mask,
+            k_pos >= q_pos - (sliding_window - 1),
+        )
     if query_start_loc is None:
         return position_mask
 
@@ -96,6 +115,10 @@ def _dense_attention_mask(
     same_req = jnp.any(token_in_req[:, None, :] & token_in_req[None, :, :],
                        axis=-1)
     return jnp.logical_and(position_mask, same_req)
+
+
+def _is_long_layer(layer_index: int, num_layers: int) -> bool:
+    return layer_index % 4 == 3 or layer_index == num_layers - 1
 
 
 class GrugMoeHfConfig(PretrainedConfig):
@@ -176,6 +199,9 @@ class GrugMoeConfig:
     layer_norm_eps: float = 1e-5
     initializer_std: float = 0.02
     qk_mult: float = 1.0
+    qk_mult_long_scale: float = 1.0
+    disable_pko: bool = True
+    disable_long_rope: bool = True
     rope_theta: float = 10000.0
     attention_mode: GrugMoeAttentionMode = GrugMoeAttentionMode.PRODUCTION
 
@@ -229,6 +255,11 @@ class GrugMoeConfig:
                 _config_attr(config, ("initializer_std", "initializer_range"),
                              0.02)),
             qk_mult=float(_config_attr(config, ("qk_mult", ), 1.0)),
+            qk_mult_long_scale=float(
+                _config_attr(config, ("qk_mult_long_scale", ), 1.0)),
+            disable_pko=bool(_config_attr(config, ("disable_pko", ), True)),
+            disable_long_rope=bool(
+                _config_attr(config, ("disable_long_rope", ), True)),
             rope_theta=_rope_theta(config),
             attention_mode=_parse_attention_mode(
                 _config_attr(config, (_ATTENTION_MODE_CONFIG_KEY, ),
@@ -272,12 +303,17 @@ class GrugMoeConfig:
             raise ValueError("num_heads must be divisible by num_kv_heads")
         if self.inferred_head_dim <= 0:
             raise ValueError("head_dim must be positive")
-        if self.inferred_head_dim % 2 != 0:
-            raise ValueError("head_dim must be even for rotary embeddings")
+        if self.inferred_head_dim % 4 != 0:
+            raise ValueError(
+                "head_dim must be divisible by four for half-RoPE")
         if self.max_seq_len <= 0:
             raise ValueError("max_seq_len must be positive")
         if self.sliding_window <= 1:
             raise ValueError("sliding_window must be greater than 1")
+        if not self.disable_pko:
+            raise NotImplementedError(
+                "GrugMoE TPU inference does not support Partial Key Offset; "
+                "export a checkpoint with disable_pko=true")
         return self
 
 
@@ -308,6 +344,80 @@ class _SafetensorsArtifactTensors(Mapping[str, np.ndarray]):
         shard_path = self._artifact_dir / shard_name
         with safe_open(str(shard_path), framework="np") as f:
             return f.get_tensor(name)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._weight_map)
+
+    def __len__(self) -> int:
+        return len(self._weight_map)
+
+
+class _RemoteSafetensorsArtifactTensors(Mapping[str, np.ndarray]):
+    """Read one remote safetensors shard at a time into host memory."""
+
+    def __init__(self, weights_uri: str, weight_map: Mapping[str,
+                                                             str]) -> None:
+        self._fs, self._artifact_root = url_to_fs(weights_uri)
+        self._weight_map = dict(weight_map)
+        self._expected_names_by_shard: dict[str, set[str]] = {}
+        for name, shard_name in self._weight_map.items():
+            self._expected_names_by_shard.setdefault(shard_name,
+                                                     set()).add(name)
+        self._cached_shards: dict[str, dict[str, np.ndarray]] = {}
+
+    def _remote_shard_path(self, shard_name: str) -> str:
+        normalized = posixpath.normpath(shard_name)
+        if (normalized != shard_name or normalized.startswith("../")
+                or posixpath.isabs(normalized)):
+            raise ValueError(
+                f"Safetensors shard {shard_name!r} must stay within "
+                f"{self._artifact_root}")
+        return posixpath.join(self._artifact_root.rstrip("/"), normalized)
+
+    def _load_shard(self, shard_name: str) -> None:
+        remote_path = self._remote_shard_path(shard_name)
+        logger.info("Loading remote GrugMoE shard %s", remote_path)
+        fd, local_path = tempfile.mkstemp(
+            prefix="grugmoe-shard-",
+            suffix=".safetensors",
+            dir=os.environ.get("TMPDIR"),
+        )
+        os.close(fd)
+        try:
+            with self._fs.open(remote_path,
+                               "rb") as source, open(local_path,
+                                                     "wb") as destination:
+                shutil.copyfileobj(source, destination, length=8 * 1024 * 1024)
+            with safe_open(local_path, framework="np") as f:
+                actual_names = set(f.keys())
+                expected_names = self._expected_names_by_shard[shard_name]
+                missing = expected_names - actual_names
+                unexpected = actual_names - expected_names
+                if missing or unexpected:
+                    raise ValueError(
+                        "Safetensors shard does not match its index entry: "
+                        f"file={shard_name!r} missing={sorted(missing)} "
+                        f"unexpected={sorted(unexpected)}")
+                tensors = {name: f.get_tensor(name) for name in actual_names}
+        finally:
+            os.unlink(local_path)
+
+        self._cached_shards[shard_name] = tensors
+        logger.info(
+            "Loaded remote GrugMoE shard %s (%d tensors)",
+            remote_path,
+            len(tensors),
+        )
+
+    def __getitem__(self, name: str) -> np.ndarray:
+        shard_name = self._weight_map[name]
+        if shard_name not in self._cached_shards:
+            self._load_shard(shard_name)
+        shard = self._cached_shards[shard_name]
+        tensor = shard.pop(name)
+        if not shard:
+            del self._cached_shards[shard_name]
+        return tensor
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._weight_map)
@@ -371,12 +481,21 @@ def _validate_sharded_safetensors_index(
                 f"unexpected={sorted(unexpected)}")
 
 
-def _load_artifact_tensors(artifact_dir: Path) -> Mapping[str, np.ndarray]:
+def _load_artifact_tensors(
+    artifact_dir: Path,
+    *,
+    weights_uri: str | None = None,
+) -> Mapping[str, np.ndarray]:
     index_path = artifact_dir / _ARTIFACT_WEIGHTS_INDEX_FILE
     if index_path.exists():
         weight_map = _read_safetensors_weight_map(index_path)
+        if weights_uri is not None:
+            return _RemoteSafetensorsArtifactTensors(weights_uri, weight_map)
         _validate_sharded_safetensors_index(artifact_dir, weight_map)
         return _SafetensorsArtifactTensors(artifact_dir, weight_map)
+
+    if weights_uri is not None:
+        raise FileNotFoundError(f"Remote GrugMoE weights require {index_path}")
 
     weights_path = artifact_dir / _ARTIFACT_WEIGHTS_FILE
     if not weights_path.is_file():
@@ -508,7 +627,7 @@ def _align_kv_heads(x: jax.Array, num_q_heads: int) -> jax.Array:
     return expanded.reshape(x.shape[0], num_q_heads, x.shape[2])
 
 
-def _apply_rotary(
+def _apply_half_rotary(
     q: jax.Array,
     k: jax.Array,
     positions: jax.Array,
@@ -516,17 +635,21 @@ def _apply_rotary(
     head_dim: int,
     theta: float,
 ) -> tuple[jax.Array, jax.Array]:
-    half_dim = head_dim // 2
-    inv_freq = 1.0 / (theta**(jnp.arange(0, half_dim, dtype=jnp.float32) /
-                              half_dim))
+    rotary_dim = head_dim // 2
+    rotary_half_dim = rotary_dim // 2
+    inv_freq = 1.0 / (theta**(
+        jnp.arange(0, rotary_half_dim, dtype=jnp.float32) / rotary_half_dim))
     angles = positions.astype(jnp.float32)[:, None] * inv_freq[None, :]
     cos = jnp.cos(angles)[:, None, :]
     sin = jnp.sin(angles)[:, None, :]
 
     def apply(x: jax.Array) -> jax.Array:
-        x1, x2 = jnp.split(x, 2, axis=-1)
-        return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin],
-                               axis=-1)
+        dtype = x.dtype
+        rotary, unrotated = jnp.split(x, [rotary_dim], axis=-1)
+        x1, x2 = jnp.split(rotary, 2, axis=-1)
+        rotated = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin],
+                                  axis=-1)
+        return jnp.concatenate([rotated, unrotated], axis=-1).astype(dtype)
 
     return apply(q), apply(k)
 
@@ -556,12 +679,13 @@ class GrugMoeGatedNorm(JaxModule):
                                  initializer_std)
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        gate_hidden = jnp.einsum("...d,dr->...r", x.astype(jnp.float32),
-                                 self.w_down.value.astype(jnp.float32))
+        # Match the Levanter BF16 inference policy: the gated-norm projections
+        # compute in the model dtype. Promoting operands before the dot changes
+        # every residual stream enough to violate the cross-backend contract.
+        gate_hidden = jnp.einsum("...d,dr->...r", x, self.w_down.value)
         gate_hidden = jax.nn.silu(gate_hidden)
         gate = jax.nn.sigmoid(
-            jnp.einsum("...r,rd->...d", gate_hidden,
-                       self.w_up.value.astype(jnp.float32)))
+            jnp.einsum("...r,rd->...d", gate_hidden, self.w_up.value))
         return x * gate.astype(x.dtype)
 
 
@@ -597,8 +721,11 @@ class GrugMoeMLP(JaxModule):
         cfg: GrugMoeConfig,
         dtype: jnp.dtype,
         rng: nnx.Rngs,
+        mesh: Mesh,
+        quant_config: Any,
         *,
         layer_index: int = -1,
+        prefix: str = "",
     ) -> None:
         self.cfg = cfg
         self.layer_index = int(layer_index)
@@ -606,22 +733,40 @@ class GrugMoeMLP(JaxModule):
                                    dtype, cfg.initializer_std)
         self.router_bias = nnx.Param(
             jnp.zeros((cfg.num_experts, ), dtype=jnp.float32))
-        self.w_gate_up = _init_weight(
-            rng,
-            (cfg.num_experts, cfg.hidden_dim, 2 * cfg.intermediate_dim),
-            dtype,
-            cfg.initializer_std,
-        )
-        self.w_down = _init_weight(
-            rng,
-            (cfg.num_experts, cfg.intermediate_dim, cfg.hidden_dim),
-            dtype,
-            cfg.initializer_std,
+        expert_axis = ShardingAxisName.EXPERT
+        expert_parallelism = get_expert_parallelism(expert_axis, mesh)
+        if cfg.num_experts % expert_parallelism != 0:
+            raise ValueError(
+                f"num_experts={cfg.num_experts} must be divisible by "
+                f"expert_parallelism={expert_parallelism}")
+        self.experts = JaxMoE(
+            dtype=dtype,
+            num_local_experts=cfg.num_experts,
+            hidden_size=cfg.hidden_dim,
+            intermediate_size_moe=cfg.intermediate_dim,
+            hidden_act="silu",
+            rngs=rng,
+            router=SimpleNamespace(
+                num_experts_per_tok=cfg.num_experts_per_token),
+            mesh=mesh,
+            activation_ffw_td=P(ShardingAxisName.MLP_DATA, None),
+            activation_ffw_ted=P(ShardingAxisName.MLP_DATA, None, None),
+            edf_sharding=P(expert_axis, None, None),
+            efd_sharding=P(expert_axis, None, None),
+            apply_expert_weight_before_computation=False,
+            expert_axis_name=expert_axis,
+            num_expert_parallelism=expert_parallelism,
+            moe_backend=select_moe_backend(expert_parallelism > 1),
+            quant_config=quant_config,
+            scoring_func="sigmoid",
+            renormalize=False,
+            enable_return_routed_experts=True,
+            prefix=f"{prefix}.experts",
         )
 
     def route(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
-        router_logits = jnp.einsum("td,de->te", x.astype(jnp.float32),
-                                   self.router.value.astype(jnp.float32))
+        router_logits = jnp.einsum("td,de->te", x,
+                                   self.router.value).astype(jnp.float32)
         biased_logits = router_logits + jax.lax.stop_gradient(
             self.router_bias.value.astype(jnp.float32))
         _, selected = jax.lax.top_k(biased_logits,
@@ -631,15 +776,23 @@ class GrugMoeMLP(JaxModule):
         return selected.astype(jnp.int32), combine_weights
 
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
-        selected, combine_weights = self.route(x)
-        expert_w13 = self.w_gate_up.value[selected]
-        w13_out = jnp.einsum("td,tkdf->tkf", x, expert_w13)
-        gate, up = jnp.split(w13_out, [self.cfg.intermediate_dim], axis=-1)
-        expert_w2 = self.w_down.value[selected]
-        expert_out = jnp.einsum("tki,tkid->tkd",
-                                jax.nn.silu(gate) * up, expert_w2)
-        out = jnp.sum(expert_out * combine_weights[..., None], axis=1)
-        return out.astype(x.dtype), selected
+        router_logits = jnp.einsum("td,de->te", x,
+                                   self.router.value).astype(jnp.float32)
+        if self.experts.quant_method is None:
+            raise ValueError("Expected GrugMoE quant_method to be set")
+        out = self.experts.quant_method.apply_jax(
+            self.experts,
+            x,
+            router_logits=router_logits,
+            expert_logits_correction_bias=self.router_bias.value,
+            topk_weights_sum=_ROUTER_COMBINE_WEIGHT_SUM,
+        )
+        _, selected = jax.lax.top_k(
+            router_logits +
+            jax.lax.stop_gradient(self.router_bias.value.astype(jnp.float32)),
+            self.cfg.num_experts_per_token,
+        )
+        return out.astype(x.dtype), selected.astype(jnp.int32)
 
 
 def _require_production_attention_metadata(
@@ -669,10 +822,20 @@ def _require_production_attention_metadata(
 
 class GrugMoeAttention(JaxModule):
 
-    def __init__(self, cfg: GrugMoeConfig, dtype: jnp.dtype, rng: nnx.Rngs,
-                 mesh: Mesh) -> None:
+    def __init__(
+        self,
+        cfg: GrugMoeConfig,
+        dtype: jnp.dtype,
+        rng: nnx.Rngs,
+        mesh: Mesh,
+        *,
+        is_long: bool,
+    ) -> None:
         self.cfg = cfg
         self.mesh = mesh
+        self.sliding_window = None if is_long else cfg.sliding_window
+        self.use_rope = not (is_long and cfg.disable_long_rope)
+        self.qk_mult_scale = cfg.qk_mult_long_scale if is_long else 1.0
         head_dim = cfg.inferred_head_dim
         self.w_q = _init_weight(rng,
                                 (cfg.hidden_dim, cfg.num_heads * head_dim),
@@ -687,7 +850,7 @@ class GrugMoeAttention(JaxModule):
                                 (cfg.num_heads * head_dim, cfg.hidden_dim),
                                 dtype, cfg.initializer_std)
         self.attn_gate = nnx.Param(
-            jnp.zeros((cfg.hidden_dim, cfg.num_heads), dtype=jnp.float32))
+            jnp.zeros((cfg.hidden_dim, cfg.num_heads), dtype=dtype))
 
     def _project_qkv(
         self,
@@ -707,12 +870,13 @@ class GrugMoeAttention(JaxModule):
 
         q = _rms_norm(q)
         k = _rms_norm(k)
-        q, k = _apply_rotary(q,
-                             k,
-                             positions,
-                             head_dim=head_dim,
-                             theta=self.cfg.rope_theta)
-        q = q * self.cfg.qk_mult
+        if self.use_rope:
+            q, k = _apply_half_rotary(q,
+                                      k,
+                                      positions,
+                                      head_dim=head_dim,
+                                      theta=self.cfg.rope_theta)
+        q = q * self.cfg.qk_mult * self.qk_mult_scale
         return q, k, v
 
     def _exclusive_self_attention_output(
@@ -729,8 +893,7 @@ class GrugMoeAttention(JaxModule):
         v_norm_sq = jnp.sum(v * v, axis=-1, keepdims=True)
         attn_out = attn_out - (dot / (v_norm_sq + 1e-6)) * v
         gate = 2 * jax.nn.sigmoid(
-            jnp.einsum("td,dn->tn", x.astype(jnp.float32),
-                       self.attn_gate.value.astype(jnp.float32)))
+            jnp.einsum("td,dn->tn", x, self.attn_gate.value))
         attn_out = gate[..., None].astype(attn_out.dtype) * attn_out
         attn_out = attn_out.reshape(x.shape[0], self.cfg.num_heads * head_dim)
         return jnp.einsum("th,hd->td", attn_out, self.w_o.value)
@@ -739,7 +902,6 @@ class GrugMoeAttention(JaxModule):
         self,
         x: jax.Array,
         positions: jax.Array,
-        sliding_window: int,
         query_start_loc: Optional[jax.Array],
     ) -> jax.Array:
         head_dim = self.cfg.inferred_head_dim
@@ -750,7 +912,7 @@ class GrugMoeAttention(JaxModule):
         scores = jnp.einsum("qhd,khd->hqk", q * (head_dim**-0.5), k)
         mask = _dense_attention_mask(
             positions=positions,
-            sliding_window=sliding_window,
+            sliding_window=self.sliding_window,
             query_start_loc=query_start_loc,
         )
         scores = jnp.where(mask[None, :, :], scores,
@@ -765,7 +927,6 @@ class GrugMoeAttention(JaxModule):
         kv_cache: Optional[jax.Array],
         x: jax.Array,
         positions: jax.Array,
-        sliding_window: int,
         attention_metadata: AttentionMetadata,
     ) -> tuple[jax.Array, jax.Array]:
         q, k, v = self._project_qkv(x, positions)
@@ -783,7 +944,7 @@ class GrugMoeAttention(JaxModule):
             attention_metadata,
             self.mesh,
             self.cfg.inferred_head_dim,
-            attention_chunk_size=sliding_window,
+            attention_chunk_size=self.sliding_window,
         )
         return new_kv_cache, self._exclusive_self_attention_output(
             x, attn_out, v)
@@ -793,16 +954,15 @@ class GrugMoeAttention(JaxModule):
         kv_cache: Optional[jax.Array],
         x: jax.Array,
         attention_metadata: AttentionMetadata,
-        sliding_window: int,
     ) -> tuple[Optional[jax.Array], jax.Array]:
         positions = attention_metadata.input_positions
         if positions.ndim != 1:
             positions = jnp.reshape(positions, (-1, ))
         if self.cfg.attention_mode == GrugMoeAttentionMode.DENSE:
             return kv_cache, self._dense_reference_attention(
-                x, positions, sliding_window, attention_metadata.query_start_loc)
+                x, positions, attention_metadata.query_start_loc)
         return self._production_attention(kv_cache, x, positions,
-                                          sliding_window, attention_metadata)
+                                          attention_metadata)
 
 
 class GrugMoeDecoderLayer(JaxModule):
@@ -813,8 +973,10 @@ class GrugMoeDecoderLayer(JaxModule):
         dtype: jnp.dtype,
         rng: nnx.Rngs,
         mesh: Mesh,
+        quant_config: Any,
         *,
         layer_index: int = -1,
+        prefix: str = "",
     ) -> None:
         self.layer_index = int(layer_index)
         self.rms_attn = GrugMoeRMSNorm(cfg.hidden_dim, cfg.layer_norm_eps,
@@ -822,12 +984,21 @@ class GrugMoeDecoderLayer(JaxModule):
         self.attn_gated_norm = GrugMoeGatedNorm(cfg.hidden_dim,
                                                 cfg.initializer_std, dtype,
                                                 rng)
-        self.attn = GrugMoeAttention(cfg, dtype, rng, mesh)
+        is_long = _is_long_layer(layer_index, cfg.num_layers)
+        self.attn = GrugMoeAttention(cfg, dtype, rng, mesh, is_long=is_long)
         self.rms_mlp = GrugMoeRMSNorm(cfg.hidden_dim, cfg.layer_norm_eps,
                                       dtype)
         self.mlp_gated_norm = GrugMoeGatedNorm(cfg.hidden_dim,
                                                cfg.initializer_std, dtype, rng)
-        self.mlp = GrugMoeMLP(cfg, dtype, rng, layer_index=layer_index)
+        self.mlp = GrugMoeMLP(
+            cfg,
+            dtype,
+            rng,
+            mesh,
+            quant_config,
+            layer_index=layer_index,
+            prefix=f"{prefix}.mlp",
+        )
         self.shared = (GrugMoeDenseMLP(
             cfg.hidden_dim,
             cfg.shared_expert_intermediate_dim,
@@ -841,11 +1012,9 @@ class GrugMoeDecoderLayer(JaxModule):
         kv_cache: Optional[jax.Array],
         x: jax.Array,
         attention_metadata: AttentionMetadata,
-        sliding_window: int,
     ) -> tuple[Optional[jax.Array], jax.Array, jax.Array]:
         attn_in = self.attn_gated_norm(self.rms_attn(x))
-        kv_cache, attn_out = self.attn(kv_cache, attn_in, attention_metadata,
-                                       sliding_window)
+        kv_cache, attn_out = self.attn(kv_cache, attn_in, attention_metadata)
         x = x + attn_out
         mlp_in = self.mlp_gated_norm(self.rms_mlp(x))
         mlp_out, expert_ids = self.mlp(mlp_in)
@@ -899,7 +1068,9 @@ class GrugMoeModel(JaxModule):
                 self.dtype,
                 rng,
                 self.mesh,
+                vllm_config.quant_config,
                 layer_index=_layer_index,
+                prefix=f"model.layers.{_layer_index}",
             ),
         )
         self.final_norm = (GrugMoeRMSNorm(
@@ -938,7 +1109,6 @@ class GrugMoeModel(JaxModule):
         if positions.ndim != 1:
             positions = jnp.reshape(positions, (-1, ))
 
-        short_window = self.config.sliding_window // 2
         new_kv_caches: list[Optional[jax.Array]] = []
         all_expert_ids = []
         for i, layer in enumerate(self.layers):
@@ -946,9 +1116,7 @@ class GrugMoeModel(JaxModule):
             if isinstance(layer, PPMissingLayer):
                 new_kv_caches.append(kv_cache)
                 continue
-            layer_window = self.config.sliding_window if i % 4 == 3 else short_window
-            kv_cache, x, expert_ids = layer(kv_cache, x, attention_metadata,
-                                            layer_window)
+            kv_cache, x, expert_ids = layer(kv_cache, x, attention_metadata)
             new_kv_caches.append(kv_cache)
             all_expert_ids.append(expert_ids)
 
@@ -1040,9 +1208,9 @@ class GrugMoeForCausalLM(JaxModule):
         tensors: Mapping[str, np.ndarray],
         consumed: set[str],
         name: str,
-    ) -> jax.Array:
+    ) -> np.ndarray:
         consumed.add(name)
-        return jnp.asarray(tensors[name])
+        return tensors[name]
 
     def _assign_param(
         self,
@@ -1050,13 +1218,18 @@ class GrugMoeForCausalLM(JaxModule):
         value: jax.Array,
         *,
         tensor_name: str,
+        allow_shape_mismatch: bool = False,
     ) -> None:
-        value = jnp.asarray(value, dtype=param.value.dtype)
-        if value.shape != param.value.shape:
+        target = param.value
+        if not allow_shape_mismatch and value.shape != target.shape:
             raise ValueError(
                 f"Loaded shape for {tensor_name}: {value.shape} does not match "
-                f"model shape: {param.value.shape}")
-        param.value = value
+                f"model shape: {target.shape}")
+        with cpu_mesh_context():
+            host_value = jnp.asarray(value, dtype=target.dtype)
+        sharding = param.get_metadata().get("sharding", ())
+        param.set_value(shard_put(host_value, sharding, mesh=self.mesh))
+        del host_value
 
     def _assign_linear_param(
         self,
@@ -1067,13 +1240,15 @@ class GrugMoeForCausalLM(JaxModule):
     ) -> None:
         self._assign_param(
             param,
-            jnp.swapaxes(self._tensor(tensors, consumed, name), -1, -2),
+            np.swapaxes(self._tensor(tensors, consumed, name), -1, -2),
             tensor_name=name,
         )
 
     def load_inference_artifact(
         self,
         artifact_dir: str | Path,
+        *,
+        weights_uri: str | None = None,
     ) -> GrugMoeArtifactLoadReport:
         """Load the canonical GrugMoE inference artifact.
 
@@ -1097,7 +1272,10 @@ class GrugMoeForCausalLM(JaxModule):
             expected_tie_word_embeddings=self.tie_word_embeddings,
         )
 
-        tensors = _load_artifact_tensors(artifact_path)
+        tensors = _load_artifact_tensors(
+            artifact_path,
+            weights_uri=weights_uri,
+        )
         expected = _canonical_grugmoe_tensor_names(
             self.model.config,
             tie_word_embeddings=self.tie_word_embeddings,
@@ -1222,35 +1400,52 @@ class GrugMoeForCausalLM(JaxModule):
                 self._tensor(tensors, consumed, f"{prefix}.mlp.router.bias"),
                 tensor_name=f"{prefix}.mlp.router.bias",
             )
-            gate = jnp.swapaxes(
+            # Keep expert tensors in HF orientation until the shared GMM
+            # processor transposes and packs them for its selected backend.
+            self._assign_param(
+                layer.mlp.experts.kernel_gating_EDF,
                 self._tensor(
                     tensors,
                     consumed,
                     f"{prefix}.mlp.experts.gate_proj.weight",
                 ),
-                -1,
-                -2,
+                tensor_name=f"{prefix}.mlp.experts.gate_proj.weight",
+                allow_shape_mismatch=True,
             )
-            up = jnp.swapaxes(
+            self._assign_param(
+                layer.mlp.experts.kernel_up_proj_EDF,
                 self._tensor(
                     tensors,
                     consumed,
                     f"{prefix}.mlp.experts.up_proj.weight",
                 ),
-                -1,
-                -2,
+                tensor_name=f"{prefix}.mlp.experts.up_proj.weight",
+                allow_shape_mismatch=True,
             )
             self._assign_param(
-                layer.mlp.w_gate_up,
-                jnp.concatenate([gate, up], axis=-1),
-                tensor_name=f"{prefix}.mlp.experts.gate_proj.weight",
+                layer.mlp.experts.kernel_down_proj_EFD,
+                self._tensor(
+                    tensors,
+                    consumed,
+                    f"{prefix}.mlp.experts.down_proj.weight",
+                ),
+                tensor_name=f"{prefix}.mlp.experts.down_proj.weight",
+                allow_shape_mismatch=True,
             )
-            self._assign_linear_param(
-                layer.mlp.w_down,
-                tensors,
-                consumed,
-                f"{prefix}.mlp.experts.down_proj.weight",
-            )
+            for param in (
+                    layer.mlp.experts.kernel_gating_EDF,
+                    layer.mlp.experts.kernel_up_proj_EDF,
+                    layer.mlp.experts.kernel_down_proj_EFD,
+            ):
+                param.set_metadata(_weights_to_load=[True] *
+                                   self.model.config.num_experts)
+            if layer.mlp.experts.quant_method is None:
+                raise ValueError(
+                    f"{prefix} is missing its MoE quantization method")
+            if not layer.mlp.experts.quant_method.process_weights_after_loading(
+                    layer.mlp.experts):
+                raise RuntimeError(
+                    f"{prefix} did not finish processing expert weights")
 
             if self.model.config.shared_expert_intermediate_dim > 0:
                 if layer.shared is None:
@@ -1308,8 +1503,12 @@ class GrugMoeForCausalLM(JaxModule):
 
     def load_weights(self, rng: jax.Array) -> GrugMoeArtifactLoadReport:
         del rng
+        weights_uri = self.vllm_config.additional_config.get(
+            _ARTIFACT_WEIGHTS_URI_CONFIG_KEY)
         return self.load_inference_artifact(
-            self.vllm_config.model_config.model)
+            self.vllm_config.model_config.model,
+            weights_uri=weights_uri,
+        )
 
 
 __all__ = [

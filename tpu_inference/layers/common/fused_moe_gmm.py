@@ -465,6 +465,60 @@ def _apply_all_gather_fp8(hidden_states: jax.Array, mesh: Mesh,
     )(hidden_states_q, scale)
 
 
+def _select_topk_weights_and_indices(
+    gating_output: jax.Array,
+    *,
+    topk: int,
+    scoring_fn: str,
+    hash_based_topk_indices: jax.Array | None,
+    expert_score_correction_bias: jax.Array | None,
+    expert_logits_correction_bias: jax.Array | None,
+) -> tuple[jax.Array, jax.Array]:
+    topk_weights = apply_scoring_fn(scoring_fn, gating_output)
+    if hash_based_topk_indices is not None:
+        topk_indices = hash_based_topk_indices
+        topk_weights = jnp.take_along_axis(topk_weights,
+                                           topk_indices,
+                                           axis=-1)
+    elif envs.MOE_APPROX_TOPK:
+        topk_weights, topk_indices = jax.lax.approx_max_k(
+            topk_weights,
+            k=topk,
+            recall_target=envs.MOE_APPROX_TOPK_RECALL_TARGET)
+    elif expert_logits_correction_bias is not None:
+        _, topk_indices = jax.lax.top_k(
+            gating_output + expert_logits_correction_bias[None, :], k=topk)
+        topk_weights = jnp.take_along_axis(topk_weights,
+                                           topk_indices,
+                                           axis=-1)
+    elif expert_score_correction_bias is not None:
+        _, topk_indices = jax.lax.top_k(
+            topk_weights + expert_score_correction_bias[None, :], k=topk)
+        topk_weights = jnp.take_along_axis(topk_weights,
+                                           topk_indices,
+                                           axis=-1)
+    else:
+        topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
+    return topk_weights, topk_indices
+
+
+def _normalize_topk_weights(
+    topk_weights: jax.Array,
+    *,
+    renormalize: bool,
+    normalization_sum: float | None,
+) -> jax.Array:
+    if renormalize and normalization_sum is not None:
+        raise ValueError(
+            "renormalize and normalization_sum are mutually exclusive")
+    if renormalize:
+        normalization_sum = 1.0
+    if normalization_sum is None:
+        return topk_weights
+    return topk_weights * (normalization_sum /
+                           (topk_weights.sum(axis=-1, keepdims=True) + 1e-9))
+
+
 @jax.jit(static_argnames=(
     "topk",
     "renormalize",
@@ -476,6 +530,7 @@ def _apply_all_gather_fp8(hidden_states: jax.Array, mesh: Mesh,
     "enable_rs_kernel",
     "onehot_moe_permute_threshold",
     "scatter_results",
+    "topk_weights_sum",
 ))
 def fused_moe_func(
     hidden_states: jax.Array,
@@ -498,6 +553,8 @@ def fused_moe_func(
     scatter_results: bool = False,
     hash_based_topk_indices: jax.Array | None = None,
     expert_score_correction_bias: jax.Array | None = None,
+    expert_logits_correction_bias: jax.Array | None = None,
+    topk_weights_sum: float | None = None,
 ) -> jax.Array:
     """Route tokens in hidden_states into each experts based on routing.
 
@@ -531,26 +588,19 @@ def fused_moe_func(
 
     assert gating_output.shape == (num_tokens, global_num_experts)
 
-    topk_weights = apply_scoring_fn(scoring_fn, gating_output)
-    if hash_based_topk_indices is not None:
-        topk_indices = hash_based_topk_indices
-        topk_weights = jnp.take_along_axis(topk_weights, topk_indices, axis=-1)
-    elif envs.MOE_APPROX_TOPK:
-        topk_weights, topk_indices = jax.lax.approx_max_k(
-            topk_weights,
-            k=topk,
-            recall_target=envs.MOE_APPROX_TOPK_RECALL_TARGET)
-    else:
-        if expert_score_correction_bias is not None:
-            _, topk_indices = jax.lax.top_k(
-                topk_weights + expert_score_correction_bias[None, :], k=topk)
-            topk_weights = jnp.take_along_axis(topk_weights,
-                                               topk_indices,
-                                               axis=-1)
-        else:
-            topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+    topk_weights, topk_indices = _select_topk_weights_and_indices(
+        gating_output,
+        topk=topk,
+        scoring_fn=scoring_fn,
+        hash_based_topk_indices=hash_based_topk_indices,
+        expert_score_correction_bias=expert_score_correction_bias,
+        expert_logits_correction_bias=expert_logits_correction_bias,
+    )
+    topk_weights = _normalize_topk_weights(
+        topk_weights,
+        renormalize=renormalize,
+        normalization_sum=topk_weights_sum,
+    )
     # All gathering topk_indices and topk_weights if attention dp is used.
     if get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) > 1:
         topk_indices, topk_weights = all_gather_topk_indices_and_weights(
