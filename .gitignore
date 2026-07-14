@@ -203,3 +203,6 @@ shellcheck*/
 csrc/moe/marlin_moe_wna16/kernel_*
 
 !/support_matrices/**
+
+# Marin: agent-local Claude Code settings (the .claude/skills symlink is tracked)
+.claude/settings.local.json

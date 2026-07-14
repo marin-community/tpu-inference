@@ -1,0 +1,120 @@
+# tpu-inference (Marin fork)
+
+@.agents/marin-style/AGENTS-core.md
+
+The core standards above apply to the code Marin owns in this repo. This file
+records what is different here, because this is not a normal Marin repo: it is a
+fork that tracks an upstream project.
+
+## Fork policy
+
+This repo is a fork of [vllm-project/tpu-inference](https://github.com/vllm-project/tpu-inference),
+periodically refreshed from upstream. Marin's changes ride on top as a small
+delta. Upstream owns almost every file; we own a handful.
+
+**Minimize the upstream diff.** Every file we touch is a file the next upstream
+refresh has to merge. Before changing an upstream file, ask whether the change
+belongs upstream instead.
+
+Rules that follow from that:
+
+- **Never reformat or restyle upstream code.** Upstream's formatters are yapf +
+  isort + ruff, configured in `.pre-commit-config.yaml`. Do not "fix" upstream
+  style, do not run Marin's formatters over upstream files, and do not edit
+  `.pre-commit-config.yaml`, `.buildkite/`, or `.github/workflows/` files that
+  are not ours.
+- Marin-owned paths: `infra/`, `.github/workflows/marin-*.yaml`, `.agents/`,
+  `AGENTS.md`, `CLAUDE.md`, and the delta files listed below.
+- Keep new code in new files where you can. A new module is a clean merge; a
+  hunk in the middle of an upstream file is a conflict.
+
+### The Marin delta
+
+Everything Marin adds on top of upstream, as of this writing:
+
+| File | What it is |
+| --- | --- |
+| `tpu_inference/models/jax/grugmoe.py` | Native JAX implementation of Marin's GrugMoE model. |
+| `tpu_inference/layers/vllm/__init__.py` | Registers GrugMoE with the TPU model loader (hunk in an upstream file). |
+| `tpu_inference/runner/token_decision.py` | Registry for the in-process per-step token-decision callback. |
+| `tpu_inference/runner/tpu_runner.py` | Calls that callback from the engine step (hunk in an upstream file). |
+| `tests/models/jax/test_grugmoe.py` | GrugMoE behavior tests. Run on CPU. |
+| `tests/models/common/test_model_loader.py` | GrugMoE loader/registration coverage. Needs Marin's vLLM fork. |
+| `requirements.txt` | TorchVision pinned to the pair Marin's vLLM stack resolves. |
+| `setup.py` | Source installs report the selected release version. |
+
+To see the real delta rather than trusting this table:
+
+```bash
+git fetch upstream
+git diff --stat "$(git merge-base upstream/main HEAD)"..HEAD
+```
+
+That diff also contains upstream's own release-branch cherry-picks, which are
+upstream-owned even though they are not on `upstream/main`.
+
+### Pairing with the vLLM fork
+
+This fork is used together with Marin's vLLM fork: tpu-inference provides the TPU
+backend, vLLM provides the engine, and the two are refreshed and pinned as a pair
+from the Marin repo. A change here that needs a matching vLLM change is not
+complete until both SHAs move together. `tests/models/common/test_model_loader.py`
+depends on the vLLM fork, which is why it cannot run against stock PyPI vLLM.
+
+## Development
+
+Marin's lint entry point, scoped by `[tool.marin-style]` in `pyproject.toml` to
+the delta files above:
+
+```bash
+uv run infra/pre-commit.py --all-files        # check
+uv run infra/pre-commit.py --all-files --fix  # check and fix
+```
+
+It runs `ruff check` only — no formatter — so it cannot churn upstream style.
+Upstream's own hooks (`pre-commit run`) still govern upstream files; leave them
+to upstream.
+
+Re-vendor the shared standards after bumping the pinned `marin-style` rev in
+`infra/pre-commit.py`:
+
+```bash
+uvx --from git+https://github.com/marin-community/marin-style@<rev> marin-style sync
+```
+
+## Tests
+
+Tests live in `tests/`, mirroring the `tpu_inference/` package layout.
+
+**Most of this suite needs a real TPU.** Upstream runs it in Docker on TPU
+runners via `.buildkite/`, which GitHub-hosted CI cannot do: no accelerator, and
+`libtpu` is not installable there. Do not add TPU-dependent tests to the Marin
+GitHub workflows.
+
+What does run without a TPU, on CPU, is the GrugMoE model test:
+
+```bash
+uv run --python 3.12 --with "jax[cpu]==0.10.1" --with flax==0.12.4 --with torchax==0.0.11 \
+  --with qwix==0.1.2 --with "transformers>=5.8.0" --with vllm --with requests --with jaxtyping \
+  --with pytest --with pytest-mock \
+  python -m pytest tests/models/jax/test_grugmoe.py
+```
+
+`JAX_PLATFORMS=cpu` is implied when no TPU is present. Importing anything under
+`tpu_inference.` pulls in vLLM, so even a CPU import needs vLLM installed.
+
+## CI
+
+Two Marin workflows, both prefixed `marin-` to keep them clearly ours:
+
+- `.github/workflows/marin-ci.yaml` — per-PR, CPU-only, minutes. Delta-scoped
+  lint, a vendored-standards drift check, and the CPU tests above. It does not
+  invoke upstream's buildkite matrix or upstream's pre-commit hooks.
+- `.github/workflows/marin-nightly.yaml` — nightly TPU end-to-end. Provisions a
+  v5litepod-8 through Iris, installs Marin's pinned vLLM fork plus this repo at
+  HEAD, serves a model, probes the endpoint, and gates the result against
+  `infra/nightly/spec.json`. Also runnable on demand via `workflow_dispatch`.
+
+The nightly is the only thing that exercises this repo on real hardware. If you
+change the runner, the model, or the serving path, expect PR CI to stay green and
+the nightly to be the test that tells you the truth.

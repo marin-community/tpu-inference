@@ -11,3 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Marin coding standards (infra/pre-commit.py). This is an upstream-tracking fork,
+# so the checks are scoped to the files Marin owns: upstream code keeps its own
+# yapf/isort/ruff matrix in .pre-commit-config.yaml and must not be reformatted.
+# `include` is the Marin delta -- extend it when the delta grows.
+[tool.marin-style]
+checks = ["ruff-check"]
+include = [
+    "tpu_inference/models/jax/grugmoe.py",
+    "tpu_inference/runner/token_decision.py",
+    "tests/models/jax/test_grugmoe.py",
+    "tests/models/common/test_model_loader.py",
+    "infra/**",
+]
