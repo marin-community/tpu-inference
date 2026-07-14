@@ -18,6 +18,9 @@
 # `include` is the Marin delta -- extend it when the delta grows.
 [tool.marin-style]
 checks = ["ruff-check"]
+# Match the ruff that upstream's .pre-commit-config.yaml pins, so the two linters
+# never disagree about the same file.
+ruff_version = "0.11.8"
 include = [
     "tpu_inference/models/jax/grugmoe.py",
     "tpu_inference/runner/token_decision.py",

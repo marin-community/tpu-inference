@@ -37,7 +37,7 @@ concurrency:
 
 env:
   # Keep in step with the rev pinned in infra/pre-commit.py.
-  MARIN_STYLE_REV: 4469660ef1ba6ecd4c8d81bdbb17091bc501a682
+  MARIN_STYLE_REV: 999ea41d48c05db6f78552ddfa8d3cc6d49cd37f
 
 jobs:
   lint:
