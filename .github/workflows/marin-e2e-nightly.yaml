@@ -65,7 +65,7 @@ env:
   TPU: ${{ github.event.inputs.tpu || 'v5litepod-8' }}
   REGION: ${{ github.event.inputs.region || 'europe-west4' }}
   TENSOR_PARALLEL_SIZE: ${{ github.event.inputs.tensor_parallel_size || '8' }}
-  RECORD: ${{ github.event.inputs.record == 'true' && '1' || '0' }}
+  RECORD_FLAG: ${{ github.event.inputs.record == 'true' && '--record' || '' }}
   JOB_NAME: tpu-inference-nightly
 
 jobs:
@@ -124,14 +124,16 @@ jobs:
       - name: Serve on TPU and probe the endpoint
         # This repo is bundled as the Iris job's workspace, so infra/nightly/ arrives on
         # the worker at the commit under test: the served code, the probe, and the gate
-        # spec are all from this SHA. The job runs infra/nightly/serve_and_probe.sh and
+        # spec are all from this SHA. The job runs infra/nightly/serve_and_probe.py and
         # its exit code is this step's result.
         #
         # --no-sync skips the workspace `uv sync` -- the serving environment is the uvx
         # env the script builds, matching marin-core's isolated TPU-vLLM path.
         run: |
           set -euo pipefail
-          # shellcheck disable=SC2016  # $IRIS_WORKDIR is expanded on the worker, not here
+          # The env vars are passed to the job with -e and expanded by the job's shell,
+          # not this one -- hence the single quotes.
+          # shellcheck disable=SC2016
           iris --config marin/lib/iris/config/marin.yaml job run \
             --job-name "$JOB_NAME" \
             --tpu "$TPU" --enable-extra-resources \
@@ -144,8 +146,14 @@ jobs:
             -e VLLM_REV "$VLLM_REV" \
             -e TPU_INFERENCE_REV "$GITHUB_SHA" \
             -e TENSOR_PARALLEL_SIZE "$TENSOR_PARALLEL_SIZE" \
-            -e RECORD "$RECORD" \
-            -- bash -lc 'cd "${IRIS_WORKDIR:-.}" && exec bash infra/nightly/serve_and_probe.sh'
+            -e RECORD_FLAG "$RECORD_FLAG" \
+            -- bash -lc 'cd "${IRIS_WORKDIR:-.}" && exec python3 infra/nightly/serve_and_probe.py \
+              --model "$MODEL" \
+              --tpu "$TPU" \
+              --vllm-rev "$VLLM_REV" \
+              --tpu-inference-rev "$TPU_INFERENCE_REV" \
+              --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" \
+              $RECORD_FLAG'
 
       - name: Stop the Iris job
         if: always()

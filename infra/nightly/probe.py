@@ -33,6 +33,7 @@ import json
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -64,6 +65,15 @@ RECORDED_NOTE = "Recorded from a green nightly run by infra/nightly/probe.py --r
 # reflects steady-state serving rather than compile time.
 WARMUP_TIMEOUT = 1800.0
 READINESS_POLL_INTERVAL = 5.0
+
+
+@dataclass(frozen=True)
+class Provenance:
+    """What was served, recorded into a spec so a floor can be traced to a run."""
+
+    tpu: str
+    vllm_rev: str
+    tpu_inference_rev: str
 
 
 @dataclass(frozen=True)
@@ -120,9 +130,18 @@ def complete(base_url: str, model: str, prompt: str,
                       output_tokens=body["usage"]["completion_tokens"])
 
 
-def wait_for_models(base_url: str, deadline: float) -> None:
-    """Block until the server lists its models, or raise once the deadline passes."""
+def wait_for_models(base_url: str,
+                    deadline: float,
+                    is_alive: Callable[[], bool] = lambda: True) -> None:
+    """Block until the server lists its models.
+
+    Raises if the deadline passes, or as soon as ``is_alive`` goes false -- a vLLM
+    that died on startup should fail the run in seconds, not after the warmup
+    timeout that a still-compiling one needs.
+    """
     while True:
+        if not is_alive():
+            raise RuntimeError("the server exited before it began serving")
         try:
             with urllib.request.urlopen(f"{base_url}/models",
                                         timeout=10) as response:
@@ -177,13 +196,13 @@ def gate_failures(spec: dict, observed: Observed) -> list[str]:
 
 
 def record_spec(observed: Observed, model: str,
-                args: argparse.Namespace) -> dict:
+                provenance: Provenance) -> dict:
     """Return a gate spec built from this run's numbers, with provenance."""
-    provenance = {
+    recorded = {
         "model": model,
-        "tpu": args.tpu,
-        "vllm_fork_rev": args.vllm_rev,
-        "tpu_inference_rev": args.tpu_inference_rev,
+        "tpu": provenance.tpu,
+        "vllm_fork_rev": provenance.vllm_rev,
+        "tpu_inference_rev": provenance.tpu_inference_rev,
         "prompts": len(PROMPTS),
         "max_tokens": MAX_TOKENS,
         "recorded_at": datetime.now(UTC).isoformat(),
@@ -202,7 +221,53 @@ def record_spec(observed: Observed, model: str,
         "output_tokens": observed.output_tokens,
         "elapsed": round(observed.elapsed, 1),
     }
-    return {"provenance": provenance, "gate": gate, "observed": measured}
+    return {"provenance": recorded, "gate": gate, "observed": measured}
+
+
+def run(base_url: str,
+        model: str,
+        spec_path: Path,
+        provenance: Provenance,
+        record: bool = False,
+        is_alive: Callable[[], bool] = lambda: True) -> int:
+    """Probe a served model and gate it against the spec. Returns an exit code."""
+    base_url = base_url.rstrip("/")
+    spec = json.loads(spec_path.read_text())
+
+    print(f"waiting for {base_url}/models", flush=True)
+    wait_for_models(base_url,
+                    deadline=time.monotonic() + WARMUP_TIMEOUT,
+                    is_alive=is_alive)
+
+    print("warming up (compiles the model; not timed)", flush=True)
+    warmup = complete(base_url, model, PROMPTS[0], WARMUP_TIMEOUT)
+    print(f"warmup returned {warmup.output_tokens} tokens", flush=True)
+
+    observed = run_timed_batch(base_url, model)
+    print(
+        f"served {observed.completions} prompts, {observed.output_tokens} output "
+        f"tokens in {observed.elapsed:.1f}s = "
+        f"{observed.output_tokens_per_second:.1f} tok/s",
+        flush=True,
+    )
+
+    if record:
+        recorded = json.dumps(record_spec(observed, model, provenance),
+                              indent=2)
+        spec_path.write_text(recorded + "\n")
+        # Also to stdout: this runs on a TPU worker whose filesystem the workflow
+        # cannot reach, so the streamed job log is how a spec gets back to a human.
+        print(f"recorded {spec_path}:\n{recorded}", flush=True)
+        return 0
+
+    failures = gate_failures(spec, observed)
+    for failure in failures:
+        print(f"GATE FAILED: {failure}", flush=True)
+    if failures:
+        return 1
+
+    print("gate passed", flush=True)
+    return 0
 
 
 def main() -> int:
@@ -226,40 +291,14 @@ def main() -> int:
                         help="This repo's SHA, as provenance")
     args = parser.parse_args()
 
-    base_url = args.base_url.rstrip("/")
-    spec = json.loads(args.spec.read_text())
-
-    print(f"waiting for {base_url}/models", flush=True)
-    wait_for_models(base_url, deadline=time.monotonic() + WARMUP_TIMEOUT)
-
-    print("warming up (compiles the model; not timed)", flush=True)
-    warmup = complete(base_url, args.model, PROMPTS[0], WARMUP_TIMEOUT)
-    print(f"warmup returned {warmup.output_tokens} tokens", flush=True)
-
-    observed = run_timed_batch(base_url, args.model)
-    print(
-        f"served {observed.completions} prompts, {observed.output_tokens} output tokens "
-        f"in {observed.elapsed:.1f}s = {observed.output_tokens_per_second:.1f} tok/s",
-        flush=True,
-    )
-
-    if args.record:
-        recorded = json.dumps(record_spec(observed, args.model, args),
-                              indent=2)
-        args.spec.write_text(recorded + "\n")
-        # Also to stdout: this runs on a TPU worker whose filesystem the workflow cannot
-        # reach, so the streamed job log is how a recorded spec gets back to a human.
-        print(f"recorded {args.spec}:\n{recorded}", flush=True)
-        return 0
-
-    failures = gate_failures(spec, observed)
-    for failure in failures:
-        print(f"GATE FAILED: {failure}", flush=True)
-    if failures:
-        return 1
-
-    print("gate passed", flush=True)
-    return 0
+    provenance = Provenance(tpu=args.tpu,
+                            vllm_rev=args.vllm_rev,
+                            tpu_inference_rev=args.tpu_inference_rev)
+    return run(base_url=args.base_url,
+               model=args.model,
+               spec_path=args.spec,
+               provenance=provenance,
+               record=args.record)
 
 
 if __name__ == "__main__":

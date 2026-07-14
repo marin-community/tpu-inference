@@ -71,12 +71,14 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-          cache-dependency-glob: infra/cpu-test-requirements.txt
+          cache-dependency-glob: pyproject.toml
 
       - name: Install the CPU subset of the TPU stack
+        # The `cpu-tests` dependency group in pyproject.toml. --torch-backend cpu
+        # resolves torch to the CPU wheel rather than the CUDA one.
         run: |
           uv venv --python 3.12
-          uv pip install --torch-backend cpu -r infra/cpu-test-requirements.txt
+          uv pip install --group cpu-tests --torch-backend cpu
 
       - name: GrugMoE model tests
         run: uv run --no-project python -m pytest tests/models/jax/test_grugmoe.py -q
