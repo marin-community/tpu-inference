@@ -65,7 +65,12 @@ env:
   TPU: ${{ github.event.inputs.tpu || 'v5litepod-8' }}
   REGION: ${{ github.event.inputs.region || 'europe-west4' }}
   TENSOR_PARALLEL_SIZE: ${{ github.event.inputs.tensor_parallel_size || '8' }}
-  RECORD_FLAG: ${{ github.event.inputs.record == 'true' && '--record' || '' }}
+  # "1" or empty: the job expands it to --record. Passing the flag itself through -e
+  # would hand the iris CLI a value that starts with a dash.
+  RECORD: ${{ github.event.inputs.record == 'true' && '1' || '' }}
+  # Iris addresses a job as /<user>/<job-name>, and the user prefix otherwise comes
+  # from whoever submitted it. Pin both so the teardown step below can name the job.
+  JOB_USER: marin-ci
   JOB_NAME: tpu-inference-nightly
 
 jobs:
@@ -136,6 +141,7 @@ jobs:
           # shellcheck disable=SC2016
           iris --config marin/lib/iris/config/marin.yaml job run \
             --job-name "$JOB_NAME" \
+            --user "$JOB_USER" \
             --tpu "$TPU" --enable-extra-resources \
             --region "$REGION" \
             --cpu 8 --memory 64g --disk 100g \
@@ -146,18 +152,21 @@ jobs:
             -e VLLM_REV "$VLLM_REV" \
             -e TPU_INFERENCE_REV "$GITHUB_SHA" \
             -e TENSOR_PARALLEL_SIZE "$TENSOR_PARALLEL_SIZE" \
-            -e RECORD_FLAG "$RECORD_FLAG" \
+            -e RECORD "$RECORD" \
             -- bash -lc 'cd "${IRIS_WORKDIR:-.}" && exec python3 infra/nightly/serve_and_probe.py \
               --model "$MODEL" \
               --tpu "$TPU" \
               --vllm-rev "$VLLM_REV" \
               --tpu-inference-rev "$TPU_INFERENCE_REV" \
               --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" \
-              $RECORD_FLAG'
+              ${RECORD:+--record}'
 
       - name: Stop the Iris job
         if: always()
         # The job self-terminates on --timeout and on a clean exit; this covers a
         # cancelled or hard-killed run, so a TPU slice never outlives the workflow.
-        # --config is a top-level iris flag, before the subcommand.
-        run: iris --config marin/lib/iris/config/marin.yaml job stop "$JOB_NAME" || true
+        # The id must be canonical -- `job stop tpu-inference-nightly` raises
+        # "Job name must use canonical '/<user>/<job>' format" and, behind `|| true`,
+        # would leave the slice up. --config is a top-level iris flag, before the
+        # subcommand. Stopping a job that already exited is a no-op.
+        run: iris --config marin/lib/iris/config/marin.yaml job stop "/$JOB_USER/$JOB_NAME" || true

@@ -58,7 +58,7 @@ REQUEST_TIMEOUT = 180.0
 
 # --record sets the floor this far below the rate it observed.
 FLOOR_MARGIN = 4
-RECORDED_NOTE = "Recorded from a green nightly run by infra/nightly/probe.py --record."
+RECORDED_NOTE = "Recorded from a real serving run by infra/nightly/probe.py --record."
 
 # The first request pays for XLA compilation, which on TPU runs into minutes. It is
 # served before the timed batch and excluded from it, so the throughput number

@@ -126,6 +126,11 @@ Two Marin workflows, both prefixed `marin-` to keep them clearly ours:
   model, probes the endpoint, and gates on `infra/nightly/serving-spec.json`.
   The slice is torn down in an `if: always()` step.
 
+The gate spec is recorded from real hardware, not guessed: dispatch the nightly
+with `record: true` and it prints a fresh spec to the job log for you to commit.
+Re-record it when the model, the slice type, or the prompt set changes — a floor
+recorded against a different setup is not a floor.
+
 The nightly is the only thing that exercises this repo on real hardware. If you
 change the runner, the model, or the serving path, expect PR CI to stay green and
 the nightly to be the test that tells you the truth.
