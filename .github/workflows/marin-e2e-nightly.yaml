@@ -136,6 +136,12 @@ jobs:
         # env the script builds, matching marin-core's isolated TPU-vLLM path.
         run: |
           set -euo pipefail
+          # --timeout is what actually guarantees the slice comes back. The Iris
+          # controller sweeps executing tasks and kills any past started_at + timeout,
+          # so it fires even if this runner is hard-killed and the cleanup step below
+          # never runs. 4200s clears a cold install plus the probe's 30-minute warmup
+          # allowance, and sits under this job's timeout-minutes.
+          #
           # The env vars are passed to the job with -e and expanded by the job's shell,
           # not this one -- hence the single quotes.
           # shellcheck disable=SC2016
