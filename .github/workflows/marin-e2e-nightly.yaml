@@ -1,0 +1,178 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Marin E2E Nightly
+
+# The real end-to-end test for this fork: provision a TPU, install Marin's pinned vLLM
+# fork together with THIS repo at HEAD, serve a model, probe the endpoint, and gate the
+# result. This repo is the unit under test -- vLLM is pinned to whatever Marin currently
+# pins, so a failure here points at tpu-inference.
+#
+# Runs on a hosted runner and reaches the Iris cluster over GCP. Auth is keyless via
+# Workload Identity Federation: the job's GitHub OIDC token (permissions.id-token: write)
+# is exchanged to impersonate github-iris@hai-gcp-models -- no stored service-account key.
+# Qwen3-0.6B is public, so no HF token is needed; a gated model would need one forwarded
+# into the Iris job.
+#
+# Why a plain Iris job rather than marin-serve: marin-serve pins tpu-inference itself
+# (marin-core's tpu_vllm_pins.py, or the marin workspace lock) and exposes no flag to
+# override that pin, so it can only ever serve the tpu-inference Marin already ships --
+# which is the one thing this test must not do. `iris job run` also has no port/endpoint
+# surface, so the probe runs inside the job against localhost and the job's exit code is
+# the result. This mirrors marin's own IsolatedTpuVllm command, with the tpu-inference
+# rev swapped for the commit under test.
+
+on:
+  schedule:
+    - cron: "0 11 * * *"   # 11:00 UTC. Staggered off evalchemy's 07:00 to spread TPU demand.
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "HF model id to serve"
+        default: Qwen/Qwen3-0.6B
+      tpu:
+        description: "TPU slice type"
+        default: v5litepod-8
+      region:
+        description: "Region to pin the slice to"
+        default: europe-west4
+      tensor_parallel_size:
+        description: "vLLM tensor-parallel size (must divide the model's head count)"
+        default: "8"
+      record:
+        description: "Rewrite the gate spec from this run instead of gating it. The
+          recorded spec is printed to the job log; commit it to seed the throughput floor."
+        type: boolean
+        default: false
+
+concurrency:
+  group: marin-nightly
+  cancel-in-progress: false   # never interrupt a run that has a TPU provisioned
+
+env:
+  MODEL: ${{ github.event.inputs.model || 'Qwen/Qwen3-0.6B' }}
+  TPU: ${{ github.event.inputs.tpu || 'v5litepod-8' }}
+  REGION: ${{ github.event.inputs.region || 'europe-west4' }}
+  TENSOR_PARALLEL_SIZE: ${{ github.event.inputs.tensor_parallel_size || '8' }}
+  # "1" or empty: the job expands it to --record. Passing the flag itself through -e
+  # would hand the iris CLI a value that starts with a dash.
+  RECORD: ${{ github.event.inputs.record == 'true' && '1' || '' }}
+  # Iris addresses a job as /<user>/<job-name>, and the user prefix otherwise comes
+  # from whoever submitted it. Pin both so the teardown step below can name the job.
+  JOB_USER: marin-ci
+  JOB_NAME: tpu-inference-nightly
+
+jobs:
+  serve-and-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write   # mint the GitHub OIDC token that WIF exchanges for github-iris
+    steps:
+      - name: Check out tpu-inference (the commit under test)
+        uses: actions/checkout@v4
+
+      - name: Check out marin (Iris cluster config and the vLLM fork pin)
+        uses: actions/checkout@v4
+        with:
+          repository: marin-community/marin
+          path: marin
+          fetch-depth: 1
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: hai-gcp-models
+          workload_identity_provider: projects/748532799086/locations/global/workloadIdentityPools/github-pool/providers/github-oidc
+          service_account: github-iris@hai-gcp-models.iam.gserviceaccount.com
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: hai-gcp-models
+
+      - name: Install the iris CLI
+        # marin-core can't co-resolve with this repo's deps, so it lives in its own uv
+        # tool env. uv symlinks marin-serve but not iris, so put the tool's bin dir on
+        # PATH -- both the submit and the teardown step shell out to `iris`.
+        run: |
+          uv tool install --prerelease allow marin-core
+          echo "$(uv tool dir)/marin-core/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve the vLLM fork pin from marin
+        # Read Marin's current vLLM pin rather than copying the SHA here, so this nightly
+        # follows the refresh flow instead of drifting away from it.
+        run: |
+          VLLM_REV=$(python3 - <<'PY'
+          import re, pathlib
+          src = pathlib.Path("marin/lib/marin/src/marin/inference/tpu_vllm_pins.py").read_text()
+          print(re.search(r'VLLM_FORK_REV\s*=\s*"([0-9a-f]+)"', src).group(1))
+          PY
+          )
+          echo "VLLM_REV=$VLLM_REV" >> "$GITHUB_ENV"
+          echo "Serving vLLM fork $VLLM_REV with tpu-inference $GITHUB_SHA"
+
+      - name: Serve on TPU and probe the endpoint
+        # This repo is bundled as the Iris job's workspace, so infra/nightly/ arrives on
+        # the worker at the commit under test: the served code, the probe, and the gate
+        # spec are all from this SHA. The job runs infra/nightly/serve_and_probe.py and
+        # its exit code is this step's result.
+        #
+        # --no-sync skips the workspace `uv sync` -- the serving environment is the uvx
+        # env the script builds, matching marin-core's isolated TPU-vLLM path.
+        run: |
+          set -euo pipefail
+          # --timeout is what actually guarantees the slice comes back. The Iris
+          # controller sweeps executing tasks and kills any past started_at + timeout,
+          # so it fires even if this runner is hard-killed and the cleanup step below
+          # never runs. 4200s clears a cold install plus the probe's 30-minute warmup
+          # allowance, and sits under this job's timeout-minutes.
+          #
+          # The env vars are passed to the job with -e and expanded by the job's shell,
+          # not this one -- hence the single quotes.
+          # shellcheck disable=SC2016
+          iris --config marin/lib/iris/config/marin.yaml job run \
+            --job-name "$JOB_NAME" \
+            --user "$JOB_USER" \
+            --tpu "$TPU" --enable-extra-resources \
+            --region "$REGION" \
+            --cpu 8 --memory 64g --disk 100g \
+            --timeout 4200 \
+            --no-sync \
+            -e MODEL "$MODEL" \
+            -e TPU "$TPU" \
+            -e VLLM_REV "$VLLM_REV" \
+            -e TPU_INFERENCE_REV "$GITHUB_SHA" \
+            -e TENSOR_PARALLEL_SIZE "$TENSOR_PARALLEL_SIZE" \
+            -e RECORD "$RECORD" \
+            -- bash -lc 'cd "${IRIS_WORKDIR:-.}" && exec python3 infra/nightly/serve_and_probe.py \
+              --model "$MODEL" \
+              --tpu "$TPU" \
+              --vllm-rev "$VLLM_REV" \
+              --tpu-inference-rev "$TPU_INFERENCE_REV" \
+              --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" \
+              ${RECORD:+--record}'
+
+      - name: Stop the Iris job
+        if: always()
+        # The job self-terminates on --timeout and on a clean exit; this covers a
+        # cancelled or hard-killed run, so a TPU slice never outlives the workflow.
+        # The id must be canonical -- `job stop tpu-inference-nightly` raises
+        # "Job name must use canonical '/<user>/<job>' format" and, behind `|| true`,
+        # would leave the slice up. --config is a top-level iris flag, before the
+        # subcommand. Stopping a job that already exited is a no-op.
+        run: iris --config marin/lib/iris/config/marin.yaml job stop "/$JOB_USER/$JOB_NAME" || true
