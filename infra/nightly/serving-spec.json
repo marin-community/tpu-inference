@@ -1,0 +1,17 @@
+{
+  "provenance": {
+    "model": "Qwen/Qwen3-0.6B",
+    "tpu": "v5litepod-8",
+    "vllm_fork_rev": null,
+    "tpu_inference_rev": null,
+    "prompts": 8,
+    "max_tokens": 64,
+    "recorded_at": null,
+    "note": "Floor set by hand, NOT yet seeded from real hardware: a workflow cannot be dispatched until it is on the default branch, so the first real run happens after this merges. 20 tok/s is far below what Qwen3-0.6B does on a v5litepod-8; it is sized to catch a collapse (CPU fallback, a recompile every step), not to track drift. Re-record it from the first green nightly with `probe.py --record` and commit the result."
+  },
+  "gate": {
+    "min_completions": 8,
+    "min_output_tokens_per_second": 20.0
+  },
+  "observed": null
+}

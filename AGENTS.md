@@ -27,6 +27,11 @@ Rules that follow from that:
   `AGENTS.md`, `CLAUDE.md`, and the delta files listed below.
 - Keep new code in new files where you can. A new module is a clean merge; a
   hunk in the middle of an upstream file is a conflict.
+- A refresh must carry the Marin-owned paths forward. An earlier set of
+  `.github/workflows/marin-*.yml` files (release and sync automation) is present
+  in history but no longer on `main`, so this has been lost at least once. After
+  a refresh, check that `marin-ci.yaml` and `marin-e2e-nightly.yaml` are still
+  there.
 
 ### The Marin delta
 
@@ -91,17 +96,22 @@ runners via `.buildkite/`, which GitHub-hosted CI cannot do: no accelerator, and
 `libtpu` is not installable there. Do not add TPU-dependent tests to the Marin
 GitHub workflows.
 
-What does run without a TPU, on CPU, is the GrugMoE model test:
+What does run without a TPU is the GrugMoE model test, against the CPU subset of
+the stack (`infra/cpu-test-requirements.txt`, which is what PR CI installs):
 
 ```bash
-uv run --python 3.12 --with "jax[cpu]==0.10.1" --with flax==0.12.4 --with torchax==0.0.11 \
-  --with qwix==0.1.2 --with "transformers>=5.8.0" --with vllm --with requests --with jaxtyping \
-  --with pytest --with pytest-mock \
-  python -m pytest tests/models/jax/test_grugmoe.py
+uv venv --python 3.12
+uv pip install --torch-backend cpu -r infra/cpu-test-requirements.txt
+uv run --no-project python -m pytest tests/models/jax/test_grugmoe.py
 ```
 
-`JAX_PLATFORMS=cpu` is implied when no TPU is present. Importing anything under
-`tpu_inference.` pulls in vLLM, so even a CPU import needs vLLM installed.
+Two things to know before adding to that set:
+
+- Importing *anything* under `tpu_inference.` pulls in vLLM, because
+  `tpu_inference/__init__.py` does. Even an import smoke needs vLLM installed.
+- That is stock PyPI vLLM, not Marin's fork. `tests/models/common/test_model_loader.py`
+  imports a quantization module only the fork ships, so it cannot run on CPU CI;
+  the nightly covers it on the real pinned pair.
 
 ## CI
 
@@ -110,11 +120,18 @@ Two Marin workflows, both prefixed `marin-` to keep them clearly ours:
 - `.github/workflows/marin-ci.yaml` — per-PR, CPU-only, minutes. Delta-scoped
   lint, a vendored-standards drift check, and the CPU tests above. It does not
   invoke upstream's buildkite matrix or upstream's pre-commit hooks.
-- `.github/workflows/marin-nightly.yaml` — nightly TPU end-to-end. Provisions a
-  v5litepod-8 through Iris, installs Marin's pinned vLLM fork plus this repo at
-  HEAD, serves a model, probes the endpoint, and gates the result against
-  `infra/nightly/spec.json`. Also runnable on demand via `workflow_dispatch`.
+- `.github/workflows/marin-e2e-nightly.yaml` — nightly TPU end-to-end (11:00
+  UTC, plus `workflow_dispatch`). Provisions a v5litepod-8 through Iris, installs
+  Marin's pinned vLLM fork plus this repo at the commit under test, serves a
+  model, probes the endpoint, and gates on `infra/nightly/serving-spec.json`.
+  The slice is torn down in an `if: always()` step.
 
 The nightly is the only thing that exercises this repo on real hardware. If you
 change the runner, the model, or the serving path, expect PR CI to stay green and
 the nightly to be the test that tells you the truth.
+
+Upstream's own `pre-commit` workflow also runs on PRs here. It is currently red
+for reasons that predate the Marin CI: upstream's yapf wants to reformat the
+delta files, which were never run through it. Do not "fix" that by reformatting
+them in this repo — the delta is replayed from a Marin overlay on every refresh,
+so the drift would come straight back. It has to be fixed at the overlay source.

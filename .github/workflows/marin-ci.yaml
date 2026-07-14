@@ -1,0 +1,88 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Marin CI
+
+# Per-PR checks for the Marin delta on top of upstream tpu-inference. CPU-only and
+# fast: no TPU, no cluster, no accelerator.
+#
+# This does NOT run upstream's suites. Upstream tests need a real TPU and run in
+# Docker on TPU runners via .buildkite/; upstream's own lint matrix (yapf/isort/ruff)
+# runs from .pre-commit-config.yaml. Both are upstream's business. What is checked
+# here is what Marin owns: the delta files enumerated in [tool.marin-style].
+#
+# The TPU path -- the thing that actually proves this fork serves -- is exercised by
+# marin-nightly.yaml.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: marin-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Keep in step with the rev pinned in infra/pre-commit.py.
+  MARIN_STYLE_REV: 4469660ef1ba6ecd4c8d81bdbb17091bc501a682
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Lint the Marin delta
+        # ruff-check only, scoped by [tool.marin-style] -- see AGENTS.md for why this
+        # fork does not run a formatter over upstream code.
+        run: uv run infra/pre-commit.py --all-files
+
+      - name: Vendored standards are up to date
+        # Fails if .agents/ has drifted from the pinned marin-style rev.
+        run: uvx --from "git+https://github.com/marin-community/marin-style@${MARIN_STYLE_REV}" marin-style sync --check
+
+  cpu-tests:
+    # The Marin delta's tests that do not need a TPU. tests/models/jax/test_grugmoe.py
+    # exercises the JAX GrugMoE model (PP embed-norm handling, expert routing, tied
+    # lm_head logits, artifact-config validation) on CPU.
+    #
+    # tests/models/common/test_model_loader.py is deliberately NOT here: it imports a
+    # quantization module that only Marin's vLLM fork ships, and building that fork is
+    # far too slow for PR CI. The nightly covers it on the real pinned pair.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: infra/cpu-test-requirements.txt
+
+      - name: Install the CPU subset of the TPU stack
+        run: |
+          uv venv --python 3.12
+          uv pip install --torch-backend cpu -r infra/cpu-test-requirements.txt
+
+      - name: GrugMoE model tests
+        run: uv run --no-project python -m pytest tests/models/jax/test_grugmoe.py -q
+
+      - name: Token-decision hook imports
+        # The joint-decode worker imports this module to register its callback; if it
+        # stops importing, the hook is dead. It is pure stdlib, so a CPU import is the
+        # whole contract that can be checked without a TPU.
+        run: uv run --no-project python -c "from tpu_inference.runner import token_decision; assert token_decision.CALLBACK is None"
