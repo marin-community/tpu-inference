@@ -176,3 +176,29 @@ jobs:
         # would leave the slice up. --config is a top-level iris flag, before the
         # subcommand. Stopping a job that already exited is a no-op.
         run: iris --config marin/lib/iris/config/marin.yaml job stop "/$JOB_USER/$JOB_NAME" || true
+
+  # Failure reporting: file or update the [nightly-tpu-e2e] tracking issue, ask
+  # weaverbot to triage (launches a weaver session), and ping Slack. The trigger
+  # and Slack channels each skip with a notice until the WEAVERBOT_GH_TOKEN /
+  # SLACK_WEBHOOK_URL org secrets are provisioned; the issue trail accrues either way.
+  report-failure:
+    needs: [serve-and-probe]
+    # cancelled matters: a job that hits its timeout-minutes reports cancelled, not failure
+    if: >-
+      always() && github.event_name == 'schedule' &&
+      (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write    # file/update the tracking issue
+      actions: read    # pull failed-job logs for the excerpt
+      contents: read
+    steps:
+      - uses: marin-community/marin-style/actions/report-failure@4e5736a7054318af49b0245fadee197f534519d7
+        with:
+          lane: tpu-e2e
+          trigger-token: ${{ secrets.WEAVERBOT_GH_TOKEN }}
+          slack-webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          triage-notes: >-
+            The nightly serves on a Marin TPU slice via Iris with a throughput floor
+            gate. Check for a leftover Iris job; this fork tracks upstream tpu-inference —
+            only the Marin delta is in scope for fixes here.
