@@ -228,12 +228,7 @@ def get_padded_head_dim(head_dim: int) -> int:
 
 
 def get_padded_num_heads(num_heads: int, sharding_size: int) -> int:
-    if num_heads >= sharding_size:
-        assert num_heads % sharding_size == 0
-    else:
-        assert sharding_size % num_heads == 0
-        num_heads = sharding_size
-    return num_heads
+    return align_to(num_heads, sharding_size)
 
 
 def get_dtype_packing(dtype):
