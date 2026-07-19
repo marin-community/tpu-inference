@@ -623,3 +623,57 @@ def test_dp_mamba_global_to_local_conversion():
     assert (7 * local_slots + 1) % local_slots == 1
     # Boundary: rank 1 last slot = 595 → local 297
     assert 595 % local_slots == 297
+
+
+def test_prompt_logprobs_accumulator_preserved_across_readd(
+        input_batch: InputBatch):
+    """A prompt_logprobs request evicted mid-prefill (skipped for a step under
+    token-budget contention) and re-added must keep its accumulator buffer.
+
+    Reallocating on re-add drops the rows already filled for earlier chunks and
+    would emit uninitialized token ids for those prompt positions, surfacing as
+    a KeyError in the completion logprobs echo.
+    """
+    sp = SamplingParams(temperature=0.0, prompt_logprobs=1)
+    req = create_dummy_request("req1",
+                               prompt_len=10,
+                               output_len=0,
+                               sampling_params=sp)
+    req.num_computed_tokens = 0
+
+    input_batch.add_request(req)
+    buf = req.in_progress_prompt_logprobs_cpu
+    assert buf is not None
+    # Mark a row so a wipe is detectable.
+    buf[0][0, 0] = 12345
+
+    # Skipped-then-rescheduled: removed from the batch (state kept in
+    # `requests`), progress advanced, then re-added.
+    input_batch.remove_request("req1")
+    req.num_computed_tokens = 4
+    input_batch.add_request(req)
+
+    assert req.in_progress_prompt_logprobs_cpu is buf
+    assert req.in_progress_prompt_logprobs_cpu[0][0, 0] == 12345
+
+
+def test_prompt_logprobs_accumulator_reallocated_for_fresh_request(
+        input_batch: InputBatch):
+    """A genuinely new request (buffer reset to None after the previous
+    prefill completed) allocates a fresh accumulator."""
+    sp = SamplingParams(temperature=0.0, prompt_logprobs=1)
+    req = create_dummy_request("req1",
+                               prompt_len=10,
+                               output_len=0,
+                               sampling_params=sp)
+    input_batch.add_request(req)
+    first = req.in_progress_prompt_logprobs_cpu
+    assert first is not None
+
+    # Prefill completed: runner resets the buffer to None.
+    input_batch.remove_request("req1")
+    req.in_progress_prompt_logprobs_cpu = None
+    input_batch.add_request(req)
+
+    assert req.in_progress_prompt_logprobs_cpu is not None
+    assert req.in_progress_prompt_logprobs_cpu is not first

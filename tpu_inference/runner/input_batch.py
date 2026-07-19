@@ -399,7 +399,14 @@ class InputBatch:
                          == -1 else sampling_params.prompt_logprobs)
                 self.num_prompt_logprobs[req_id] = num_k
                 n = len(request.prompt_token_ids) - 1
-                if n > 0:
+                # Preserve the accumulator across re-adds. A running multi-chunk
+                # prefill request that is skipped for a step (token-budget
+                # contention) is evicted from the batch and re-added later with
+                # its progress (num_computed_tokens) intact; reallocating here
+                # would drop the rows filled for earlier chunks and emit
+                # uninitialized token ids for those prompt positions. The buffer
+                # is reset to None once prefill completes.
+                if n > 0 and request.in_progress_prompt_logprobs_cpu is None:
                     request.in_progress_prompt_logprobs_cpu = (
                         np.empty((n, num_k + 1), dtype=np.int32),
                         np.empty((n, num_k + 1), dtype=np.float32),
