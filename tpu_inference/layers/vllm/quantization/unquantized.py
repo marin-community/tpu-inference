@@ -27,6 +27,7 @@ from vllm.model_executor.layers import linear as vllm_linear
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (FusedMoEConfig,
                                                   RoutedExperts,
+                                                  RoutingMethodType,
                                                   UnquantizedFusedMoEMethod)
 from vllm.model_executor.layers.quantization import \
     register_quantization_config
@@ -48,8 +49,8 @@ from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.common.utils import general_device_put
 from tpu_inference.layers.vllm.interface.moe import (
     select_moe_backend_from_fused_moe_config, vllm_moe_apply)
-from tpu_inference.layers.vllm.process_weights.cleanup_sharding import \
-    _tensor_is_in_cpu
+from tpu_inference.layers.vllm.process_weights.cleanup_sharding import (
+    _release_tensor_storage, _tensor_is_in_cpu)
 from tpu_inference.layers.vllm.quantization.base import VllmQuantizationMethod
 from tpu_inference.layers.vllm.quantization.configs import (
     VllmQuantConfig, VllmQuantLinearConfig)
@@ -106,7 +107,7 @@ def _load_weight_for_layer(
         # Dummy weights are created directly on the TPU mesh, no CPU→TPU transfer needed
         tensor_shape = tuple(tensor.shape)
         tensor_dtype = tensor.dtype
-        tensor.untyped_storage().resize_(0)
+        _release_tensor_storage(tensor)
         dtype = to_jax_dtype(tensor_dtype)
         return create_dummy_weights_on_tpu(
             sharding=sharding,
@@ -264,7 +265,7 @@ class VllmUnquantizedLinearMethod(vllm_linear.UnquantizedLinearMethod,
         weight = jnp.transpose(weight)
 
         # Free CPU memory immediately
-        layer.weight.untyped_storage().resize_(0)
+        _release_tensor_storage(layer.weight)
         delattr(layer, 'weight')
         if layer.bias is not None and not layer.skip_bias_add:
             if layer.return_bias:
@@ -272,7 +273,7 @@ class VllmUnquantizedLinearMethod(vllm_linear.UnquantizedLinearMethod,
             bias_sharding = NamedSharding(self.linear_config.mesh,
                                           self.linear_config.bias_sharding)
             bias = _load_weight_for_layer(layer, "bias", bias_sharding)
-            layer.bias.untyped_storage().resize_(0)
+            _release_tensor_storage(layer.bias)
             delattr(layer, 'bias')
         else:
             bias = None
@@ -367,7 +368,7 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
 
     @property
     def is_monolithic(self) -> bool:
-        return True
+        return self.moe.routing_method != RoutingMethodType.Custom
 
     def _select_monolithic(self) -> Callable:
         return self.apply_monolithic
@@ -399,16 +400,16 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
         w13_weight = _load_weight_for_layer(layer, "w13_weight", ep_sharding)
         w2_weight = _load_weight_for_layer(layer, "w2_weight", ep_sharding)
         # Free CPU memory immediately
-        layer.w13_weight.untyped_storage().resize_(0)
-        layer.w2_weight.untyped_storage().resize_(0)
+        _release_tensor_storage(layer.w13_weight)
+        _release_tensor_storage(layer.w2_weight)
         delattr(layer, 'w13_weight')
         delattr(layer, 'w2_weight')
 
         if self.moe.has_bias:
             w13_bias = _load_weight_for_layer(layer, "w13_bias", ep_sharding)
             w2_bias = _load_weight_for_layer(layer, "w2_bias", ep_sharding)
-            layer.w13_bias.untyped_storage().resize_(0)
-            layer.w2_bias.untyped_storage().resize_(0)
+            _release_tensor_storage(layer.w13_bias)
+            _release_tensor_storage(layer.w2_bias)
             delattr(layer, 'w13_bias')
             delattr(layer, 'w2_bias')
         else:
@@ -461,3 +462,36 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
                               x=x,
                               router_logits=router_logits,
                               input_ids=input_ids)
+
+    def apply(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run custom vLLM routing before the TPU GMM expert kernel."""
+        if self.is_monolithic:
+            raise RuntimeError("Modular apply requires a custom router")
+        if shared_experts is not None or shared_experts_input is not None:
+            raise NotImplementedError(
+                "TPU custom routing does not support vLLM-managed shared experts"
+            )
+
+        weights = FusedMoEWeights(
+            w13_weight=jax_view(layer.w13_weight),
+            w13_weight_scale=None,
+            w13_bias=jax_view(layer.w13_bias) if self.moe.has_bias else None,
+            w2_weight=jax_view(layer.w2_weight),
+            w2_weight_scale=None,
+            w2_bias=jax_view(layer.w2_bias) if self.moe.has_bias else None,
+        )
+        return vllm_moe_apply(
+            layer=layer,
+            weights=weights,
+            quant_method_instance=self,
+            x=x,
+            router_logits=(topk_weights, topk_ids),
+        )

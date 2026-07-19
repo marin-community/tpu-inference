@@ -634,7 +634,9 @@ class KVCacheManager:
                     self.shared_kv_cache_layers[layer_name] = kv_tgt_layer
                     continue
                 if attn_module.attn_type == AttentionType.DECODER:
-                    num_kv_heads = common_utils.get_padded_num_heads(
+                    # This is the vLLM attention path. Grug can preserve GQA
+                    # groups while padding a non-divisible KV-head count.
+                    num_kv_heads = common_utils.align_to(
                         attn_module.num_kv_heads,
                         self.runner.mesh.shape["model"])
                     head_size = common_utils.get_padded_head_dim(

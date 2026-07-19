@@ -485,7 +485,7 @@ def fused_moe_func(
     w2_scale: jax.Array | None,
     w1_bias: jax.Array | None,
     w2_bias: jax.Array | None,
-    gating_output: jax.Array,
+    gating_output: jax.Array | tuple[jax.Array, jax.Array],
     topk: int,
     renormalize: bool,
     mesh: Mesh,
@@ -529,28 +529,49 @@ def fused_moe_func(
         "The kernel requires num_tokens * topk to be a multiple of "
         f"16 but got {num_tokens}*{topk}={num_tokens*topk}")
 
-    assert gating_output.shape == (num_tokens, global_num_experts)
-
-    topk_weights = apply_scoring_fn(scoring_fn, gating_output)
-    if hash_based_topk_indices is not None:
-        topk_indices = hash_based_topk_indices
-        topk_weights = jnp.take_along_axis(topk_weights, topk_indices, axis=-1)
-    elif envs.MOE_APPROX_TOPK:
-        topk_weights, topk_indices = jax.lax.approx_max_k(
-            topk_weights,
-            k=topk,
-            recall_target=envs.MOE_APPROX_TOPK_RECALL_TARGET)
+    if isinstance(gating_output, tuple):
+        if hash_based_topk_indices is not None:
+            raise ValueError(
+                "Precomputed routing cannot be combined with hash-based routing"
+            )
+        topk_weights, topk_indices = gating_output
+        if topk_weights.shape != (num_tokens, topk):
+            raise ValueError("Precomputed top-k weights must have shape "
+                             f"{(num_tokens, topk)}, got {topk_weights.shape}")
+        if topk_indices.shape != (num_tokens, topk):
+            raise ValueError("Precomputed top-k indices must have shape "
+                             f"{(num_tokens, topk)}, got {topk_indices.shape}")
     else:
-        if expert_score_correction_bias is not None:
-            _, topk_indices = jax.lax.top_k(
-                topk_weights + expert_score_correction_bias[None, :], k=topk)
+        if gating_output.shape != (num_tokens, global_num_experts):
+            raise ValueError(
+                "Router logits must have shape "
+                f"{(num_tokens, global_num_experts)}, got {gating_output.shape}"
+            )
+        topk_weights = apply_scoring_fn(scoring_fn, gating_output)
+        if hash_based_topk_indices is not None:
+            topk_indices = hash_based_topk_indices
             topk_weights = jnp.take_along_axis(topk_weights,
                                                topk_indices,
                                                axis=-1)
+        elif envs.MOE_APPROX_TOPK:
+            topk_weights, topk_indices = jax.lax.approx_max_k(
+                topk_weights,
+                k=topk,
+                recall_target=envs.MOE_APPROX_TOPK_RECALL_TARGET)
         else:
-            topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+            if expert_score_correction_bias is not None:
+                _, topk_indices = jax.lax.top_k(
+                    topk_weights + expert_score_correction_bias[None, :],
+                    k=topk)
+                topk_weights = jnp.take_along_axis(topk_weights,
+                                                   topk_indices,
+                                                   axis=-1)
+            else:
+                topk_weights, topk_indices = jax.lax.top_k(topk_weights,
+                                                           k=topk)
+        if renormalize:
+            topk_weights = topk_weights / topk_weights.sum(axis=-1,
+                                                           keepdims=True)
     # All gathering topk_indices and topk_weights if attention dp is used.
     if get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) > 1:
         topk_indices, topk_weights = all_gather_topk_indices_and_weights(
