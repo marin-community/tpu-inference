@@ -36,7 +36,8 @@ from tpu_inference.kernels.mla.v2.tuned_params import (TuningKey,
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
-from tpu_inference.utils import get_megacore, get_mesh_shape_product
+from tpu_inference.utils import (get_megacore, get_mesh_shape_product,
+                                 get_padded_num_heads)
 
 logger = init_logger(__name__)
 
@@ -348,20 +349,39 @@ def sharded_ragged_paged_attention(
     update_kv_cache: bool = True,
 ):
     """Shards along KV heads."""
-    # Handle GQA/MQA where num_kv_heads < tp_size
-    # We replicate KV heads to match tp_size so that we can shard them evenly.
-    # TODO (ranlihao): This is not performant and introduces extra overhead during inference. We need to handle this during weight loading
+    # Handle Q/KV head counts that do not divide the tensor-parallel mesh.
+    # Divisible GQA/MQA keeps the existing replication path. Otherwise pad
+    # complete GQA groups and slice the dummy query groups from the output.
     tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
+    original_num_q_heads = q.shape[1]
     if tp_size > 1:
+        num_q_heads = q.shape[1]
         num_kv_heads = k.shape[1]
-        if num_kv_heads < tp_size:
-            if tp_size % num_kv_heads != 0:
-                raise ValueError(
-                    f"For GQA/MQA, tp_size {tp_size} must be divisible by num_kv_heads {num_kv_heads}"
-                )
+        if num_q_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"num_q_heads {num_q_heads} must be divisible by "
+                f"num_kv_heads {num_kv_heads}")
+        if (num_kv_heads < tp_size and tp_size % num_kv_heads == 0
+                and num_q_heads % tp_size == 0):
             factor = tp_size // num_kv_heads
             k = jnp.repeat(k, factor, axis=1)
             v = jnp.repeat(v, factor, axis=1)
+        elif num_kv_heads % tp_size != 0 or num_q_heads % tp_size != 0:
+            queries_per_kv = num_q_heads // num_kv_heads
+            padded_num_kv_heads = get_padded_num_heads(
+                num_kv_heads, tp_size)
+            padded_num_q_heads = padded_num_kv_heads * queries_per_kv
+            q = jnp.pad(q,
+                        ((0, 0), (0, padded_num_q_heads - num_q_heads),
+                         (0, 0)))
+            kv_padding = ((0, 0),
+                          (0, padded_num_kv_heads - num_kv_heads), (0, 0))
+            k = jnp.pad(k, kv_padding)
+            v = jnp.pad(v, kv_padding)
+            if attention_sink is not None:
+                attention_sink = jnp.pad(
+                    attention_sink,
+                    ((0, padded_num_q_heads - num_q_heads), ))
 
     qkv_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None)
     kv_cache_spec = P(ShardingAxisName.ATTN_DATA, None,
@@ -414,13 +434,14 @@ def sharded_ragged_paged_attention(
             kwargs["update_kv_cache"] = update_kv_cache
         return func(*args, **kwargs)
 
-    return jax.shard_map(
+    output, updated_kv_cache = jax.shard_map(
         _ragged_paged_attention,
         mesh=mesh,
         in_specs=in_specs,
         out_specs=out_specs,
         check_vma=False,
     )(*args)
+    return output[:, :original_num_q_heads], updated_kv_cache
 
 
 def attention(
