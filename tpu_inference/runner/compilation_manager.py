@@ -1015,11 +1015,14 @@ class CompilationManager:
                                                jnp.float32, logits_sharding)
             token_ids = self._create_dummy_tensor((num_tokens, ), jnp.int32,
                                                   token_ids_sharding)
+            prompt_target_overrides = self._create_dummy_tensor(
+                (num_tokens, ), jnp.int32, token_ids_sharding)
             self._run_compilation(
                 f"worker{self.runner.rank} compute_and_gather_prompt_logprobs",
                 compute_and_gather_prompt_logprobs,
                 logits,
                 token_ids,
+                prompt_target_overrides,
                 self.runner.model_config.max_logprobs,
                 num_tokens=num_tokens,
             )
