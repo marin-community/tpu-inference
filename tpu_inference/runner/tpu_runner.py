@@ -1219,9 +1219,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         else:
             mm_embeds, is_mm_embed = None, None
 
-        if self.is_multimodal_model and self.input_batch.num_prompt_logprobs:
+        # Only genuine multimodal inputs are unsupported here; text-only batches
+        # (mm_embeds is None) compute prompt logprobs fine even on a VL model, so
+        # gate on the batch content rather than model capability -- otherwise
+        # text-only requests (e.g. lm-eval loglikelihood) to a VL model raise in
+        # the engine step loop and kill EngineCore.
+        if mm_embeds is not None and self.input_batch.num_prompt_logprobs:
             raise ValueError(
-                "prompt_logprobs is not supported for multimodal models.")
+                "prompt_logprobs is not supported for multimodal inputs.")
 
         if self.speculative_config and self.input_batch.num_prompt_logprobs:
             raise ValueError(
