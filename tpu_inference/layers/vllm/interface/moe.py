@@ -64,7 +64,8 @@ def vllm_moe_apply(layer: RoutedExperts,
                    weights: FusedMoEWeights,
                    quant_method_instance: FusedMoEMethodBase,
                    x: torch.Tensor,
-                   router_logits: torch.Tensor,
+                   router_logits: torch.Tensor | tuple[torch.Tensor,
+                                                       torch.Tensor],
                    input_ids: torch.Tensor | None = None) -> torch.Tensor:
     """
     Shared function for applying a FusedMoE layer for the TorchAX/vLLM backend.
@@ -122,11 +123,16 @@ def vllm_moe_apply(layer: RoutedExperts,
         extra_kwargs["e_score_correction_bias"] = jax_view(
             layer.e_score_correction_bias)
 
+    if isinstance(router_logits, tuple):
+        gating_output = tuple(jax_view(value) for value in router_logits)
+    else:
+        gating_output = jax_view(router_logits)
+
     return torch_view(
         moe_apply(
             layer=layer,
             x=jax_view(x),
-            gating_output=jax_view(router_logits),
+            gating_output=gating_output,
             weights=weights,
             moe_backend=quant_method_instance.moe_backend,
             mesh=quant_method_instance.mesh,

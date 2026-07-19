@@ -14,10 +14,33 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
-from tpu_inference.layers.vllm.process_weights.cleanup_sharding import \
-    shard_model_to_tpu
+from tpu_inference.layers.vllm.process_weights.cleanup_sharding import (
+    _release_tensor_storage, shard_model_to_tpu)
+
+
+def test_release_tensor_storage_tolerates_non_resizable_streamed_storage():
+    storage = MagicMock()
+    storage.resize_.side_effect = RuntimeError(
+        "Trying to resize storage that is not resizable")
+    tensor = MagicMock()
+    tensor.untyped_storage.return_value = storage
+
+    _release_tensor_storage(tensor)
+
+    storage.resize_.assert_called_once_with(0)
+
+
+def test_release_tensor_storage_propagates_unexpected_errors():
+    storage = MagicMock()
+    storage.resize_.side_effect = RuntimeError("device disappeared")
+    tensor = MagicMock()
+    tensor.untyped_storage.return_value = storage
+
+    with pytest.raises(RuntimeError, match="device disappeared"):
+        _release_tensor_storage(tensor)
 
 
 def test_shard_model_to_tpu_simplification():
