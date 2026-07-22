@@ -263,6 +263,7 @@ class TestComputePromptLogprobs:
         mock_req_state = MagicMock()
         mock_req_state.num_computed_tokens = 0
         mock_req_state.num_prompt_tokens = 3
+        mock_req_state.prompt_token_ids = [0, 1, 2]
         requests = {"req1": mock_req_state}
 
         mock_scheduler_output = MagicMock()
@@ -292,3 +293,103 @@ class TestComputePromptLogprobs:
         assert snap.start_idx == 0
         assert snap.num_logits == 2
         assert snap.is_last_chunk is False
+
+    def test_prompt_logprobs_chunk_boundary_uses_true_next_token(self):
+        """The last row of a non-final prompt chunk must gather the request's
+        real next prompt token, not the neighbouring batch row that ``jnp.roll``
+        would wrap to. Regression for the bursty prompt-logprobs ``KeyError``
+        (a chunk-boundary row dropping the actual prompt token from its top-k).
+        """
+        from unittest.mock import MagicMock
+
+        # full_logits row r predicts the token at prompt position r+1. Give each
+        # row a distinct argmax so the gathered logprobs are checkable.
+        full_logits = jnp.array(
+            [
+                [0.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0],
+            ],
+            dtype=jnp.float32,
+        )
+        # Batch packs req1's 2 scheduled tokens then a neighbouring row (id 5).
+        input_ids = jnp.array([1, 2, 5], dtype=jnp.int32)
+
+        # req1 prompt is [1, 2, 3]; only positions 0..1 are scheduled this step,
+        # so the true target for boundary row 1 is prompt token id 3 (position 2),
+        # which is absent from the batch. Plain roll would target input_ids[2]==5.
+        mock_req_state = MagicMock()
+        mock_req_state.num_computed_tokens = 0
+        mock_req_state.num_prompt_tokens = 3
+        mock_req_state.prompt_token_ids = [1, 2, 3]
+
+        mock_scheduler_output = MagicMock()
+        mock_scheduler_output.num_scheduled_tokens = {"req1": 2}
+
+        res = compute_prompt_logprobs(
+            full_logits=full_logits,
+            input_ids=input_ids,
+            num_prompt_logprobs={"req1": 2},
+            requests={"req1": mock_req_state},
+            scheduler_output=mock_scheduler_output,
+            req_ids_dp={0: ["req1"]},
+            dp_size=1,
+            max_logprobs=2,
+        )
+
+        assert res is not None
+        token_ids = np.asarray(jax.device_get(res.tensors.logprob_token_ids))
+        logprobs = np.asarray(jax.device_get(res.tensors.logprobs))
+
+        # Column 0 holds the actual (prompt) token and its logprob.
+        # Interior row 0 keeps the rolled target: input_ids[1] == 2.
+        assert token_ids[0, 0] == 2
+        # Boundary row 1 must use the real next prompt token (3), not input_ids[2].
+        assert token_ids[1, 0] == 3
+        expected = np.asarray(jax.nn.log_softmax(full_logits, axis=-1))[1, 3]
+        assert np.allclose(logprobs[1, 0], expected, atol=1e-5)
+
+    def test_prompt_logprobs_final_chunk_has_no_override(self):
+        """A final (or unchunked) prompt chunk never reads a token outside the
+        batch, so no boundary override is needed and the rolled target is used.
+        """
+        from unittest.mock import MagicMock
+
+        full_logits = jnp.array(
+            [
+                [1.0, 2.0, 3.0],
+                [3.0, 2.0, 1.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=jnp.float32,
+        )
+        input_ids = jnp.array([0, 1, 2], dtype=jnp.int32)
+
+        # Whole 3-token prompt scheduled at once: num_scheduled(3) > num_remaining(2).
+        mock_req_state = MagicMock()
+        mock_req_state.num_computed_tokens = 0
+        mock_req_state.num_prompt_tokens = 3
+        mock_req_state.prompt_token_ids = [0, 1, 2]
+
+        mock_scheduler_output = MagicMock()
+        mock_scheduler_output.num_scheduled_tokens = {"req1": 3}
+
+        res = compute_prompt_logprobs(
+            full_logits=full_logits,
+            input_ids=input_ids,
+            num_prompt_logprobs={"req1": 2},
+            requests={"req1": mock_req_state},
+            scheduler_output=mock_scheduler_output,
+            req_ids_dp={0: ["req1"]},
+            dp_size=1,
+            max_logprobs=2,
+        )
+
+        assert res is not None
+        snap = res.req_snaps[0]
+        assert snap.is_last_chunk is True
+        assert snap.num_logits == 2
+        token_ids = np.asarray(jax.device_get(res.tensors.logprob_token_ids))
+        # Rows 0..1 keep the rolled targets input_ids[1], input_ids[2].
+        assert token_ids[0, 0] == 1
+        assert token_ids[1, 0] == 2

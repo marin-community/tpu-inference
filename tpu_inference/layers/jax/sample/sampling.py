@@ -17,12 +17,14 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from vllm.v1.outputs import LogprobsTensors
 
 from tpu_inference.layers.common.binary_search import topk_mask, topp_mask
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.common.utils import general_device_put
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
 
@@ -166,10 +168,22 @@ def compute_and_gather_logprobs(
 def compute_and_gather_prompt_logprobs(
     logits: jax.Array,
     input_ids: jax.Array,
+    prompt_target_overrides: jax.Array,
     max_logprobs: int,
 ) -> LogprobsTensors:
-    """Compute logprobs from full logits and gather the requested top-k for prompt tokens."""
+    """Compute logprobs from full logits and gather the requested top-k for prompt tokens.
+
+    The prompt-logprob target for row ``r`` is the next prompt token, i.e.
+    ``input_ids[r + 1]``. That shift is wrong at each request's chunk boundary:
+    the next prompt token lives in a later chunk, not in this packed batch, so a
+    plain roll would target the neighbouring request's first token and drop the
+    real prompt token from the gathered top-k (yielding a ``KeyError`` when the
+    engine looks it up). ``prompt_target_overrides`` holds the correct next
+    token at those boundary rows and ``-1`` everywhere else.
+    """
     prompt_target_ids = jnp.roll(input_ids, -1, axis=0)
+    prompt_target_ids = jnp.where(prompt_target_overrides >= 0,
+                                  prompt_target_overrides, prompt_target_ids)
     return compute_and_gather_logprobs(logits, prompt_target_ids, max_logprobs)
 
 
@@ -190,17 +204,14 @@ def compute_prompt_logprobs(
     if (not num_prompt_logprobs or full_logits is None or input_ids is None):
         return None
 
-    # Gather compact [total_padded_tokens, max_logprobs+1] tensors on TPU and
-    # start async transfer to host (overlaps with next step's execute_model).
-    # We use the statically precompiled max_logprobs instead of the dynamic user max_k
-    # to avoid triggering JAX recompilation. The correct num_k is preserved in req_snaps.
-    prompt_lp_tensors = compute_and_gather_prompt_logprobs(
-        full_logits, input_ids, max_logprobs)
-    prompt_lp_tensors = _jax_logprobs_copy_to_host_async(prompt_lp_tensors)
-
-    # Snapshot all mutable per-request state before update_states(N+1) runs.
+    # Snapshot all mutable per-request state before update_states(N+1) runs, and
+    # collect the chunk-boundary target-token corrections applied by
+    # compute_and_gather_prompt_logprobs.
+    num_tokens = input_ids.shape[0]
     padded_tokens_per_dp = full_logits.shape[0] // dp_size
     req_snaps: List[PromptLogprobsReqSnap] = []
+    override_rows: List[int] = []
+    override_ids: List[int] = []
     if req_ids_dp:
         for dp_rank, req_id_list in req_ids_dp.items():
             dp_token_offset = dp_rank * padded_tokens_per_dp
@@ -213,9 +224,18 @@ def compute_prompt_logprobs(
                     start_idx = req_state.num_computed_tokens
                     num_remaining = req_state.num_prompt_tokens - (start_idx +
                                                                    1)
+                    req_offset = dp_token_offset + local_token_offset
                     if num_scheduled <= num_remaining:
                         num_logits = num_scheduled
                         is_last_chunk = False
+                        # The final row of a non-last chunk predicts the first
+                        # token of this request's next chunk, which is not packed
+                        # into this batch. Supply it explicitly so the roll does
+                        # not target the neighbouring request's token.
+                        override_rows.append(req_offset + num_scheduled - 1)
+                        override_ids.append(
+                            req_state.prompt_token_ids[start_idx +
+                                                       num_scheduled])
                     else:
                         num_logits = num_remaining
                         is_last_chunk = True
@@ -223,13 +243,30 @@ def compute_prompt_logprobs(
                         PromptLogprobsReqSnap(
                             req_id=req_id,
                             req_state=req_state,
-                            req_offset=dp_token_offset + local_token_offset,
+                            req_offset=req_offset,
                             start_idx=start_idx,
                             num_logits=num_logits,
                             is_last_chunk=is_last_chunk,
                             num_k=num_k,
                         ))
                 local_token_offset += num_scheduled
+
+    prompt_target_overrides = np.full((num_tokens, ), -1, dtype=np.int32)
+    if override_rows:
+        prompt_target_overrides[np.asarray(
+            override_rows, dtype=np.int32)] = np.asarray(override_ids,
+                                                         dtype=np.int32)
+    # Match input_ids' sharding so the precompiled gather sees identical avals.
+    prompt_target_overrides = general_device_put(prompt_target_overrides,
+                                                 input_ids.sharding)
+
+    # Gather compact [total_padded_tokens, max_logprobs+1] tensors on TPU and
+    # start async transfer to host (overlaps with next step's execute_model).
+    # We use the statically precompiled max_logprobs instead of the dynamic user max_k
+    # to avoid triggering JAX recompilation. The correct num_k is preserved in req_snaps.
+    prompt_lp_tensors = compute_and_gather_prompt_logprobs(
+        full_logits, input_ids, prompt_target_overrides, max_logprobs)
+    prompt_lp_tensors = _jax_logprobs_copy_to_host_async(prompt_lp_tensors)
 
     return PromptLogprobsAsyncData(tensors=prompt_lp_tensors,
                                    req_snaps=req_snaps)
