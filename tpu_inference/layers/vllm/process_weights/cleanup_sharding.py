@@ -39,6 +39,15 @@ P = PartitionSpec
 logger = init_logger(__name__)
 
 
+def _release_tensor_storage(tensor: torch.Tensor) -> None:
+    """Release owned storage while tolerating read-only streamed tensors."""
+    try:
+        tensor.untyped_storage().resize_(0)
+    except RuntimeError as error:
+        if "storage that is not resizable" not in str(error):
+            raise
+
+
 def shard_model_to_tpu(model: torch.nn.Module,
                        mesh: Mesh) -> dict[str, torchax.torch.Tensor]:
     """
@@ -97,7 +106,7 @@ def _convert_to_torchax_and_shard(tensor: torch.Tensor,
     if vllm_envs.VLLM_TPU_USING_PATHWAYS and isinstance(tensor, torch.Tensor):
         if is_pathways_dummy_load():
             # Generate random values directly on TPU.
-            tensor.untyped_storage().resize_(0)
+            _release_tensor_storage(tensor)
             return torch_view(
                 create_dummy_weights_on_tpu(
                     sharding=sharding,
