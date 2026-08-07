@@ -14,8 +14,8 @@ from torchax.ops.mappings import t2j as ref_t2j
 # Import the functions to be tested
 from tpu_inference.utils import (GBYTES, enable_megacore,
                                  get_jax_dtype_from_str_dtype, get_megacore,
-                                 get_padded_head_dim, hbm_usage_bytes,
-                                 hbm_usage_gb)
+                                 get_padded_head_dim, get_padded_num_heads,
+                                 hbm_usage_bytes, hbm_usage_gb)
 from tpu_inference.utils import t2j as t2j
 
 
@@ -187,6 +187,23 @@ def test_hbm_usage_bytes_pathways_no_arrays(mock_devices, mock_live_arrays):
 def test_get_padded_head_dim(head_dim, expected_padded_head_dim):
     """Tests the get_padded_head_dim function."""
     assert get_padded_head_dim(head_dim) == expected_padded_head_dim
+
+
+@pytest.mark.parametrize("num_heads,sharding_size,expected", [
+    (1, 8, 8),
+    (4, 8, 8),
+    (8, 8, 8),
+    (16, 8, 16),
+])
+def test_get_padded_num_heads(num_heads, sharding_size, expected):
+    assert get_padded_num_heads(num_heads, sharding_size) == expected
+
+
+@pytest.mark.parametrize("num_heads,sharding_size", [(5, 8), (20, 8)])
+def test_get_padded_num_heads_rejects_incompatible_sharding(
+        num_heads, sharding_size):
+    with pytest.raises(AssertionError):
+        get_padded_num_heads(num_heads, sharding_size)
 
 
 def test_get_jax_dtype_from_str_dtype():

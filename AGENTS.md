@@ -45,8 +45,21 @@ Everything Marin adds on top of upstream, as of this writing:
 | `tpu_inference/runner/tpu_runner.py` | Calls that callback from the engine step (hunk in an upstream file). |
 | `tests/models/jax/test_grugmoe.py` | GrugMoE behavior tests. Run on CPU. |
 | `tests/models/common/test_model_loader.py` | GrugMoE loader/registration coverage. Needs Marin's vLLM fork. |
+| `tpu_inference/layers/common/attention_interface.py` | Pads and trims arbitrary-GQA attention projections. |
+| `tpu_inference/layers/common/fused_moe_gmm.py` | Accepts custom routers' precomputed expert assignments. |
+| `tpu_inference/layers/common/moe.py` | Types precomputed custom-router assignments. |
+| `tpu_inference/layers/vllm/interface/moe.py` | Converts precomputed router outputs to JAX arrays. |
+| `tpu_inference/layers/vllm/quantization/unquantized.py` | Uses the modular GMM path for custom routing. |
+| `tpu_inference/layers/vllm/process_weights/cleanup_sharding.py` | Tolerates non-resizable parameter storage during sharding cleanup. |
+| `tests/layers/vllm/test_unquantized.py` | Covers the custom-router modular GMM path. |
+| `tests/layers/common/test_attention_interface.py` | Covers arbitrary-GQA padding and output trimming. |
+| `tests/test_utils.py` | Pins strict generic head-padding validation. |
+| `tests/layers/vllm/process_weights/test_cleanup_sharding.py` | Covers non-resizable parameter storage cleanup. |
 | `requirements.txt` | TorchVision pinned to the pair Marin's vLLM stack resolves. |
 | `setup.py` | Source installs report the selected release version. |
+
+These entries exist only to support the paired Snowball TPU stack. Retain them
+only while that stack requires them.
 
 To see the real delta rather than trusting this table:
 

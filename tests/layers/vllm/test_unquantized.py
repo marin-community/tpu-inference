@@ -29,7 +29,8 @@ from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
                                              init_distributed_environment)
 from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import FusedMoE, RoutingMethodType
+from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                LinearBase,
                                                MergedColumnParallelLinear,
@@ -543,6 +544,109 @@ def test_fused_moe(use_ep, num_devices, num_tokens, intermediate_size,
                                    check_device=False,
                                    atol=1e-1,
                                    rtol=1e-1)
+
+
+class _FixedRouter(BaseRouter):
+
+    @property
+    def routing_method_type(self) -> RoutingMethodType:
+        return RoutingMethodType.Custom
+
+    def _compute_routing(self,
+                         hidden_states,
+                         router_logits,
+                         indices_type,
+                         *,
+                         input_ids=None):
+        del hidden_states, input_ids
+        token_indices = torch.arange(router_logits.shape[0],
+                                     device=router_logits.device)
+        expert_ids = torch.stack(
+            (
+                (token_indices + 1) % self.global_num_experts,
+                (token_indices + 3) % self.global_num_experts,
+            ),
+            dim=-1,
+        )
+        weights = torch.tensor((0.25, 0.75),
+                               dtype=router_logits.dtype,
+                               device=router_logits.device)
+        weights = weights.expand(router_logits.shape[0], -1)
+        if indices_type is not None:
+            expert_ids = expert_ids.to(indices_type)
+        return weights, expert_ids
+
+
+def test_fused_moe_custom_router_preserves_precomputed_weights_and_experts():
+    mesh = test_utils.get_spmd_mesh(jax.local_device_count())
+    num_tokens = 8
+    hidden_size = 128
+    intermediate_size = 128
+    num_experts = 8
+    topk = 2
+    dtype = torch.bfloat16
+    torch.manual_seed(42)
+
+    inputs = torch.randn((num_tokens, hidden_size), dtype=dtype) / 10
+    router_logits = torch.randn((num_tokens, num_experts), dtype=dtype)
+    w1 = torch.randn(
+        (num_experts, 2 * intermediate_size, hidden_size), dtype=dtype) / 10
+    w2 = torch.randn(
+        (num_experts, hidden_size, intermediate_size), dtype=dtype) / 10
+
+    engine_args = EngineArgs(
+        model="Qwen/Qwen2-1.5B-Instruct",
+        max_model_len=64,
+        max_num_batched_tokens=64,
+        max_num_seqs=4,
+    )
+    vllm_config = engine_args.create_engine_config()
+    vllm_config.model_config.dtype = dtype
+    vllm_config.parallel_config = ParallelConfig(
+        tensor_parallel_size=mesh.devices.size,
+        enable_expert_parallel=False,
+    )
+    quant_config = get_tpu_quantization_config(vllm_config, mesh)
+    router = _FixedRouter(top_k=topk, global_num_experts=num_experts)
+    with set_current_vllm_config(vllm_config):
+        fused_moe = FusedMoE(
+            num_experts=num_experts,
+            top_k=topk,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            renormalize=False,
+            tp_size=1,
+            dp_size=1,
+            quant_config=quant_config,
+            router=router,
+        )
+    fused_moe.routed_experts.w13_weight.data = w1
+    fused_moe.routed_experts.w2_weight.data = w2
+
+    topk_weights, topk_ids = router.select_experts(inputs, router_logits)
+    all_expert_hidden = torch.einsum("td,eid->tei", inputs, w1)
+    gate, up = all_expert_hidden.chunk(2, dim=-1)
+    all_expert_output = torch.einsum(
+        "tei,edi->ted", torch.nn.functional.silu(gate) * up, w2)
+    token_indices = torch.arange(num_tokens).unsqueeze(-1)
+    selected_output = all_expert_output[token_indices, topk_ids.long()]
+    expected = torch.sum(selected_output * topk_weights.unsqueeze(-1), dim=1)
+
+    with torchax.default_env(), set_forward_context(
+            None, vllm_config), jax.set_mesh(mesh):
+        quant_method = fused_moe.routed_experts.quant_method
+        assert isinstance(quant_method, VllmUnquantizedFusedMoEMethod)
+        quant_method.process_weights_after_loading(fused_moe.routed_experts)
+        actual = fused_moe(inputs.to("jax"), router_logits.to("jax"))
+        actual = j2t(actual.to(torch.float32)).to(dtype)
+
+    torch.testing.assert_close(
+        expected,
+        actual,
+        check_device=False,
+        atol=2e-2,
+        rtol=2e-2,
+    )
 
 
 @pytest.mark.parametrize("num_devices", [jax.local_device_count()])

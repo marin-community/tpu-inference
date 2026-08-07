@@ -261,11 +261,10 @@ def test_sharded_ragged_paged_attention_gqa_replication(monkeypatch, gqa_mesh):
     assert jnp.array_equal(replicated_v, expected_v)
 
 
-def test_sharded_ragged_paged_attention_gqa_incompatible_raises_error(
-    gqa_mesh, ):
+def test_sharded_ragged_paged_attention_pads_complete_gqa_groups(
+        monkeypatch, gqa_mesh):
     """
-    Tests that a ValueError is raised for GQA when tp_size is not divisible
-    by num_kv_heads.
+    Tests that non-divisible GQA heads are padded without changing real groups.
     """
     # 1. Arrange
     tp_size = gqa_mesh.shape[ShardingAxisName.ATTN_HEAD]
@@ -273,10 +272,11 @@ def test_sharded_ragged_paged_attention_gqa_incompatible_raises_error(
     num_kv_heads = 3  # Incompatible with tp_size=4
     head_dim = 128
 
-    q = jnp.ones((TOTAL_TOKENS, NUM_HEADS, head_dim))
+    num_q_heads = 12
+    q = jnp.ones((TOTAL_TOKENS, num_q_heads, head_dim))
     k = jnp.ones((TOTAL_TOKENS, num_kv_heads, head_dim))
     v = jnp.ones((TOTAL_TOKENS, num_kv_heads, head_dim))
-    kv_cache = jnp.zeros((num_kv_heads, NUM_BLOCKS, BLOCK_SIZE, head_dim))
+    kv_cache = jnp.zeros((tp_size, NUM_BLOCKS, BLOCK_SIZE, head_dim))
     # Other metadata
     kv_lens = jnp.zeros((MAX_NUM_SEQS, ), dtype=jnp.int32)
     page_indices = jnp.zeros((MAX_NUM_SEQS, MAX_BLOCKS_PER_SEQ),
@@ -285,25 +285,38 @@ def test_sharded_ragged_paged_attention_gqa_incompatible_raises_error(
     distribution = jnp.zeros((3, ), dtype=jnp.int32)
     sm_scale = 1.0
 
-    # 2. Act & Assert
-    with pytest.raises(
-            ValueError,
-            match=(f"For GQA/MQA, tp_size {tp_size} must be divisible by "
-                   f"num_kv_heads {num_kv_heads}"),
-    ):
-        sharded_ragged_paged_attention(
-            mesh=gqa_mesh,
-            q=q,
-            k=k,
-            v=v,
-            kv_cache=kv_cache,
-            kv_lens=kv_lens,
-            page_indices=page_indices,
-            cu_q_lens=cu_q_lens,
-            distribution=distribution,
-            attention_sink=None,
-            sm_scale=sm_scale,
-        )
+    def fake_shard_map_call(*args):
+        return jnp.ones_like(args[0]), kv_cache
+
+    mock_shard_map_callable = MagicMock(side_effect=fake_shard_map_call)
+    monkeypatch.setattr("jax.shard_map",
+                        MagicMock(return_value=mock_shard_map_callable))
+
+    output, _ = sharded_ragged_paged_attention(
+        mesh=gqa_mesh,
+        q=q,
+        k=k,
+        v=v,
+        kv_cache=kv_cache,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        attention_sink=None,
+        sm_scale=sm_scale,
+    )
+
+    padded_q, padded_k, padded_v = mock_shard_map_callable.call_args[0][:3]
+    assert padded_q.shape[1] == 16
+    assert padded_k.shape[1] == tp_size
+    assert padded_v.shape[1] == tp_size
+    assert jnp.array_equal(padded_q[:, :num_q_heads], q)
+    assert jnp.array_equal(padded_k[:, :num_kv_heads], k)
+    assert jnp.array_equal(padded_v[:, :num_kv_heads], v)
+    assert jnp.all(padded_q[:, num_q_heads:] == 0)
+    assert jnp.all(padded_k[:, num_kv_heads:] == 0)
+    assert jnp.all(padded_v[:, num_kv_heads:] == 0)
+    assert output.shape == q.shape
 
 
 def _run_sharded_rpa_capturing_kwargs(monkeypatch, gqa_mesh, update_kv_cache):

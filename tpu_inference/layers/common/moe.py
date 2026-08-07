@@ -92,6 +92,10 @@ def moe_apply(
                 activation = "silu_and_mul_with_clamp"
         match moe_backend:
             case MoEBackend.FUSED_MOE:
+                if isinstance(gating_output, tuple):
+                    raise NotImplementedError(
+                        "The fused EP MoE kernel does not support precomputed routing"
+                    )
                 subc_quant_w1_sz = None
                 subc_quant_w2_sz = None
                 if weights.w13_weight_scale is not None and weights.w2_weight_scale is not None:
