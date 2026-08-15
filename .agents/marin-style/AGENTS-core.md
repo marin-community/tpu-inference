@@ -1,4 +1,4 @@
-<!-- Vendored from marin-community/marin-style v0.1.0 — do not edit; re-run `marin-style sync`. -->
+<!-- Vendored from marin-community/marin-style v0.3.1 — do not edit; re-run `marin-style sync`. -->
 
 # Marin Coding Standards (Core)
 
@@ -16,8 +16,10 @@ infra/pre-commit.py --all-files --fix
 - `infra/pre-commit.py` is the required lint entry point. It is a thin shim that
   runs the shared `marin-style` checks. Do not replace it with `uv run pre-commit`.
 - Type checking runs as part of the pre-commit pass; keep type hints passing.
-- Run the lint-review pass (`infra/pre-commit.py --review`) before opening a PR,
-  and fix or answer every finding it reports.
+- Run the lint-review pass (`infra/pre-commit.py --review`) once before opening a
+  PR, and fix or answer every finding it reports. Small, targeted follow-ups do
+  not need another review. Rerun it only when later changes materially alter the
+  branch's design, scope, or risk, or when the user asks for another pass.
 
 ## Communication & Commits
 
@@ -29,10 +31,17 @@ infra/pre-commit.py --all-files --fix
 - Agent *comments* on PRs/issues must begin with `🤖` unless the exact text was
   explicitly approved by the user. This applies to comments only — never put a
   `🤖` marker in a commit message or a PR/issue body.
-- A PR description is the squash-merge commit message: lead with what the change
-  does, no template scaffold (no `Problem`/`Fix`/`Summary`/`Changes` headings),
-  no "Testing"/"Verification" section. Use markdown only when it makes the change
-  clearer for a human, never as boilerplate.
+- All agent-authored commit, PR, and issue titles and bodies must follow
+  `.agents/skills/writing-style/SKILL.md` and its PR or issue guide. Review the
+  exact text that will be published, then apply `ai-writing-donts.md` as a final
+  compression pass. Do not publish raw implementation notes, test narration,
+  prompt-shaped headings, or claims that use emphasis in place of evidence.
+- A PR description is the squash-merge commit message. Keep every fact a future
+  reader needs to understand the behavior and rationale, including measured
+  results and caveats when they affect review. Remove headings, diff narration,
+  and implementation inventories; put extended history in a linked issue,
+  design doc, logbook, or artifact. Follow the `commit` skill
+  (`.agents/skills/commit/SKILL.md`) when committing, pushing, or opening a PR.
 
 ## Ecosystem Costs
 
