@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from resolve_marin_vllm_rev import resolve_vllm_revision
-from serve_and_probe import actual_tpu
+from serve_and_probe import placed_tpu
 
 
 def test_resolve_vllm_revision(tmp_path: Path) -> None:
@@ -39,16 +39,24 @@ def test_resolve_vllm_revision_rejects_missing_pin(tmp_path: Path) -> None:
         resolve_vllm_revision(pin_file)
 
 
-def test_actual_tpu_uses_worker_placement(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_placed_tpu_uses_worker_placement(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(
         "IRIS_WORKER_DEVICE",
         '{"tpu": {"variant": "v6e-8", "topology": "2x4"}}',
     )
 
-    assert actual_tpu("v5litepod-8,v6e-8") == "v6e-8"
+    assert placed_tpu() == "v6e-8"
 
 
-def test_actual_tpu_falls_back_to_request(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_placed_tpu_requires_worker_placement(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("IRIS_WORKER_DEVICE", raising=False)
 
-    assert actual_tpu("v5litepod-8,v6e-8") == "v5litepod-8,v6e-8"
+    with pytest.raises(KeyError, match="IRIS_WORKER_DEVICE"):
+        placed_tpu()
+
+
+def test_placed_tpu_rejects_non_tpu_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("IRIS_WORKER_DEVICE", '{"cpu": {"variant": "cpu"}}')
+
+    with pytest.raises(ValueError, match="does not contain a TPU variant"):
+        placed_tpu()

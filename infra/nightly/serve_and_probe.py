@@ -31,10 +31,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-if __package__:
-    from . import probe
-else:
-    import probe
+import probe
 
 VLLM_FORK = "https://github.com/marin-community/vllm.git"
 TPU_INFERENCE_FORK = "https://github.com/marin-community/tpu-inference.git"
@@ -50,14 +47,13 @@ DTYPE = "bfloat16"
 SHUTDOWN_GRACE = 30.0
 
 
-def actual_tpu(requested_tpu: str) -> str:
-    """Return the TPU type Iris placed this task on, when available."""
-    worker_device = os.environ.get("IRIS_WORKER_DEVICE")
-    if worker_device is None:
-        return requested_tpu
-
-    device = json.loads(worker_device)
-    return device.get("tpu", {}).get("variant") or requested_tpu
+def placed_tpu() -> str:
+    """Return the TPU type Iris placed this task on."""
+    device = json.loads(os.environ["IRIS_WORKER_DEVICE"])
+    tpu = device.get("tpu")
+    if not isinstance(tpu, dict) or not isinstance(tpu.get("variant"), str) or not tpu["variant"]:
+        raise ValueError("IRIS_WORKER_DEVICE does not contain a TPU variant")
+    return tpu["variant"]
 
 
 def serve_command(model: str, vllm_rev: str, tpu_inference_rev: str,
@@ -117,7 +113,6 @@ def main() -> int:
                         required=True,
                         help="This repo's commit -- the code under test")
     parser.add_argument("--tensor-parallel-size", required=True, type=int)
-    parser.add_argument("--tpu", default="", help="Slice type, for provenance")
     parser.add_argument(
         "--record",
         action="store_true",
@@ -141,7 +136,7 @@ def main() -> int:
             model=args.model,
             spec_path=SPEC,
             provenance=probe.Provenance(
-                tpu=actual_tpu(args.tpu),
+                tpu=placed_tpu(),
                 vllm_rev=args.vllm_rev,
                 tpu_inference_rev=args.tpu_inference_rev),
             record=args.record,

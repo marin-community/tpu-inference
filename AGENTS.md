@@ -96,13 +96,14 @@ runners via `.buildkite/`, which GitHub-hosted CI cannot do: no accelerator, and
 `libtpu` is not installable there. Do not add TPU-dependent tests to the Marin
 GitHub workflows.
 
-What does run without a TPU is the GrugMoE model test, against the CPU subset of
-the stack (`infra/cpu-test-requirements.txt`, which is what PR CI installs):
+The GrugMoE model test and the stdlib-only Marin nightly tests run without a TPU,
+against the CPU dependency group that PR CI installs:
 
 ```bash
 uv venv --python 3.12
-uv pip install --torch-backend cpu -r infra/cpu-test-requirements.txt
+uv pip install --group cpu-tests --torch-backend cpu
 uv run --no-project python -m pytest tests/models/jax/test_grugmoe.py
+uv run --no-project python -m pytest infra/nightly/test_nightly.py
 ```
 
 Two things to know before adding to that set:
