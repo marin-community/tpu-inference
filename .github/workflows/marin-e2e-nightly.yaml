@@ -42,11 +42,10 @@ on:
         description: "HF model id to serve"
         default: Qwen/Qwen3-0.6B
       tpu:
-        description: "TPU slice type"
-        default: v5litepod-8
+        description: "Compatible TPU slice types, comma-separated"
+        default: v5litepod-8,v6e-8
       region:
-        description: "Region to pin the slice to"
-        default: europe-west4
+        description: "Optional region to pin the slice to; blank lets Iris choose"
       tensor_parallel_size:
         description: "vLLM tensor-parallel size (must divide the model's head count)"
         default: "8"
@@ -62,8 +61,8 @@ concurrency:
 
 env:
   MODEL: ${{ github.event.inputs.model || 'Qwen/Qwen3-0.6B' }}
-  TPU: ${{ github.event.inputs.tpu || 'v5litepod-8' }}
-  REGION: ${{ github.event.inputs.region || 'europe-west4' }}
+  TPU: ${{ github.event.inputs.tpu || 'v5litepod-8,v6e-8' }}
+  REGION: ${{ github.event.inputs.region || '' }}
   TENSOR_PARALLEL_SIZE: ${{ github.event.inputs.tensor_parallel_size || '8' }}
   # "1" or empty: the job expands it to --record. Passing the flag itself through -e
   # would hand the iris CLI a value that starts with a dash.
@@ -72,6 +71,9 @@ env:
   # from whoever submitted it. Pin both so the teardown step below can name the job.
   JOB_USER: marin-ci
   JOB_NAME: tpu-inference-nightly
+  # Keep the small completion record in one region even when the job and its
+  # local outputs float to wherever Iris finds TPU capacity.
+  RUN_STATUS_PATH: gs://marin-us-central1/tmp/ttl=14d/ci/tpu-inference-nightly-${{ github.run_id }}-${{ github.run_attempt }}/run_status.json
 
 jobs:
   serve-and-probe:
@@ -117,12 +119,8 @@ jobs:
         # Read Marin's current vLLM pin rather than copying the SHA here, so this nightly
         # follows the refresh flow instead of drifting away from it.
         run: |
-          VLLM_REV=$(python3 - <<'PY'
-          import re, pathlib
-          src = pathlib.Path("marin/lib/marin/src/marin/inference/tpu_vllm_pins.py").read_text()
-          print(re.search(r'VLLM_FORK_REV\s*=\s*"([0-9a-f]+)"', src).group(1))
-          PY
-          )
+          VLLM_REV=$(python3 infra/nightly/resolve_marin_vllm_rev.py \
+            marin/lib/marin/src/marin/external_dependencies.py)
           echo "VLLM_REV=$VLLM_REV" >> "$GITHUB_ENV"
           echo "Serving vLLM fork $VLLM_REV with tpu-inference $GITHUB_SHA"
 
@@ -136,6 +134,10 @@ jobs:
         # env the script builds, matching marin-core's isolated TPU-vLLM path.
         run: |
           set -euo pipefail
+          region_args=()
+          if [ -n "$REGION" ]; then
+            region_args=(--region "$REGION")
+          fi
           # --timeout is what actually guarantees the slice comes back. The Iris
           # controller sweeps executing tasks and kills any past started_at + timeout,
           # so it fires even if this runner is hard-killed and the cleanup step below
@@ -149,9 +151,10 @@ jobs:
             --job-name "$JOB_NAME" \
             --user "$JOB_USER" \
             --tpu "$TPU" --enable-extra-resources \
-            --region "$REGION" \
+            "${region_args[@]}" \
             --cpu 8 --memory 64g --disk 100g \
             --timeout 4200 \
+            --run-status-path "$RUN_STATUS_PATH" \
             --no-sync \
             -e MODEL "$MODEL" \
             -e TPU "$TPU" \

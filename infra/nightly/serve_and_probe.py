@@ -25,12 +25,16 @@ ephemeral uvx environment this script builds.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-import probe
+if __package__:
+    from . import probe
+else:
+    import probe
 
 VLLM_FORK = "https://github.com/marin-community/vllm.git"
 TPU_INFERENCE_FORK = "https://github.com/marin-community/tpu-inference.git"
@@ -44,6 +48,16 @@ MAX_NUM_BATCHED_TOKENS = 512
 DTYPE = "bfloat16"
 
 SHUTDOWN_GRACE = 30.0
+
+
+def actual_tpu(requested_tpu: str) -> str:
+    """Return the TPU type Iris placed this task on, when available."""
+    worker_device = os.environ.get("IRIS_WORKER_DEVICE")
+    if worker_device is None:
+        return requested_tpu
+
+    device = json.loads(worker_device)
+    return device.get("tpu", {}).get("variant") or requested_tpu
 
 
 def serve_command(model: str, vllm_rev: str, tpu_inference_rev: str,
@@ -127,7 +141,7 @@ def main() -> int:
             model=args.model,
             spec_path=SPEC,
             provenance=probe.Provenance(
-                tpu=args.tpu,
+                tpu=actual_tpu(args.tpu),
                 vllm_rev=args.vllm_rev,
                 tpu_inference_rev=args.tpu_inference_rev),
             record=args.record,
