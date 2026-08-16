@@ -96,13 +96,14 @@ runners via `.buildkite/`, which GitHub-hosted CI cannot do: no accelerator, and
 `libtpu` is not installable there. Do not add TPU-dependent tests to the Marin
 GitHub workflows.
 
-What does run without a TPU is the GrugMoE model test, against the CPU subset of
-the stack (`infra/cpu-test-requirements.txt`, which is what PR CI installs):
+The GrugMoE model test and the stdlib-only Marin nightly tests run without a TPU,
+against the CPU dependency group that PR CI installs:
 
 ```bash
 uv venv --python 3.12
-uv pip install --torch-backend cpu -r infra/cpu-test-requirements.txt
+uv pip install --group cpu-tests --torch-backend cpu
 uv run --no-project python -m pytest tests/models/jax/test_grugmoe.py
+uv run --no-project python -m pytest infra/nightly/test_nightly.py
 ```
 
 Two things to know before adding to that set:
@@ -121,15 +122,17 @@ Two Marin workflows, both prefixed `marin-` to keep them clearly ours:
   lint, a vendored-standards drift check, and the CPU tests above. It does not
   invoke upstream's buildkite matrix or upstream's pre-commit hooks.
 - `.github/workflows/marin-e2e-nightly.yaml` — nightly TPU end-to-end (11:00
-  UTC, plus `workflow_dispatch`). Provisions a v5litepod-8 through Iris, installs
-  Marin's pinned vLLM fork plus this repo at the commit under test, serves a
-  model, probes the endpoint, and gates on `infra/nightly/serving-spec.json`.
-  The slice is torn down in an `if: always()` step.
+  UTC, plus `workflow_dispatch`). Asks Iris for any compatible 8-chip TPU in any
+  region, installs Marin's pinned vLLM fork plus this repo at the commit under
+  test, serves a model, probes the endpoint, and gates on
+  `infra/nightly/serving-spec.json`. The slice is torn down in an `if: always()`
+  step.
 
 The gate spec is recorded from real hardware, not guessed: dispatch the nightly
 with `record: true` and it prints a fresh spec to the job log for you to commit.
-Re-record it when the model, the slice type, or the prompt set changes — a floor
-recorded against a different setup is not a floor.
+Record on the slowest allowed slice, and re-record when the model, compatible
+slice set, or prompt set changes. The status and gate provenance record which
+slice Iris actually selected.
 
 The nightly is the only thing that exercises this repo on real hardware. If you
 change the runner, the model, or the serving path, expect PR CI to stay green and

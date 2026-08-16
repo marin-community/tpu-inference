@@ -83,6 +83,9 @@ jobs:
       - name: GrugMoE model tests
         run: uv run --no-project python -m pytest tests/models/jax/test_grugmoe.py -q
 
+      - name: Marin nightly workflow tests
+        run: uv run --no-project python -m pytest infra/nightly/test_nightly.py -q
+
       - name: Token-decision hook imports
         # The joint-decode worker imports this module to register its callback; if it
         # stops importing, the hook is dead. It is pure stdlib, so a CPU import is the
