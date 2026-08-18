@@ -131,6 +131,8 @@ def main() -> int:
         help="Rewrite the gate spec from this run instead of gating")
     args = parser.parse_args()
 
+    physical_tpu = placed_tpu()
+    print(f"physical TPU: {physical_tpu}", flush=True)
     command = serve_command(args.model, args.vllm_rev, args.tpu_inference_rev,
                             args.tensor_parallel_size)
     print(f"serving: {' '.join(command)}", flush=True)
@@ -148,7 +150,7 @@ def main() -> int:
             model=args.model,
             spec_path=SPEC,
             provenance=probe.Provenance(
-                tpu=placed_tpu(),
+                tpu=physical_tpu,
                 vllm_rev=args.vllm_rev,
                 tpu_inference_rev=args.tpu_inference_rev),
             record=args.record,
