@@ -25,6 +25,12 @@ import serve_and_probe
 
 VLLM_REV = "1" * 40
 TPU_INFERENCE_REV = "2" * 40
+GATE_SPEC = {
+    "gate": {
+        "min_completions": 8,
+        "min_output_tokens_per_second": 200.0,
+    }
+}
 
 
 def test_resolve_vllm_revision_reads_canonical_pin(tmp_path: Path) -> None:
@@ -81,12 +87,6 @@ def test_serve_command_pins_both_forks_and_slice_size() -> None:
 
 
 def test_gate_failures_accepts_healthy_batch() -> None:
-    spec = {
-        "gate": {
-            "min_completions": 8,
-            "min_output_tokens_per_second": 200.0,
-        }
-    }
     observed = probe.Observed(
         completions=8,
         empty_completions=0,
@@ -94,7 +94,7 @@ def test_gate_failures_accepts_healthy_batch() -> None:
         elapsed=2.0,
     )
 
-    assert probe.gate_failures(spec, observed) == []
+    assert probe.gate_failures(GATE_SPEC, observed) == []
 
 
 @pytest.mark.parametrize(
@@ -121,13 +121,7 @@ def test_gate_failures_accepts_healthy_batch() -> None:
     ],
 )
 def test_gate_failures_rejects_invalid_batch(observed: probe.Observed) -> None:
-    spec = {
-        "gate": {
-            "min_completions": 8,
-            "min_output_tokens_per_second": 200.0,
-        }
-    }
-    assert probe.gate_failures(spec, observed)
+    assert probe.gate_failures(GATE_SPEC, observed)
 
 
 def test_record_spec_preserves_provenance_and_sets_quarter_floor() -> None:
