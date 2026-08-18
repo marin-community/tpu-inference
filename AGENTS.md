@@ -131,8 +131,8 @@ Two Marin workflows, both prefixed `marin-` to keep them clearly ours:
 The gate spec is recorded from real hardware, not guessed: dispatch the nightly
 with `record: true` and it prints a fresh spec to the job log for you to commit.
 Record on the slowest allowed slice, and re-record when the model, compatible
-slice set, or prompt set changes. The status and gate provenance record which
-slice Iris actually selected.
+slice set, or prompt set changes. The workflow log records which slice Iris
+actually selected.
 
 The nightly is the only thing that exercises this repo on real hardware. If you
 change the runner, the model, or the serving path, expect PR CI to stay green and
