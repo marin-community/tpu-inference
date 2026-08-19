@@ -28,6 +28,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (FusedMoEConfig,
                                                   RoutedExperts,
                                                   RoutingMethodType,
+                                                  SharedExperts,
                                                   UnquantizedFusedMoEMethod)
 from vllm.model_executor.layers.quantization import \
     register_quantization_config
@@ -466,7 +467,7 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        shared_experts,
+        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         """Run custom vLLM routing before the TPU GMM expert kernel."""

@@ -575,9 +575,11 @@ def fused_moe_func(
         w2_scale: w2 scale [num_experts, num_blocks, 1, hidden_size]
         w1_bias: optional bias of w1 [num_experts, 1, intermediate_size * 2]
         w2_bias: optional bias of w2 [num_experts, 1, hidden_size]
-        gating_output: routing information of tokens [num_tokens, num_experts]
+        gating_output: router logits [num_tokens, num_experts], or a tuple of
+            final top-k weights and expert indices, each [num_tokens, topk].
         topk: number of experts to choose per token.
-        renormalize: normalize gating_output.
+        renormalize: normalize weights derived from router logits. Precomputed
+            weights already contain the custom router's normalization policy.
         mesh: mesh to perform moe.
         use_ep: use expert parallelism.
         activation: activation function to perform on the output of w1.
@@ -596,6 +598,8 @@ def fused_moe_func(
         f"16 but got {num_tokens}*{topk}={num_tokens*topk}")
 
     if isinstance(gating_output, tuple):
+        # vLLM's modular path has already applied the custom router, including
+        # its normalization policy, before invoking this kernel.
         if hash_based_topk_indices is not None:
             raise ValueError(
                 "Precomputed routing cannot be combined with hash-based routing"

@@ -77,7 +77,8 @@ def vllm_moe_apply(layer: RoutedExperts,
         weights: The FusedMoE weights.
         quant_method_instance: The quantization method instance.
         x: The input tensor.
-        router_logits: The router logits.
+        router_logits: Router logits, or precomputed top-k weights and expert
+            IDs from a custom router.
 
     Returns:
         The output tensor from the MoE fowrard pass.

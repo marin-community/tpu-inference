@@ -277,7 +277,7 @@ def test_sharded_ragged_paged_attention_pads_complete_gqa_groups(
     # 1. Arrange
     tp_size = gqa_mesh.shape[ShardingAxisName.ATTN_HEAD]
     assert tp_size == 4
-    num_kv_heads = 3  # Incompatible with tp_size=4
+    num_kv_heads = 3  # Not divisible by tp_size=4
     head_dim = 128
 
     num_q_heads = 12
