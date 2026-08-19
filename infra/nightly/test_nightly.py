@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
-import json
+from io import BytesIO
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import Request
 
 import pytest
 
@@ -51,23 +53,38 @@ def test_resolve_vllm_revision_rejects_missing_pin(tmp_path: Path) -> None:
         resolve_marin_vllm_rev.resolve_vllm_revision(dependency_file)
 
 
-def test_placed_tpu_reads_iris_worker_device(
+def test_physical_tpu_type_reads_gcp_instance_metadata(
         monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("IRIS_WORKER_DEVICE",
-                       json.dumps({"tpu": {
-                           "variant": "v6e-8"
-                       }}))
+    def urlopen(request: Request, **_: object) -> BytesIO:
+        assert request.get_header("Metadata-flavor") == "Google"
+        return BytesIO(b"v6e-8\n")
 
-    assert serve_and_probe.placed_tpu() == "v6e-8"
+    monkeypatch.setattr(serve_and_probe.urllib.request, "urlopen", urlopen)
+
+    assert serve_and_probe.physical_tpu_type() == "v6e-8"
 
 
-@pytest.mark.parametrize("device", [{}, {"tpu": {}}, {"tpu": {"variant": ""}}])
-def test_placed_tpu_rejects_missing_variant(
-        monkeypatch: pytest.MonkeyPatch, device: dict[str, object]) -> None:
-    monkeypatch.setenv("IRIS_WORKER_DEVICE", json.dumps(device))
+def test_physical_tpu_type_rejects_empty_metadata(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        serve_and_probe.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: BytesIO(),
+    )
 
-    with pytest.raises(ValueError):
-        serve_and_probe.placed_tpu()
+    with pytest.raises(RuntimeError, match="empty physical TPU type"):
+        serve_and_probe.physical_tpu_type()
+
+
+def test_physical_tpu_type_propagates_metadata_failure(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise URLError("unavailable")
+
+    monkeypatch.setattr(serve_and_probe.urllib.request, "urlopen", fail)
+
+    with pytest.raises(URLError, match="unavailable"):
+        serve_and_probe.physical_tpu_type()
 
 
 def test_serve_command_pins_both_forks_and_slice_size() -> None:

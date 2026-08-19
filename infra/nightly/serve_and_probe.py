@@ -25,10 +25,10 @@ ephemeral uvx environment this script builds.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 import probe
@@ -45,15 +45,23 @@ MAX_NUM_BATCHED_TOKENS = 512
 DTYPE = "bfloat16"
 
 SHUTDOWN_GRACE = 30.0
+GCP_TPU_TYPE_URL = (
+    "http://metadata.google.internal/computeMetadata/v1/instance/attributes/"
+    "accelerator-type"
+)
 
 
-def placed_tpu() -> str:
-    """Return the TPU type Iris placed this task on."""
-    device = json.loads(os.environ["IRIS_WORKER_DEVICE"])
-    tpu = device.get("tpu")
-    if not isinstance(tpu, dict) or not isinstance(tpu.get("variant"), str) or not tpu["variant"]:
-        raise ValueError("IRIS_WORKER_DEVICE does not contain a TPU variant")
-    return tpu["variant"]
+def physical_tpu_type() -> str:
+    """Return the physical TPU type reported by GCP instance metadata."""
+    request = urllib.request.Request(
+        GCP_TPU_TYPE_URL,
+        headers={"Metadata-Flavor": "Google"},
+    )
+    with urllib.request.urlopen(request, timeout=2) as response:
+        tpu = response.read().decode().strip()
+    if not tpu:
+        raise RuntimeError("GCP metadata returned an empty physical TPU type")
+    return tpu
 
 
 def serve_command(model: str, vllm_rev: str, tpu_inference_rev: str,
@@ -119,6 +127,8 @@ def main() -> int:
         help="Rewrite the gate spec from this run instead of gating")
     args = parser.parse_args()
 
+    physical_tpu = physical_tpu_type()
+    print(f"physical TPU: {physical_tpu}", flush=True)
     command = serve_command(args.model, args.vllm_rev, args.tpu_inference_rev,
                             args.tensor_parallel_size)
     print(f"serving: {' '.join(command)}", flush=True)
@@ -136,7 +146,7 @@ def main() -> int:
             model=args.model,
             spec_path=SPEC,
             provenance=probe.Provenance(
-                tpu=placed_tpu(),
+                tpu=physical_tpu,
                 vllm_rev=args.vllm_rev,
                 tpu_inference_rev=args.tpu_inference_rev),
             record=args.record,
