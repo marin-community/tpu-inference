@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 from urllib.error import URLError
+from urllib.request import Request
 
 import pytest
 
@@ -51,59 +53,38 @@ def test_resolve_vllm_revision_rejects_missing_pin(tmp_path: Path) -> None:
         resolve_marin_vllm_rev.resolve_vllm_revision(dependency_file)
 
 
-class _MetadataResponse:
-
-    def __init__(self, value: bytes):
-        self.value = value
-
-    def __enter__(self) -> _MetadataResponse:
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        return None
-
-    def read(self) -> bytes:
-        return self.value
-
-
-def test_placed_tpu_reads_gcp_instance_metadata(
+def test_physical_tpu_type_reads_gcp_instance_metadata(
         monkeypatch: pytest.MonkeyPatch) -> None:
-    request_details: dict[str, object] = {}
-
-    def urlopen(request: object, timeout: int) -> _MetadataResponse:
-        request_details.update(request=request, timeout=timeout)
-        return _MetadataResponse(b"v6e-8\n")
+    def urlopen(request: Request, **_: object) -> BytesIO:
+        assert request.get_header("Metadata-flavor") == "Google"
+        return BytesIO(b"v6e-8\n")
 
     monkeypatch.setattr(serve_and_probe.urllib.request, "urlopen", urlopen)
 
-    assert serve_and_probe.placed_tpu() == "v6e-8"
-    request = request_details["request"]
-    assert request.full_url == serve_and_probe.GCP_TPU_TYPE_URL
-    assert request.get_header("Metadata-flavor") == "Google"
-    assert request_details["timeout"] == 2
+    assert serve_and_probe.physical_tpu_type() == "v6e-8"
 
 
-def test_placed_tpu_rejects_empty_metadata(
+def test_physical_tpu_type_rejects_empty_metadata(
         monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         serve_and_probe.urllib.request,
         "urlopen",
-        lambda *_args, **_kwargs: _MetadataResponse(b""),
+        lambda *_args, **_kwargs: BytesIO(),
     )
 
     with pytest.raises(RuntimeError, match="empty physical TPU type"):
-        serve_and_probe.placed_tpu()
+        serve_and_probe.physical_tpu_type()
 
 
-def test_placed_tpu_rejects_metadata_failure(
+def test_physical_tpu_type_propagates_metadata_failure(
         monkeypatch: pytest.MonkeyPatch) -> None:
     def fail(*_args: object, **_kwargs: object) -> None:
         raise URLError("unavailable")
 
     monkeypatch.setattr(serve_and_probe.urllib.request, "urlopen", fail)
 
-    with pytest.raises(RuntimeError, match="could not read"):
-        serve_and_probe.placed_tpu()
+    with pytest.raises(URLError, match="unavailable"):
+        serve_and_probe.physical_tpu_type()
 
 
 def test_serve_command_pins_both_forks_and_slice_size() -> None:

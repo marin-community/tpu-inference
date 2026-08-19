@@ -70,7 +70,7 @@ env:
   # Iris addresses a job as /<user>/<job-name>, and the user prefix otherwise comes
   # from whoever submitted it. Pin both so the teardown step below can name the job.
   JOB_USER: marin-ci
-  JOB_NAME: tpu-inference-nightly
+  JOB_NAME: tpu-inference-nightly-${{ github.run_id }}-${{ github.run_attempt }}
 jobs:
   serve-and-probe:
     runs-on: ubuntu-latest
@@ -148,7 +148,6 @@ jobs:
             --user "$JOB_USER" \
             --tpu "$TPU" --enable-extra-resources \
             "${region_args[@]}" \
-            --priority production \
             --cpu 8 --memory 64g --disk 100g \
             --timeout 4200 \
             --no-sync \

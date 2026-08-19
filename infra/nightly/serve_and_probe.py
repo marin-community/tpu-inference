@@ -28,7 +28,6 @@ import argparse
 import os
 import subprocess
 import sys
-import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -52,17 +51,14 @@ GCP_TPU_TYPE_URL = (
 )
 
 
-def placed_tpu() -> str:
+def physical_tpu_type() -> str:
     """Return the physical TPU type reported by GCP instance metadata."""
     request = urllib.request.Request(
         GCP_TPU_TYPE_URL,
         headers={"Metadata-Flavor": "Google"},
     )
-    try:
-        with urllib.request.urlopen(request, timeout=2) as response:
-            tpu = response.read().decode().strip()
-    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
-        raise RuntimeError("could not read the physical TPU type from GCP metadata") from exc
+    with urllib.request.urlopen(request, timeout=2) as response:
+        tpu = response.read().decode().strip()
     if not tpu:
         raise RuntimeError("GCP metadata returned an empty physical TPU type")
     return tpu
@@ -131,7 +127,7 @@ def main() -> int:
         help="Rewrite the gate spec from this run instead of gating")
     args = parser.parse_args()
 
-    physical_tpu = placed_tpu()
+    physical_tpu = physical_tpu_type()
     print(f"physical TPU: {physical_tpu}", flush=True)
     command = serve_command(args.model, args.vllm_rev, args.tpu_inference_rev,
                             args.tensor_parallel_size)
