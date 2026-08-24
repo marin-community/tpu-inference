@@ -197,4 +197,6 @@ jobs:
           triage-notes: >-
             The nightly serves on a Marin TPU slice via Iris with a throughput floor
             gate. Check for a leftover Iris job; this fork tracks upstream tpu-inference —
-            only the Marin delta is in scope for fixes here.
+            only the Marin delta is in scope for fixes here. A repository-local PR that
+            fixes the tracked failure must end its body with a Fixes link to this issue.
+            Use Part of only when the PR does not restore the lane.
