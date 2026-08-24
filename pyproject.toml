@@ -11,3 +11,48 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Marin coding standards (infra/pre-commit.py). This is an upstream-tracking fork,
+# so the checks are scoped to the files Marin owns: upstream code keeps its own
+# yapf/isort/ruff matrix in .pre-commit-config.yaml and must not be reformatted.
+# `include` is the Marin delta -- extend it when the delta grows.
+[tool.marin-style]
+checks = ["ruff-check"]
+# Match the ruff that upstream's .pre-commit-config.yaml pins, so the two linters
+# never disagree about the same file.
+ruff_version = "0.11.8"
+include = [
+    "tpu_inference/models/jax/grugmoe.py",
+    "tpu_inference/runner/token_decision.py",
+    "tests/models/jax/test_grugmoe.py",
+    "tests/models/common/test_model_loader.py",
+    "infra/**",
+]
+
+# The CPU-only subset of the TPU serving stack: enough to import `tpu_inference` and
+# run the Marin delta's CPU tests on a GitHub-hosted runner. Installed by marin-ci.yaml
+# with `uv pip install --group cpu-tests --torch-backend cpu`, which resolves torch to
+# the CPU wheel instead of the CUDA one.
+#
+# requirements.txt cannot be used for this: it pins libtpu, which needs a TPU.
+#
+# vLLM is not optional even for an import -- tpu_inference/__init__.py pulls it in, so
+# every `tpu_inference.` import needs it. This is stock PyPI vLLM, not Marin's vLLM fork,
+# which is a source build far too slow for PR CI. That gap is why
+# tests/models/common/test_model_loader.py runs in the nightly and not here: it imports a
+# quantization module only the fork ships.
+[dependency-groups]
+cpu-tests = [
+    "jax[cpu]==0.10.1",
+    "flax==0.12.4",
+    "torchax==0.0.11",
+    "qwix==0.1.2",
+    "transformers>=5.8.0",
+    "vllm==0.25.1",
+    "jaxtyping",
+    "numpy",
+    "requests",
+    "safetensors",
+    "pytest",
+    "pytest-mock",
+]
