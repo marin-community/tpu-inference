@@ -67,10 +67,8 @@ def serve_command(model: str, vllm_requirement: str, tpu_inference_rev: str,
                   tensor_parallel_size: int) -> list[str]:
     """Build the command that starts vLLM on the slice.
 
-    This mirrors marin-core's own isolated TPU-vLLM environment (IsolatedTpuVllm:
-    uvx, Marin's selected vLLM release, --torch-backend cpu, VLLM_TARGET_DEVICE=tpu) with one
-    substitution: tpu-inference comes from the commit under test rather than from
-    Marin's pin. That substitution is the entire point of this nightly.
+    Use Marin's selected vLLM release with one substitution: tpu-inference comes
+    from the commit under test rather than the release's direct dependency.
     """
     return [
         "uvx",
