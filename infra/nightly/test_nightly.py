@@ -15,17 +15,15 @@
 from __future__ import annotations
 
 from io import BytesIO
-from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request
 
 import pytest
 
 import probe
-import resolve_marin_vllm_rev
 import serve_and_probe
 
-VLLM_REV = "1" * 40
+VLLM_REQUIREMENT = "vllm @ https://example.invalid/vllm.whl"
 TPU_INFERENCE_REV = "2" * 40
 GATE_SPEC = {
     "gate": {
@@ -33,24 +31,6 @@ GATE_SPEC = {
         "min_output_tokens_per_second": 200.0,
     }
 }
-
-
-def test_resolve_vllm_revision_reads_canonical_pin(tmp_path: Path) -> None:
-    dependency_file = tmp_path / "dependency.py"
-    dependency_file.write_text(
-        'VLLM_FORK_REQUIREMENT = "vllm @ '
-        f'git+https://github.com/marin-community/vllm.git@{VLLM_REV}"\n')
-
-    assert resolve_marin_vllm_rev.resolve_vllm_revision(
-        dependency_file) == VLLM_REV
-
-
-def test_resolve_vllm_revision_rejects_missing_pin(tmp_path: Path) -> None:
-    dependency_file = tmp_path / "dependency.py"
-    dependency_file.write_text("VLLM_FORK_REQUIREMENT = 'vllm'\n")
-
-    with pytest.raises(ValueError):
-        resolve_marin_vllm_rev.resolve_vllm_revision(dependency_file)
 
 
 def test_physical_tpu_type_reads_gcp_instance_metadata(
@@ -87,16 +67,15 @@ def test_physical_tpu_type_propagates_metadata_failure(
         serve_and_probe.physical_tpu_type()
 
 
-def test_serve_command_pins_both_forks_and_slice_size() -> None:
+def test_serve_command_uses_marin_release_and_head_override() -> None:
     command = serve_and_probe.serve_command(
         model="Qwen/Qwen3-0.6B",
-        vllm_rev=VLLM_REV,
+        vllm_requirement=VLLM_REQUIREMENT,
         tpu_inference_rev=TPU_INFERENCE_REV,
         tensor_parallel_size=8,
     )
 
-    assert (
-        f"vllm @ git+{serve_and_probe.VLLM_FORK}@{VLLM_REV}" in command)
+    assert VLLM_REQUIREMENT in command
     assert (f"tpu-inference @ git+{serve_and_probe.TPU_INFERENCE_FORK}"
             f"@{TPU_INFERENCE_REV}" in command)
     assert command[command.index("--tensor-parallel-size") + 1] == "8"
@@ -150,14 +129,14 @@ def test_record_spec_preserves_provenance_and_sets_quarter_floor() -> None:
     )
     provenance = probe.Provenance(
         tpu="v6e-8",
-        vllm_rev=VLLM_REV,
+        vllm_requirement=VLLM_REQUIREMENT,
         tpu_inference_rev=TPU_INFERENCE_REV,
     )
 
     recorded = probe.record_spec(observed, "Qwen/Qwen3-0.6B", provenance)
 
     assert recorded["provenance"]["tpu"] == "v6e-8"
-    assert recorded["provenance"]["vllm_fork_rev"] == VLLM_REV
+    assert recorded["provenance"]["vllm_requirement"] == VLLM_REQUIREMENT
     assert recorded["provenance"][
         "tpu_inference_rev"] == TPU_INFERENCE_REV
     assert recorded["gate"]["min_completions"] == len(probe.PROMPTS)

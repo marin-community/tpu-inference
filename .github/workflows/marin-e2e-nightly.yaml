@@ -14,10 +14,10 @@
 
 name: Marin E2E Nightly
 
-# The real end-to-end test for this fork: provision a TPU, install Marin's pinned vLLM
-# fork together with THIS repo at HEAD, serve a model, probe the endpoint, and gate the
-# result. This repo is the unit under test -- vLLM is pinned to whatever Marin currently
-# pins, so a failure here points at tpu-inference.
+# The real end-to-end test for this fork: provision a TPU, install Marin's selected vLLM
+# release together with THIS repo at HEAD, serve a model, probe the endpoint, and gate the
+# result. This repo is the unit under test -- vLLM is whatever Marin currently serves,
+# so a failure here points at tpu-inference.
 #
 # Runs on a hosted runner and reaches the Iris cluster over GCP. Auth is keyless via
 # Workload Identity Federation: the job's GitHub OIDC token (permissions.id-token: write)
@@ -30,8 +30,8 @@ name: Marin E2E Nightly
 # override that pin, so it can only ever serve the tpu-inference Marin already ships --
 # which is the one thing this test must not do. `iris job run` also has no port/endpoint
 # surface, so the probe runs inside the job against localhost and the job's exit code is
-# the result. This mirrors marin's own IsolatedTpuVllm command, with the tpu-inference
-# rev swapped for the commit under test.
+# the result. This mirrors Marin's own uvx command, with tpu-inference overridden by the
+# commit under test.
 
 on:
   schedule:
@@ -82,7 +82,7 @@ jobs:
       - name: Check out tpu-inference (the commit under test)
         uses: actions/checkout@v4
 
-      - name: Check out marin (Iris cluster config and the vLLM fork pin)
+      - name: Check out marin (Iris cluster config and selected vLLM release)
         uses: actions/checkout@v4
         with:
           repository: marin-community/marin
@@ -111,14 +111,17 @@ jobs:
           uv tool install --prerelease allow marin-core
           echo "$(uv tool dir)/marin-core/bin" >> "$GITHUB_PATH"
 
-      - name: Resolve the vLLM fork pin from marin
-        # Read Marin's current vLLM pin rather than copying the SHA here, so this nightly
-        # follows the refresh flow instead of drifting away from it.
+      - name: Read Marin's selected vLLM requirement
         run: |
-          VLLM_REV=$(python3 infra/nightly/resolve_marin_vllm_rev.py \
-            marin/lib/marin/src/marin/external_dependencies.py)
-          echo "VLLM_REV=$VLLM_REV" >> "$GITHUB_ENV"
-          echo "Serving vLLM fork $VLLM_REV with tpu-inference $GITHUB_SHA"
+          VLLM_REQUIREMENT=$(python3 - <<'PY'
+          import runpy
+
+          pins = runpy.run_path("marin/lib/marin/src/marin/external_dependencies.py")
+          print(pins["VLLM_TPU_RELEASE"].requirement)
+          PY
+          )
+          echo "VLLM_REQUIREMENT=$VLLM_REQUIREMENT" >> "$GITHUB_ENV"
+          echo "Serving Marin's selected vLLM release with tpu-inference $GITHUB_SHA"
 
       - name: Serve on TPU and probe the endpoint
         # This repo is bundled as the Iris job's workspace, so infra/nightly/ arrives on
@@ -152,13 +155,13 @@ jobs:
             --timeout 4200 \
             --no-sync \
             -e MODEL "$MODEL" \
-            -e VLLM_REV "$VLLM_REV" \
+            -e VLLM_REQUIREMENT "$VLLM_REQUIREMENT" \
             -e TPU_INFERENCE_REV "$GITHUB_SHA" \
             -e TENSOR_PARALLEL_SIZE "$TENSOR_PARALLEL_SIZE" \
             -e RECORD "$RECORD" \
             -- bash -lc 'cd "${IRIS_WORKDIR:-.}" && exec python3 infra/nightly/serve_and_probe.py \
               --model "$MODEL" \
-              --vllm-rev "$VLLM_REV" \
+              --vllm-requirement "$VLLM_REQUIREMENT" \
               --tpu-inference-rev "$TPU_INFERENCE_REV" \
               --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" \
               ${RECORD:+--record}'

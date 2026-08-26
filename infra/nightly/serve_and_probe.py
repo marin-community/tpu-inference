@@ -33,7 +33,6 @@ from pathlib import Path
 
 import probe
 
-VLLM_FORK = "https://github.com/marin-community/vllm.git"
 TPU_INFERENCE_FORK = "https://github.com/marin-community/tpu-inference.git"
 
 HOST = "127.0.0.1"
@@ -64,19 +63,19 @@ def physical_tpu_type() -> str:
     return tpu
 
 
-def serve_command(model: str, vllm_rev: str, tpu_inference_rev: str,
+def serve_command(model: str, vllm_requirement: str, tpu_inference_rev: str,
                   tensor_parallel_size: int) -> list[str]:
     """Build the command that starts vLLM on the slice.
 
     This mirrors marin-core's own isolated TPU-vLLM environment (IsolatedTpuVllm:
-    uvx, the vLLM fork, --torch-backend cpu, VLLM_TARGET_DEVICE=tpu) with one
+    uvx, Marin's selected vLLM release, --torch-backend cpu, VLLM_TARGET_DEVICE=tpu) with one
     substitution: tpu-inference comes from the commit under test rather than from
     Marin's pin. That substitution is the entire point of this nightly.
     """
     return [
         "uvx",
         "--from",
-        f"vllm @ git+{VLLM_FORK}@{vllm_rev}",
+        vllm_requirement,
         "--with",
         f"tpu-inference @ git+{TPU_INFERENCE_FORK}@{tpu_inference_rev}",
         "--python",
@@ -114,9 +113,9 @@ def stop(server: subprocess.Popen) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--vllm-rev",
+    parser.add_argument("--vllm-requirement",
                         required=True,
-                        help="Marin's vLLM fork SHA")
+                        help="Marin's selected public vLLM wheel")
     parser.add_argument("--tpu-inference-rev",
                         required=True,
                         help="This repo's commit -- the code under test")
@@ -129,7 +128,7 @@ def main() -> int:
 
     physical_tpu = physical_tpu_type()
     print(f"physical TPU: {physical_tpu}", flush=True)
-    command = serve_command(args.model, args.vllm_rev, args.tpu_inference_rev,
+    command = serve_command(args.model, args.vllm_requirement, args.tpu_inference_rev,
                             args.tensor_parallel_size)
     print(f"serving: {' '.join(command)}", flush=True)
 
@@ -147,7 +146,7 @@ def main() -> int:
             spec_path=SPEC,
             provenance=probe.Provenance(
                 tpu=physical_tpu,
-                vllm_rev=args.vllm_rev,
+                vllm_requirement=args.vllm_requirement,
                 tpu_inference_rev=args.tpu_inference_rev),
             record=args.record,
             is_alive=lambda: server.poll() is None,
