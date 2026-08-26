@@ -28,6 +28,7 @@ import argparse
 import os
 import subprocess
 import sys
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -63,7 +64,8 @@ def physical_tpu_type() -> str:
     return tpu
 
 
-def serve_command(model: str, vllm_requirement: str, tpu_inference_rev: str,
+def serve_command(model: str, vllm_requirement: str, override_path: str,
+                  exclude_newer: str,
                   tensor_parallel_size: int) -> list[str]:
     """Build the command that starts vLLM on the slice.
 
@@ -74,8 +76,10 @@ def serve_command(model: str, vllm_requirement: str, tpu_inference_rev: str,
         "uvx",
         "--from",
         vllm_requirement,
-        "--with",
-        f"tpu-inference @ git+{TPU_INFERENCE_FORK}@{tpu_inference_rev}",
+        "--overrides",
+        override_path,
+        "--exclude-newer",
+        exclude_newer,
         "--python",
         "3.12",
         "--torch-backend",
@@ -114,6 +118,9 @@ def main() -> int:
     parser.add_argument("--vllm-requirement",
                         required=True,
                         help="Marin's selected public vLLM wheel")
+    parser.add_argument("--exclude-newer",
+                        required=True,
+                        help="Marin's dependency cutoff")
     parser.add_argument("--tpu-inference-rev",
                         required=True,
                         help="This repo's commit -- the code under test")
@@ -126,31 +133,36 @@ def main() -> int:
 
     physical_tpu = physical_tpu_type()
     print(f"physical TPU: {physical_tpu}", flush=True)
-    command = serve_command(args.model, args.vllm_requirement, args.tpu_inference_rev,
-                            args.tensor_parallel_size)
-    print(f"serving: {' '.join(command)}", flush=True)
+    with tempfile.NamedTemporaryFile("w", suffix=".txt") as override:
+        override.write(
+            f"tpu-inference @ git+{TPU_INFERENCE_FORK}@{args.tpu_inference_rev}\n")
+        override.flush()
+        command = serve_command(args.model, args.vllm_requirement, override.name,
+                                args.exclude_newer,
+                                args.tensor_parallel_size)
+        print(f"serving: {' '.join(command)}", flush=True)
 
-    # vLLM's logs stream to the job log, which is how a failed serve gets diagnosed.
-    server = subprocess.Popen(command,
-                              env={
-                                  **os.environ, "VLLM_TARGET_DEVICE": "tpu"
-                              },
-                              stdout=sys.stdout,
-                              stderr=sys.stderr)
-    try:
-        return probe.run(
-            base_url=f"http://{HOST}:{PORT}/v1",
-            model=args.model,
-            spec_path=SPEC,
-            provenance=probe.Provenance(
-                tpu=physical_tpu,
-                vllm_requirement=args.vllm_requirement,
-                tpu_inference_rev=args.tpu_inference_rev),
-            record=args.record,
-            is_alive=lambda: server.poll() is None,
-        )
-    finally:
-        stop(server)
+        # vLLM's logs stream to the job log, which is how a failed serve gets diagnosed.
+        server = subprocess.Popen(command,
+                                  env={
+                                      **os.environ, "VLLM_TARGET_DEVICE": "tpu"
+                                  },
+                                  stdout=sys.stdout,
+                                  stderr=sys.stderr)
+        try:
+            return probe.run(
+                base_url=f"http://{HOST}:{PORT}/v1",
+                model=args.model,
+                spec_path=SPEC,
+                provenance=probe.Provenance(
+                    tpu=physical_tpu,
+                    vllm_requirement=args.vllm_requirement,
+                    tpu_inference_rev=args.tpu_inference_rev),
+                record=args.record,
+                is_alive=lambda: server.poll() is None,
+            )
+        finally:
+            stop(server)
 
 
 if __name__ == "__main__":
