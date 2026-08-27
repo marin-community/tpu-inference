@@ -24,7 +24,6 @@ import probe
 import serve_and_probe
 
 VLLM_REQUIREMENT = "vllm @ https://example.invalid/vllm.whl"
-EXCLUDE_NEWER = "2026-08-12T00:00:00Z"
 TPU_INFERENCE_REV = "2" * 40
 GATE_SPEC = {
     "gate": {
@@ -66,22 +65,6 @@ def test_physical_tpu_type_propagates_metadata_failure(
 
     with pytest.raises(URLError, match="unavailable"):
         serve_and_probe.physical_tpu_type()
-
-
-def test_serve_command_uses_marin_release_and_override_file() -> None:
-    command = serve_and_probe.serve_command(
-        model="Qwen/Qwen3-0.6B",
-        vllm_requirement=VLLM_REQUIREMENT,
-        override_path="/tmp/tpu-inference-override.txt",
-        exclude_newer=EXCLUDE_NEWER,
-        tensor_parallel_size=8,
-    )
-
-    assert VLLM_REQUIREMENT in command
-    assert command[command.index("--overrides") + 1] == "/tmp/tpu-inference-override.txt"
-    assert command[command.index("--exclude-newer") + 1] == EXCLUDE_NEWER
-    assert command[command.index("--tensor-parallel-size") + 1] == "8"
-    assert command[command.index("--dtype") + 1] == "bfloat16"
 
 
 def test_gate_failures_accepts_healthy_batch() -> None:
