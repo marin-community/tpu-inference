@@ -69,8 +69,7 @@ def serve_command(model: str, vllm_requirement: str, override_path: str,
                   tensor_parallel_size: int) -> list[str]:
     """Build the command that starts vLLM on the slice.
 
-    Use Marin's selected vLLM release with one substitution: tpu-inference comes
-    from the commit under test rather than the release's direct dependency.
+    Use Marin's selected vLLM release with the supplied dependency override.
     """
     return [
         "uvx",
