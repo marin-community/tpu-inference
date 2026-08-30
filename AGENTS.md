@@ -60,11 +60,12 @@ upstream-owned even though they are not on `upstream/main`.
 
 ### Pairing with the vLLM fork
 
-This fork is used together with Marin's vLLM fork: tpu-inference provides the TPU
-backend, vLLM provides the engine, and the two are refreshed and pinned as a pair
-from the Marin repo. A change here that needs a matching vLLM change is not
-complete until both SHAs move together. `tests/models/common/test_model_loader.py`
-depends on the vLLM fork, which is why it cannot run against stock PyPI vLLM.
+This fork is released together with Marin's vLLM fork: tpu-inference provides the
+TPU backend, vLLM provides the engine, and Marin selects one public TPU vLLM wheel
+requirement whose metadata selects the compatible tpu-inference wheel. Producing
+a new public pair requires reviewed compatible source tips from both forks.
+`tests/models/common/test_model_loader.py` depends on the vLLM fork, which is why
+it cannot run against stock PyPI vLLM.
 
 ## Development
 
@@ -122,11 +123,12 @@ Two Marin workflows, both prefixed `marin-` to keep them clearly ours:
   lint, a vendored-standards drift check, and the CPU tests above. It does not
   invoke upstream's buildkite matrix or upstream's pre-commit hooks.
 - `.github/workflows/marin-e2e-nightly.yaml` — nightly TPU end-to-end (11:00
-  UTC, plus `workflow_dispatch`). Asks Iris for any compatible 8-chip TPU in any
-  region, installs Marin's pinned vLLM fork plus this repo at the commit under
-  test, serves a model, probes the endpoint, and gates on
-  `infra/nightly/serving-spec.json`. The slice is torn down in an `if: always()`
-  step.
+  UTC, plus `workflow_dispatch`). It reads Marin's public TPU vLLM requirement
+  and dependency cutoff, then replaces only the companion tpu-inference wheel
+  with this repository's exact HEAD through `uvx --overrides`. It asks Iris for
+  any compatible 8-chip TPU in any region, serves a model, probes the endpoint,
+  and gates on `infra/nightly/serving-spec.json`. The slice is torn down in an
+  `if: always()` step.
 
 The gate spec is recorded from real hardware, not guessed: dispatch the nightly
 with `record: true` and it prints a fresh spec to the job log for you to commit.

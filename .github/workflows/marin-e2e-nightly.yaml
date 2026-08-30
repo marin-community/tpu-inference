@@ -14,10 +14,10 @@
 
 name: Marin E2E Nightly
 
-# The real end-to-end test for this fork: provision a TPU, install Marin's selected vLLM
-# release together with THIS repo at HEAD, serve a model, probe the endpoint, and gate the
-# result. This repo is the unit under test -- vLLM is whatever Marin currently serves,
-# so a failure here points at tpu-inference.
+# The real end-to-end test for this fork: provision a TPU, read Marin's selected public
+# vLLM requirement and dependency cutoff, replace only its companion tpu-inference wheel
+# with THIS repo at HEAD through uvx --overrides, serve a model, probe the endpoint, and
+# gate the result. This repo is the unit under test.
 #
 # Runs on a hosted runner and reaches the Iris cluster over GCP. Auth is keyless via
 # Workload Identity Federation: the job's GitHub OIDC token (permissions.id-token: write)
@@ -25,13 +25,12 @@ name: Marin E2E Nightly
 # Qwen3-0.6B is public, so no HF token is needed; a gated model would need one forwarded
 # into the Iris job.
 #
-# Why a plain Iris job rather than marin-serve: marin-serve pins tpu-inference itself
-# (marin-core's tpu_vllm_pins.py, or the marin workspace lock) and exposes no flag to
-# override that pin, so it can only ever serve the tpu-inference Marin already ships --
-# which is the one thing this test must not do. `iris job run` also has no port/endpoint
-# surface, so the probe runs inside the job against localhost and the job's exit code is
-# the result. This mirrors Marin's own uvx command, with tpu-inference overridden by the
-# commit under test.
+# Why a plain Iris job rather than marin-serve: marin-serve consumes the released pair
+# and exposes no flag to replace its companion, while this test must exercise the exact
+# tpu-inference commit under test. `iris job run` also has no port/endpoint surface, so
+# the probe runs inside the job against localhost and the job's exit code is the result.
+# This mirrors Marin's isolated uvx command, with tpu-inference replaced through an
+# override at the commit under test.
 
 on:
   schedule:
