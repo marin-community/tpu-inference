@@ -28,12 +28,12 @@ import argparse
 import os
 import subprocess
 import sys
+import tempfile
 import urllib.request
 from pathlib import Path
 
 import probe
 
-VLLM_FORK = "https://github.com/marin-community/vllm.git"
 TPU_INFERENCE_FORK = "https://github.com/marin-community/tpu-inference.git"
 
 HOST = "127.0.0.1"
@@ -64,21 +64,21 @@ def physical_tpu_type() -> str:
     return tpu
 
 
-def serve_command(model: str, vllm_rev: str, tpu_inference_rev: str,
+def serve_command(model: str, vllm_requirement: str, override_path: str,
+                  exclude_newer: str,
                   tensor_parallel_size: int) -> list[str]:
     """Build the command that starts vLLM on the slice.
 
-    This mirrors marin-core's own isolated TPU-vLLM environment (IsolatedTpuVllm:
-    uvx, the vLLM fork, --torch-backend cpu, VLLM_TARGET_DEVICE=tpu) with one
-    substitution: tpu-inference comes from the commit under test rather than from
-    Marin's pin. That substitution is the entire point of this nightly.
+    Use Marin's selected vLLM release with the supplied dependency override.
     """
     return [
         "uvx",
         "--from",
-        f"vllm @ git+{VLLM_FORK}@{vllm_rev}",
-        "--with",
-        f"tpu-inference @ git+{TPU_INFERENCE_FORK}@{tpu_inference_rev}",
+        vllm_requirement,
+        "--overrides",
+        override_path,
+        "--exclude-newer",
+        exclude_newer,
         "--python",
         "3.12",
         "--torch-backend",
@@ -114,9 +114,12 @@ def stop(server: subprocess.Popen) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--vllm-rev",
+    parser.add_argument("--vllm-requirement",
                         required=True,
-                        help="Marin's vLLM fork SHA")
+                        help="Marin's selected public vLLM wheel")
+    parser.add_argument("--exclude-newer",
+                        required=True,
+                        help="Marin's dependency cutoff")
     parser.add_argument("--tpu-inference-rev",
                         required=True,
                         help="This repo's commit -- the code under test")
@@ -129,31 +132,36 @@ def main() -> int:
 
     physical_tpu = physical_tpu_type()
     print(f"physical TPU: {physical_tpu}", flush=True)
-    command = serve_command(args.model, args.vllm_rev, args.tpu_inference_rev,
-                            args.tensor_parallel_size)
-    print(f"serving: {' '.join(command)}", flush=True)
+    with tempfile.NamedTemporaryFile("w", suffix=".txt") as override:
+        override.write(
+            f"tpu-inference @ git+{TPU_INFERENCE_FORK}@{args.tpu_inference_rev}\n")
+        override.flush()
+        command = serve_command(args.model, args.vllm_requirement, override.name,
+                                args.exclude_newer,
+                                args.tensor_parallel_size)
+        print(f"serving: {' '.join(command)}", flush=True)
 
-    # vLLM's logs stream to the job log, which is how a failed serve gets diagnosed.
-    server = subprocess.Popen(command,
-                              env={
-                                  **os.environ, "VLLM_TARGET_DEVICE": "tpu"
-                              },
-                              stdout=sys.stdout,
-                              stderr=sys.stderr)
-    try:
-        return probe.run(
-            base_url=f"http://{HOST}:{PORT}/v1",
-            model=args.model,
-            spec_path=SPEC,
-            provenance=probe.Provenance(
-                tpu=physical_tpu,
-                vllm_rev=args.vllm_rev,
-                tpu_inference_rev=args.tpu_inference_rev),
-            record=args.record,
-            is_alive=lambda: server.poll() is None,
-        )
-    finally:
-        stop(server)
+        # vLLM's logs stream to the job log, which is how a failed serve gets diagnosed.
+        server = subprocess.Popen(command,
+                                  env={
+                                      **os.environ, "VLLM_TARGET_DEVICE": "tpu"
+                                  },
+                                  stdout=sys.stdout,
+                                  stderr=sys.stderr)
+        try:
+            return probe.run(
+                base_url=f"http://{HOST}:{PORT}/v1",
+                model=args.model,
+                spec_path=SPEC,
+                provenance=probe.Provenance(
+                    tpu=physical_tpu,
+                    vllm_requirement=args.vllm_requirement,
+                    tpu_inference_rev=args.tpu_inference_rev),
+                record=args.record,
+                is_alive=lambda: server.poll() is None,
+            )
+        finally:
+            stop(server)
 
 
 if __name__ == "__main__":

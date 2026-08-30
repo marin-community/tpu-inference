@@ -72,7 +72,7 @@ class Provenance:
     """What was served, recorded into a spec so a floor can be traced to a run."""
 
     tpu: str
-    vllm_rev: str
+    vllm_requirement: str
     tpu_inference_rev: str
 
 
@@ -201,7 +201,7 @@ def record_spec(observed: Observed, model: str,
     recorded = {
         "model": model,
         "tpu": provenance.tpu,
-        "vllm_fork_rev": provenance.vllm_rev,
+        "vllm_requirement": provenance.vllm_requirement,
         "tpu_inference_rev": provenance.tpu_inference_rev,
         "prompts": len(PROMPTS),
         "max_tokens": MAX_TOKENS,
@@ -283,16 +283,16 @@ def main() -> int:
     parser.add_argument("--tpu",
                         default="",
                         help="Slice type, recorded as provenance")
-    parser.add_argument("--vllm-rev",
+    parser.add_argument("--vllm-requirement",
                         default="",
-                        help="vLLM fork SHA, recorded as provenance")
+                        help="vLLM requirement, recorded as provenance")
     parser.add_argument("--tpu-inference-rev",
                         default="",
                         help="This repo's SHA, as provenance")
     args = parser.parse_args()
 
     provenance = Provenance(tpu=args.tpu,
-                            vllm_rev=args.vllm_rev,
+                            vllm_requirement=args.vllm_requirement,
                             tpu_inference_rev=args.tpu_inference_rev)
     return run(base_url=args.base_url,
                model=args.model,
