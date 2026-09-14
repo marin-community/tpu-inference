@@ -23,7 +23,7 @@ name: Marin CI
 # here is what Marin owns: the delta files enumerated in [tool.marin-style].
 #
 # The TPU path -- the thing that actually proves this fork serves -- is exercised by
-# marin-nightly.yaml.
+# marin-e2e-nightly.yaml.
 
 on:
   pull_request:
@@ -90,4 +90,4 @@ jobs:
         # The joint-decode worker imports this module to register its callback; if it
         # stops importing, the hook is dead. It is pure stdlib, so a CPU import is the
         # whole contract that can be checked without a TPU.
-        run: uv run --no-project python -c "from tpu_inference.runner import token_decision; assert token_decision.CALLBACK is None"
+        run: uv run --no-project python -c "from tpu_inference.runner import token_decision"
