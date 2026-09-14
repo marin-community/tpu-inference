@@ -217,6 +217,7 @@ setup_environment() {
 
   # Build with specific hash and 'latest' tag for convenience
   docker build \
+      --build-arg VLLM_REPO="${VLLM_REPO:-https://github.com/vllm-project/vllm.git}" \
       --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}" \
       --build-arg IS_TEST="true" \
       --build-arg BM_INFRA="${BM_INFRA:-false}" \
