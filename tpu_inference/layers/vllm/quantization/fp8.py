@@ -54,6 +54,7 @@ from tpu_inference.layers.vllm.process_weights.cleanup_sharding import \
 from tpu_inference.layers.vllm.quantization.base import VllmQuantizationMethod
 from tpu_inference.layers.vllm.quantization.configs import (
     VllmQuantConfig, VllmQuantLinearConfig)
+from tpu_inference.layers.vllm.quantization.host_storage import free_torch_storage
 from tpu_inference.layers.vllm.quantization.unquantized import (
     VllmUnquantizedFusedMoEMethod, VllmUnquantizedLinearMethod,
     _load_weight_for_layer)
@@ -62,22 +63,6 @@ from tpu_inference.logger import init_logger
 P = PartitionSpec
 
 logger = init_logger(__name__)
-
-
-# TODO: Use custom op with overriding weight loading class so we will have a better
-# and cleaner interface.
-def _free_torch_storage(tensor: Optional[torch.Tensor]) -> None:
-    """Safely frees the underlying CPU memory storage of a PyTorch tensor.
-
-    Tries `untyped_storage().resize_(0)` first, with fallback to `set_(torch.storage.UntypedStorage())`
-    for 0-dim scalars or float8 dtypes that cannot be resized in-place.
-    """
-    if tensor is None:
-        return
-    try:
-        tensor.untyped_storage().resize_(0)
-    except Exception:
-        tensor.set_(torch.storage.UntypedStorage())
 
 
 def _release_host_memory() -> None:
@@ -225,7 +210,7 @@ class VllmFp8LinearMethod(
 
         weight = _load_weight_for_layer(layer, "weight", loading_sharding)
         weight = jnp.transpose(weight)
-        _free_torch_storage(p_weight)
+        free_torch_storage(p_weight)
         delattr(layer, "weight")
 
         if self.block_quant:
@@ -239,7 +224,7 @@ class VllmFp8LinearMethod(
             weight_scale = _load_weight_for_layer(layer, "weight_scale_inv",
                                                   loading_sharding)
             weight_scale = jnp.transpose(weight_scale)
-            _free_torch_storage(layer.weight_scale_inv)
+            free_torch_storage(layer.weight_scale_inv)
             delattr(layer, "weight_scale_inv")
         else:
             weight_scale_tensor = layer.weight_scale
@@ -250,7 +235,7 @@ class VllmFp8LinearMethod(
             scale_sharding = NamedSharding(self.linear_config.mesh, P(None))
             weight_scale = _load_weight_for_layer(layer, "weight_scale",
                                                   scale_sharding)
-            _free_torch_storage(layer.weight_scale)
+            free_torch_storage(layer.weight_scale)
             delattr(layer, "weight_scale")
 
         if layer.bias is not None and not layer.skip_bias_add:
@@ -491,10 +476,10 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
         )
 
         # Free CPU memory now that weights have been safely transferred to TPU
-        _free_torch_storage(layer.w13_weight)
-        _free_torch_storage(layer.w2_weight)
-        _free_torch_storage(p_w13_scale)
-        _free_torch_storage(p_w2_scale)
+        free_torch_storage(layer.w13_weight)
+        free_torch_storage(layer.w2_weight)
+        free_torch_storage(p_w13_scale)
+        free_torch_storage(p_w2_scale)
         delattr(layer, "w13_weight")
         delattr(layer, "w2_weight")
         delattr(layer, scale_w13_name)
