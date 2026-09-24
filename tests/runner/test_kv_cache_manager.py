@@ -372,7 +372,7 @@ class TestKVCacheManager:
         assert spec.num_kv_heads == 1
         assert spec.head_size == expected_head_size
 
-    def test_get_kv_cache_spec_pads_snowball_kv_heads_for_tp8(self):
+    def test_get_kv_cache_spec_pads_five_kv_heads_for_tp8(self):
         devices = np.array(jax.devices()[:1] * 8)
         self.runner.mesh = jax.sharding.Mesh(devices.reshape((1, 8)),
                                              ('data', 'model'))

@@ -270,7 +270,8 @@ def test_sharded_ragged_paged_attention_gqa_replication(monkeypatch, gqa_mesh):
     assert jnp.array_equal(replicated_v, expected_v)
 
 
-def test_sharded_ragged_paged_attention_pads_snowball_gqa(monkeypatch):
+def test_sharded_ragged_paged_attention_pads_nondivisible_gqa_for_tp8(
+        monkeypatch):
     """Pad complete 20:5 GQA groups for TP8, then trim dummy query heads."""
     devices = np.array(jax.local_devices()[:1] * 8)
     mesh = Mesh(devices.reshape((1, 8)),
