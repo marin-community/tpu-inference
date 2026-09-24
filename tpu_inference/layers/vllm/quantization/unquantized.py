@@ -28,6 +28,7 @@ from vllm.model_executor.layers import linear as vllm_linear
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (FusedMoEConfig,
                                                   RoutedExperts,
+                                                  RoutingMethodType,
                                                   UnquantizedFusedMoEMethod)
 from vllm.model_executor.layers.quantization import \
     register_quantization_config
@@ -409,7 +410,7 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
 
     @property
     def is_monolithic(self) -> bool:
-        return True
+        return self.moe.routing_method != RoutingMethodType.Custom
 
     def _select_monolithic(self) -> Callable:
         return self.apply_monolithic
@@ -503,3 +504,36 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
                               x=x,
                               router_logits=router_logits,
                               input_ids=input_ids)
+
+    def apply(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Pass custom vLLM expert selection to the TPU GMM kernel."""
+        if self.is_monolithic:
+            raise RuntimeError("Modular apply requires a custom router")
+        if shared_experts is not None or shared_experts_input is not None:
+            raise NotImplementedError(
+                "TPU custom routing does not support vLLM-managed shared experts"
+            )
+
+        weights = FusedMoEWeights(
+            w13_weight=jax_view(layer.w13_weight),
+            w13_weight_scale=None,
+            w13_bias=jax_view(layer.w13_bias) if self.moe.has_bias else None,
+            w2_weight=jax_view(layer.w2_weight),
+            w2_weight_scale=None,
+            w2_bias=jax_view(layer.w2_bias) if self.moe.has_bias else None,
+        )
+        return vllm_moe_apply(
+            layer=layer,
+            weights=weights,
+            quant_method_instance=self,
+            x=x,
+            router_logits=(topk_weights, topk_ids),
+        )
