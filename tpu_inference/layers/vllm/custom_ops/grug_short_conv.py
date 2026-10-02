@@ -4,8 +4,8 @@
 """Torchax bridge for the Grug short-convolution custom op."""
 
 import torch
-import torchax
 from torchax.interop import jax_view, torch_view
+from torchax.ops import ops_registry
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.grugmoe import GrugMoeShortConv
 
@@ -52,4 +52,9 @@ def grug_short_conv_tpu(inputs: torch.Tensor, output: torch.Tensor, layer_name: 
 
 def register_grug_short_conv() -> None:
     """Register the mutating Torchax op after the Marin Grug model defines it."""
-    torchax.default_env().override_op_definition(torch.ops.vllm.grug_moe_short_conv.default, grug_short_conv_tpu)
+    # Model-registry subprocesses load plugins before inspecting model classes.
+    # Register globally without constructing an Environment (which owns a JAX PRNG).
+    ops_registry.register_torch_dispatch_op(
+        torch.ops.vllm.grug_moe_short_conv.default, grug_short_conv_tpu,
+        is_jax_function=False, is_user_defined=True,
+    )
