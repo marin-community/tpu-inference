@@ -1329,22 +1329,14 @@ class TestKVCacheManager:
                                     *,
                                     attn_page,
                                     unpadded_mamba,
-                                    num_attn_groups=1,
-                                    num_mamba_groups=3,
                                     num_attn_layers=15,
-                                    num_mamba_layers=45,
-                                    group_size=15):
+                                    num_mamba_layers=45):
         """Helper: invoke `_maybe_set_compact_mamba_num_blocks_override` with
         the Qwen3.5-shaped layer counts (15 attn + 45 mamba layers, grouped
         into 1 attn group + 3 mamba groups, 15 layers per kv-cache group)."""
         manager._maybe_set_compact_mamba_num_blocks_override(
-            attn_page_size_bytes=attn_page,
-            unpadded_mamba_page_size_bytes=unpadded_mamba,
-            num_attn_groups=num_attn_groups,
-            num_mamba_groups=num_mamba_groups,
-            num_attn_layers=num_attn_layers,
-            num_mamba_layers=num_mamba_layers,
-            group_size=group_size,
+            attention_bytes_per_block=num_attn_layers * attn_page,
+            mamba_bytes_per_slot=num_mamba_layers * unpadded_mamba,
         )
 
     def test_compact_mamba_override_caps_mamba_at_max_num_reqs(self):
