@@ -51,7 +51,10 @@ def test_replicated_linear_releases_host_storage(tmp_path, dtype, numpy_shared):
     inputs = torch.randn(8, 128, dtype=dtype) / 10
     weight = torch.randn(16, 128, dtype=dtype) / 20
     bias = torch.randn(16, dtype=dtype) / 20
-    expected = torch.nn.functional.linear(inputs, weight, bias).float()
+    expected_weight = weight.T.clone()
+    expected_bias = bias.clone()
+    # The TPU linear path rounds matmul to its output dtype before adding bias.
+    expected = (torch.nn.functional.linear(inputs, weight) + bias).float()
     with set_current_vllm_config(config):
         init_distributed_environment(
             1,
@@ -74,8 +77,13 @@ def test_replicated_linear_releases_host_storage(tmp_path, dtype, numpy_shared):
         # The byte view also covers BF16, which NumPy cannot represent directly.
         linear.weight.detach().view(torch.uint8).numpy()
         linear.bias.detach().view(torch.uint8).numpy()
-    with torchax.default_env(), jax.set_mesh(mesh):
+    # Isolate storage transfer from TPU's default reduced-precision FP32 matmul.
+    with torchax.default_env(), jax.set_mesh(mesh), \
+            jax.default_matmul_precision("highest"):
         linear.quant_method.process_weights_after_loading(linear)
+        actual_weight = j2t(linear.weight.to(torch.float32)).to(dtype)
+        actual_bias = j2t(linear.bias.to(torch.float32)).to(dtype)
         actual = j2t(linear(inputs.to("jax")).to(torch.float32))
-    # Compare BF16 accumulation with the established linear-layer tolerances.
+    torch.testing.assert_close(actual_weight, expected_weight, atol=0, rtol=0)
+    torch.testing.assert_close(actual_bias, expected_bias, atol=0, rtol=0)
     torch.testing.assert_close(actual.to(dtype), expected.to(dtype))
