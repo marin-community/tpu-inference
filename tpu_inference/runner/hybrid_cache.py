@@ -22,8 +22,7 @@ def hybrid_cache_budget(specs: dict[str, KVCacheSpec], physical_pages: dict[str,
     vLLM charges the largest group's layer count times the uniform page size
     per block. TPU allocates every layer separately, so that charge must cover
     the sum of all layers' physical pages, including heterogeneous recurrent
-    shapes. Provisional equal padding lets vLLM group the actual specs without
-    recreating its compatibility or group-size heuristics.
+    shapes.
     """
     largest_page = max(physical_pages.values())
     provisional = {

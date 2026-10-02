@@ -5,6 +5,8 @@ import dataclasses
 from types import SimpleNamespace
 
 import jax
+import jax.numpy as jnp
+import numpy as np
 import pytest
 import torch
 from transformers import Qwen2Config
@@ -16,6 +18,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
+from tpu_inference.layers.common.grug_short_conv import grug_short_conv_local
 from tpu_inference.layers.common.sharding import MESH_AXIS_NAMES
 from tpu_inference.runner.hybrid_cache import hybrid_cache_budget
 from tpu_inference.runner.kv_cache_manager import KVCacheManager
@@ -86,6 +89,7 @@ def test_heterogeneous_padded_groups_allocate_independent_bounded_arrays(tmp_pat
         cache_config = get_kv_cache_config_from_groups(config, groups, 16 * 2**20)
         manager.initialize_kv_cache(cache_config)
     allocated = 0
+    checked_shapes = set()
     for name, spec in specs.items():
         cache = runner.kv_caches[runner.layer_name_to_kvcache_index[name]]
         arrays = cache if isinstance(spec, MambaSpec) else (cache,)
@@ -93,6 +97,19 @@ def test_heterogeneous_padded_groups_allocate_independent_bounded_arrays(tmp_pat
             allocated += array.nbytes
         if isinstance(spec, MambaSpec):
             assert cache[0].shape == (3, *spec.shapes[0])
+            if spec.shapes[0] not in checked_shapes:
+                width = spec.shapes[0][-1]
+                state = jnp.full_like(cache[0], 9)
+                output, updated = jax.jit(grug_short_conv_local)(
+                    jnp.ones((2, width), jnp.bfloat16), state,
+                    jnp.ones((4, width), jnp.bfloat16),
+                    jnp.asarray([0, 2], jnp.int32), jnp.asarray([2], jnp.int32),
+                    jnp.asarray([0, 0, 1], jnp.int32), jnp.asarray([2], jnp.int32))
+                np.testing.assert_array_equal(np.asarray(output), np.broadcast_to([[1], [2]], (2, width)))
+                expected_state = np.full(cache[0].shape, 9)
+                expected_state[2] = np.broadcast_to([[0], [1], [1]], (3, width))
+                np.testing.assert_array_equal(np.asarray(updated), expected_state)
+                checked_shapes.add(spec.shapes[0])
         else:
             assert cache.shape[0] == cache_config.num_blocks
     expected = sum(page * (3 if isinstance(specs[name], MambaSpec) else cache_config.num_blocks)
