@@ -22,6 +22,8 @@ checks = ["ruff-check"]
 # never disagree about the same file.
 ruff_version = "0.11.8"
 include = [
+    "tpu_inference/runner/hybrid_cache.py",
+    "tests/runner/test_hybrid_cache.py",
     "tpu_inference/models/jax/grugmoe.py",
     "tpu_inference/layers/common/grug_short_conv.py",
     "tpu_inference/layers/vllm/custom_ops/grug_short_conv.py",
