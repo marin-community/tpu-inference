@@ -66,3 +66,6 @@ def register_layers():
 
     if _is_tpu_stack_active():
         _register_grugmoe()
+        # Grug is available only with the paired Marin vLLM fork.
+        from tpu_inference.layers.vllm.custom_ops.grug_short_conv import register_grug_short_conv
+        register_grug_short_conv()

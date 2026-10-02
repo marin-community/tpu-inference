@@ -23,6 +23,10 @@ checks = ["ruff-check"]
 ruff_version = "0.11.8"
 include = [
     "tpu_inference/models/jax/grugmoe.py",
+    "tpu_inference/layers/common/grug_short_conv.py",
+    "tpu_inference/layers/vllm/custom_ops/grug_short_conv.py",
+    "tpu_inference/layers/vllm/__init__.py",
+    "tests/layers/vllm/test_grug_short_conv.py",
     "tpu_inference/layers/common/fused_moe_gmm.py",
     "tpu_inference/layers/vllm/interface/moe.py",
     "tests/layers/vllm/test_grug_router.py",
