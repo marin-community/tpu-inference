@@ -24,11 +24,11 @@ from tpu_inference.runner.hybrid_cache import hybrid_cache_budget
 from tpu_inference.runner.kv_cache_manager import KVCacheManager
 
 
-def _hero_specs(layers, hidden, local_k, global_k):
+def _hero_specs(layers, hidden, local_k, global_k, kv_heads=2):
     specs = {}
     for layer in range(layers):
         specs[f"layer.{layer}.attn"] = FullAttentionSpec(
-            block_size=16, num_kv_heads=2, head_size=128, dtype=torch.bfloat16)
+            block_size=16, num_kv_heads=kv_heads, head_size=128, dtype=torch.bfloat16)
         widths = {"k": global_k if (layer + 1) % 4 == 0 else local_k,
                   "attn": hidden, "mlp": hidden}
         for site, width in widths.items():
@@ -38,11 +38,11 @@ def _hero_specs(layers, hidden, local_k, global_k):
 
 
 def test_production_hero_budget_counts_each_recurrent_shape():
-    specs = _hero_specs(48, 6144, 1536, 768)
+    specs = _hero_specs(48, 6144, 1536, 768, kv_heads=12)
     pages = {name: spec.page_size_bytes for name, spec in specs.items()}
     budget = hybrid_cache_budget(specs, pages)
     assert budget.mamba_bytes_per_slot == 3 * 2 * (36 * 1536 + 12 * 768 + 96 * 6144)
-    assert budget.attention_bytes_per_block == 48 * 2 * 16 * 2 * 128 * 2
+    assert budget.attention_bytes_per_block == 48 * 2 * 16 * 12 * 128 * 2
     padded = {name: dataclasses.replace(spec, page_size_padded=budget.uniform_page_size_bytes)
               for name, spec in specs.items()}
     groups = _get_kv_cache_groups_uniform_page_size(padded)
