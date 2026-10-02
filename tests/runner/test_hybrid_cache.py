@@ -12,6 +12,9 @@ import torch
 from transformers import Qwen2Config
 from vllm.config import set_current_vllm_config
 from vllm.engine.arg_utils import EngineArgs
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionBackend
+from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts, resolve_kv_cache_layout
 from vllm.v1.core.kv_cache_utils import (
     _get_kv_cache_groups_uniform_page_size,
     get_kv_cache_config_from_groups,
@@ -20,6 +23,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 from tpu_inference.layers.common.grug_short_conv import grug_short_conv_local
 from tpu_inference.layers.common.sharding import MESH_AXIS_NAMES
+from tpu_inference.layers.vllm.backends.flash_attn import PallasAttentionBackend
 from tpu_inference.runner.hybrid_cache import hybrid_cache_budget
 from tpu_inference.runner.kv_cache_manager import KVCacheManager
 
@@ -33,7 +37,8 @@ def _hero_specs(layers, hidden, local_k, global_k, kv_heads=2):
                   "attn": hidden, "mlp": hidden}
         for site, width in widths.items():
             specs[f"layer.{layer}.sconv_{site}"] = MambaSpec(
-                block_size=16, shapes=((3, width),), dtypes=(torch.bfloat16,))
+                block_size=16, shapes=((3, width),), dtypes=(torch.bfloat16,),
+                mamba_type=MambaAttentionBackendEnum.SHORT_CONV)
     return specs
 
 
@@ -86,6 +91,9 @@ def test_heterogeneous_padded_groups_allocate_independent_bounded_arrays(tmp_pat
     # Only telemetry is replaced; grouping, allocation and indexing are real.
     monkeypatch.setattr("tpu_inference.runner.kv_cache_manager.utils.hbm_usage_gb", lambda _: 0)
     with set_current_vllm_config(config):
+        # Match EngineCore: resolve backend-supported layouts before allocation.
+        layouts = get_supported_kv_cache_layouts([PallasAttentionBackend, ShortConvAttentionBackend])
+        resolve_kv_cache_layout(config, [[layout.name for layout in layouts]], specs.values())
         cache_config = get_kv_cache_config_from_groups(config, groups, 16 * 2**20)
         manager.initialize_kv_cache(cache_config)
     allocated = 0
