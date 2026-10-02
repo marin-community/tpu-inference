@@ -17,7 +17,8 @@ from vllm.forward_context import is_forward_context_available
 from vllm.model_executor.layers import fused_moe as vllm_fused_moe
 from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
                                                   RoutedExperts)
-from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+from vllm.model_executor.layers.fused_moe.config import (FusedMoEConfig,
+                                                        RoutingMethodType)
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import \
     get_layer_from_name
 
@@ -102,17 +103,6 @@ def vllm_moe_apply(layer: RoutedExperts,
 
     enable_return_routed_experts = vllm_config.model_config.enable_return_routed_experts if vllm_config else False
 
-    if enable_return_routed_experts:
-        if isinstance(router_logits, torch.Tensor):
-            _, expert_indices = torch.topk(router_logits, layer.top_k, dim=-1)
-            from tpu_inference.models.vllm.vllm_model_wrapper_context import \
-                get_vllm_model_wrapper_context
-            try:
-                context = get_vllm_model_wrapper_context()
-                context.expert_indices_list.append(jax_view(expert_indices))
-            except AssertionError:
-                pass
-
     mesh = quant_method_instance.mesh
     is_dp = is_attn_dp(mesh)
 
@@ -124,9 +114,25 @@ def vllm_moe_apply(layer: RoutedExperts,
     # where the shared and fused outputs are summed and reduced together in a
     # single collective downstream. This is the inverse of (and tied to)
     # ``VllmMoERunner._fused_output_is_reduced`` so the two never drift.
+    gating_output = jax_view(router_logits)
     if is_forward_context_available():
         runner = get_layer_from_name(layer.layer_name)
         extra_kwargs["defer_all_reduce"] = not runner._fused_output_is_reduced
+        if runner.router.routing_method_type == RoutingMethodType.Custom:
+            if quant_method_instance.moe_backend not in (MoEBackend.GMM_EP,
+                                                        MoEBackend.GMM_TP):
+                raise NotImplementedError("Custom routing requires a GMM MoE backend")
+            topk_weights, topk_indices = runner.router.select_experts(
+                hidden_states=x, router_logits=router_logits, input_ids=input_ids)
+            gating_output = (jax_view(topk_weights), jax_view(topk_indices))
+
+    if enable_return_routed_experts:
+        if isinstance(gating_output, tuple):
+            expert_indices = gating_output[1]
+        else:
+            _, selected = torch.topk(router_logits, layer.top_k, dim=-1)
+            expert_indices = jax_view(selected)
+        get_vllm_model_wrapper_context().expert_indices_list.append(expert_indices)
 
     if getattr(layer, "hash_indices_table", None) is not None:
         assert input_ids is not None, "input_ids must be provided when hash_indices_table is present in the layer"
@@ -161,7 +167,7 @@ def vllm_moe_apply(layer: RoutedExperts,
         moe_apply(
             layer=layer,
             x=jax_view(x),
-            gating_output=jax_view(router_logits),
+            gating_output=gating_output,
             weights=weights,
             moe_backend=quant_method_instance.moe_backend,
             mesh=quant_method_instance.mesh,
