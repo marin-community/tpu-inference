@@ -39,6 +39,19 @@ P = PartitionSpec
 logger = init_logger(__name__)
 
 
+def _free_torch_storage(tensor: torch.Tensor | None) -> None:
+    """Release a host tensor after transfer, including storage shared with NumPy."""
+    if tensor is None:
+        return
+    storage = tensor.untyped_storage()
+    if storage.resizable():
+        storage.resize_(0)
+    else:
+        # NumPy and safetensors views cannot resize their backing allocation.
+        # Detach this tensor; any outstanding views retain ownership until freed.
+        tensor.set_(torch.storage.UntypedStorage())
+
+
 def shard_model_to_tpu(model: torch.nn.Module,
                        mesh: Mesh) -> dict[str, torchax.torch.Tensor]:
     """

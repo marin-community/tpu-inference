@@ -49,8 +49,8 @@ from tpu_inference.layers.common.quantization import fp8 as common_fp8
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.vllm.interface.moe import (
     select_moe_backend_from_fused_moe_config, vllm_moe_apply)
-from tpu_inference.layers.vllm.process_weights.cleanup_sharding import \
-    _tensor_is_in_cpu
+from tpu_inference.layers.vllm.process_weights.cleanup_sharding import (
+    _free_torch_storage, _tensor_is_in_cpu)
 from tpu_inference.layers.vllm.quantization.base import VllmQuantizationMethod
 from tpu_inference.layers.vllm.quantization.configs import (
     VllmQuantConfig, VllmQuantLinearConfig)
@@ -62,22 +62,6 @@ from tpu_inference.logger import init_logger
 P = PartitionSpec
 
 logger = init_logger(__name__)
-
-
-# TODO: Use custom op with overriding weight loading class so we will have a better
-# and cleaner interface.
-def _free_torch_storage(tensor: Optional[torch.Tensor]) -> None:
-    """Safely frees the underlying CPU memory storage of a PyTorch tensor.
-
-    Tries `untyped_storage().resize_(0)` first, with fallback to `set_(torch.storage.UntypedStorage())`
-    for 0-dim scalars or float8 dtypes that cannot be resized in-place.
-    """
-    if tensor is None:
-        return
-    try:
-        tensor.untyped_storage().resize_(0)
-    except Exception:
-        tensor.set_(torch.storage.UntypedStorage())
 
 
 def _release_host_memory() -> None:
