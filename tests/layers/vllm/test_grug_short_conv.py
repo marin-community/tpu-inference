@@ -8,7 +8,9 @@ import pytest
 import torch
 import torchax
 from torchax.interop import jax_view, torch_view
-from vllm.config import CacheConfig, VllmConfig, set_current_vllm_config
+from transformers import Qwen2Config
+from vllm.config import set_current_vllm_config
+from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.models.grugmoe import GrugMoeShortConv
 
@@ -30,14 +32,21 @@ def _reference(sequence, weight):
 @pytest.mark.parametrize("kernel", [2, 4])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.disable_jax_cache
-def test_grug_short_conv_preserves_request_histories(dp, kernel, dtype):
+def test_grug_short_conv_preserves_request_histories(tmp_path, dp, kernel, dtype):
     """Exercise the real Torchax custom op across chunking, reordering and slot reuse."""
     if jax.local_device_count() < dp:
         pytest.skip("Two-device case requires a two-device CPU or TPU allocation")
     mesh = jax.make_mesh((dp, 1, 1, 1, 1, 1, 1), MESH_AXIS_NAMES,
                          axis_types=(jax.sharding.AxisType.Auto,) * len(MESH_AXIS_NAMES),
                          devices=jax.local_devices()[:dp])
-    config = VllmConfig(cache_config=CacheConfig(enable_prefix_caching=False))
+    # The TPU platform requires model metadata even for an isolated layer op.
+    Qwen2Config(vocab_size=128, hidden_size=128, intermediate_size=128,
+                num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2,
+                architectures=["Qwen2ForCausalLM"]).save_pretrained(tmp_path)
+    config = EngineArgs(model=str(tmp_path), skip_tokenizer_init=True,
+                        max_model_len=32, max_num_batched_tokens=32,
+                        max_num_seqs=4, enable_prefix_caching=False,
+                        enforce_eager=True).create_engine_config()
     torch_dtype = torch.bfloat16 if dtype == jnp.bfloat16 else torch.float32
     with set_current_vllm_config(config):
         layer = GrugMoeShortConv(4, kernel, torch_dtype, config.cache_config, "test.sconv")
