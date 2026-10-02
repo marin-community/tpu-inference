@@ -1,6 +1,9 @@
 # Copyright 2026 The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import subprocess
+import sys
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -106,3 +109,14 @@ def test_grug_short_conv_preserves_request_histories(tmp_path, dp, kernel, dtype
         # Dyadic inputs/taps keep these sums exactly representable in both dtypes.
         np.testing.assert_array_equal(np.asarray(actual).astype(np.float32), expected)
         np.testing.assert_array_equal(np.asarray(state).astype(np.float32), expected_state.astype(np.float32))
+
+
+def test_short_conv_registration_does_not_acquire_accelerator():
+    # The test parent may already own TPU; model metadata inspection must work
+    # in a child process without creating another Torchax environment.
+    subprocess.run([sys.executable, "-c", """
+from jax._src import xla_bridge
+from tpu_inference.layers.vllm.custom_ops.grug_short_conv import register_grug_short_conv
+register_grug_short_conv()
+assert not xla_bridge.backends_are_initialized()
+"""], check=True, capture_output=True, text=True)
