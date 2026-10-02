@@ -28,7 +28,7 @@ from tpu_inference.runner.hybrid_cache import hybrid_cache_budget
 from tpu_inference.runner.kv_cache_manager import KVCacheManager
 
 
-def _hero_specs(layers, hidden, local_k, global_k, kv_heads=2):
+def _short_conv_specs(layers, hidden, local_k, global_k, kv_heads=2):
     specs = {}
     for layer in range(layers):
         specs[f"layer.{layer}.attn"] = FullAttentionSpec(
@@ -43,10 +43,11 @@ def _hero_specs(layers, hidden, local_k, global_k, kv_heads=2):
 
 
 def test_production_hero_budget_counts_each_recurrent_shape():
-    specs = _hero_specs(48, 6144, 1536, 768, kv_heads=12)
+    # K history uses all stored heads before logical local/global reduction.
+    specs = _short_conv_specs(48, 6144, 1536, 1536, kv_heads=12)
     pages = {name: spec.page_size_bytes for name, spec in specs.items()}
     budget = hybrid_cache_budget(specs, pages)
-    assert budget.mamba_bytes_per_slot == 3 * 2 * (36 * 1536 + 12 * 768 + 96 * 6144)
+    assert budget.mamba_bytes_per_slot == 3 * 2 * (48 * 1536 + 96 * 6144)
     assert budget.attention_bytes_per_block == 48 * 2 * 16 * 12 * 128 * 2
     padded = {name: dataclasses.replace(spec, page_size_padded=budget.uniform_page_size_bytes)
               for name, spec in specs.items()}
@@ -83,7 +84,8 @@ def test_heterogeneous_padded_groups_allocate_independent_bounded_arrays(tmp_pat
         persistent_batch_manager=SimpleNamespace(),
     )
     manager = KVCacheManager(runner)
-    specs = _hero_specs(11, 128, 64, 32)
+    # Synthetic third width stresses uneven groups beyond production Hero.
+    specs = _short_conv_specs(11, 128, 64, 32)
     physical_pages = {name: spec.page_size_bytes for name, spec in specs.items()}
     manager.update_mamba_page_size_padded(specs)
     groups = _get_kv_cache_groups_uniform_page_size(specs)
