@@ -468,16 +468,17 @@ class TestComputePromptLogprobs:
         mock_scheduler_output = MagicMock()
         mock_scheduler_output.num_scheduled_tokens = {"req1": 2}
 
-        res = compute_prompt_logprobs(
-            full_logits=full_logits,
-            input_ids=input_ids,
-            num_prompt_logprobs={"req1": 2},
-            requests={"req1": mock_req_state},
-            scheduler_output=mock_scheduler_output,
-            req_ids_dp={0: ["req1"]},
-            dp_size=1,
-            max_logprobs=2,
-        )
+        with jax.set_mesh(TestProcessedLogprobs._get_fake_mesh()):
+            res = compute_prompt_logprobs(
+                full_logits=full_logits,
+                input_ids=input_ids,
+                num_prompt_logprobs={"req1": 2},
+                requests={"req1": mock_req_state},
+                scheduler_output=mock_scheduler_output,
+                req_ids_dp={0: ["req1"]},
+                dp_size=1,
+                max_logprobs=2,
+            )
 
         assert res is not None
         token_ids = np.asarray(jax.device_get(res.tensors.logprob_token_ids))
@@ -516,16 +517,17 @@ class TestComputePromptLogprobs:
         mock_scheduler_output = MagicMock()
         mock_scheduler_output.num_scheduled_tokens = {"req1": 3}
 
-        res = compute_prompt_logprobs(
-            full_logits=full_logits,
-            input_ids=input_ids,
-            num_prompt_logprobs={"req1": 2},
-            requests={"req1": mock_req_state},
-            scheduler_output=mock_scheduler_output,
-            req_ids_dp={0: ["req1"]},
-            dp_size=1,
-            max_logprobs=2,
-        )
+        with jax.set_mesh(TestProcessedLogprobs._get_fake_mesh()):
+            res = compute_prompt_logprobs(
+                full_logits=full_logits,
+                input_ids=input_ids,
+                num_prompt_logprobs={"req1": 2},
+                requests={"req1": mock_req_state},
+                scheduler_output=mock_scheduler_output,
+                req_ids_dp={0: ["req1"]},
+                dp_size=1,
+                max_logprobs=2,
+            )
 
         assert res is not None
         snap = res.req_snaps[0]
