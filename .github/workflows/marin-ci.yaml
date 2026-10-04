@@ -78,7 +78,7 @@ jobs:
         # resolves torch to the CPU wheel rather than the CUDA one.
         run: |
           uv venv --python 3.12
-          uv pip install --group cpu-tests --torch-backend cpu
+          VLLM_TARGET_DEVICE=empty uv pip install --group cpu-tests --torch-backend cpu
 
       - name: GrugMoE model tests
         run: uv run --no-project python -m pytest tests/models/jax/test_grugmoe.py -q

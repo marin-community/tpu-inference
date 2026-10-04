@@ -101,7 +101,7 @@ against the CPU dependency group that PR CI installs:
 
 ```bash
 uv venv --python 3.12
-uv pip install --group cpu-tests --torch-backend cpu
+VLLM_TARGET_DEVICE=empty uv pip install --group cpu-tests --torch-backend cpu
 uv run --no-project python -m pytest tests/models/jax/test_grugmoe.py
 uv run --no-project python -m pytest infra/nightly/test_nightly.py
 ```

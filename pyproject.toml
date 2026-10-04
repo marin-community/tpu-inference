@@ -37,18 +37,22 @@ include = [
 # requirements.txt cannot be used for this: it pins libtpu, which needs a TPU.
 #
 # vLLM is not optional even for an import -- tpu_inference/__init__.py pulls it in, so
-# every `tpu_inference.` import needs it. This is stock PyPI vLLM, not Marin's vLLM fork,
-# which is a source build far too slow for PR CI. That gap is why
+# every `tpu_inference.` import needs it. TPU 0.30 uses an AuxOutputConfig API
+# absent from stable vLLM 0.30. Use its immutable upstream LKG for this Python-only
+# CPU test environment. This does not select or qualify the published TPU pair.
+# That gap is why
 # tests/models/common/test_model_loader.py runs in the nightly and not here: it imports a
 # quantization module only the fork ships.
 [dependency-groups]
 cpu-tests = [
+    "torch==2.11.0+cpu",
+    "torchvision==0.26.0+cpu",
     "jax[cpu]==0.11.0",
     "flax==0.12.8",
     "torchax==0.0.13",
     "qwix==0.1.2",
     "transformers>=5.8.0",
-    "vllm==0.25.1",
+    "vllm @ git+https://github.com/vllm-project/vllm.git@153f2ba1b986fb461d84ae7b4f9644a608f36bc8",
     "jaxtyping",
     "numpy",
     "requests",
