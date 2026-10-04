@@ -23,6 +23,10 @@ export PRIORITY_DEFAULT=1
 export PRIORITY_NIGHTLY=0
 export PRIORITY_KERNEL_TUNING=-10
 
+# Keep upstream as the default while allowing fork CI to pair an exact commit
+# with the repository that actually contains it.
+export VLLM_REPO="${VLLM_REPO:-https://github.com/vllm-project/vllm.git}"
+
 # Implemented dynamic job prioritization by injecting integers during upload
 upload_with_priority() {
   local yaml_file=$1
@@ -43,7 +47,7 @@ get_vllm_commit_hash() {
     commit_hash="$(cat "$version_file")"
   fi
   if [ -z "${commit_hash:-}" ]; then
-    commit_hash=$(git ls-remote https://github.com/vllm-project/vllm.git HEAD | awk '{ print $1}')
+    commit_hash=$(git ls-remote "$VLLM_REPO" HEAD | awk '{ print $1}')
   fi
 
   echo "$commit_hash"

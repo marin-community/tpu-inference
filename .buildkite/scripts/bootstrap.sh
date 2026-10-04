@@ -271,7 +271,7 @@ rm "$NOTIFY_FILE"
 echo "Configure testing logic"
 if [[ $BUILDKITE_PIPELINE_SLUG == "tpu-vllm-integration" ]]; then
     # Note: Integration pipeline always fetch latest vllm version
-    VLLM_COMMIT_HASH=$(git ls-remote https://github.com/vllm-project/vllm.git HEAD | awk '{ print $1}')
+    VLLM_COMMIT_HASH=$(git ls-remote "$VLLM_REPO" HEAD | awk '{ print $1}')
     buildkite-agent meta-data set "VLLM_COMMIT_HASH" "${VLLM_COMMIT_HASH}"
     echo "Using vllm commit hash: $(buildkite-agent meta-data get "VLLM_COMMIT_HASH")"
     # Note: upload are inserted in reverse order, so promote LKG should upload before tests

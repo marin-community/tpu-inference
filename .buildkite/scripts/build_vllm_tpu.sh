@@ -70,14 +70,14 @@ echo "vLLM-TPU Version: ${VLLM_TPU_VERSION}"
 echo "vLLM Branch/Tag/Commit Hash: ${VLLM_BRANCH}"
 
 # --- Step 1: Clone vLLM repository ---
-VLLM_REPO="https://github.com/vllm-project/vllm.git"
+VLLM_REPO="${VLLM_REPO:-https://github.com/vllm-project/vllm.git}"
 REPO_DIR="vllm"
 
 if [ -d "$REPO_DIR" ]; then
     echo "Repository '$REPO_DIR' already exists. Skipping clone."
 else
     echo "Cloning vLLM repository..."
-    git clone ${VLLM_REPO}
+    git clone "${VLLM_REPO}"
 fi
 cd ${REPO_DIR}
 

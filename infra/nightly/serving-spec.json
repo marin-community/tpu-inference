@@ -1,0 +1,21 @@
+{
+  "provenance": {
+    "model": "Qwen/Qwen3-0.6B",
+    "tpu": "v5litepod-8",
+    "vllm_fork_rev": "a0b205f2afd5b33d01703a4cd9b18453d5286f39",
+    "tpu_inference_rev": "c85f351882ecb123cafbff3109c382c40fe52d70",
+    "prompts": 8,
+    "max_tokens": 64,
+    "recorded_at": "2026-07-14T20:32:46.214941+00:00",
+    "note": "Recorded from a real serving run by infra/nightly/probe.py --record. Seeded before this landed by submitting the nightly's own Iris job by hand, because workflow_dispatch only resolves a workflow once it is on the default branch. The floor is a quarter of the observed rate: it catches a collapse (a CPU fallback, a recompile every step), it does not track drift."
+  },
+  "gate": {
+    "min_completions": 8,
+    "min_output_tokens_per_second": 224.5
+  },
+  "observed": {
+    "output_tokens_per_second": 898.0,
+    "output_tokens": 512,
+    "elapsed": 0.6
+  }
+}
