@@ -549,7 +549,7 @@ def fused_moe_func(
     w2_scale: jax.Array | None,
     w1_bias: jax.Array | None,
     w2_bias: jax.Array | None,
-    gating_output: jax.Array,
+    gating_output: jax.Array | tuple[jax.Array, jax.Array],
     topk: int,
     renormalize: bool,
     mesh: Mesh,
@@ -577,7 +577,8 @@ def fused_moe_func(
         w2_scale: w2 scale [num_experts, num_blocks, 1, hidden_size]
         w1_bias: optional bias of w1 [num_experts, 1, intermediate_size * 2]
         w2_bias: optional bias of w2 [num_experts, 1, hidden_size]
-        gating_output: routing information of tokens [num_tokens, num_experts]
+        gating_output: logits [num_tokens, num_experts], or preselected
+            (weights, indices), each [num_tokens, topk].
         topk: number of experts to choose per token.
         renormalize: normalize gating_output.
         mesh: mesh to perform moe.
@@ -592,6 +593,8 @@ def fused_moe_func(
     """
 
     if use_ep and use_gmm_fused_rs_kernel:
+        if isinstance(gating_output, tuple):
+            raise NotImplementedError("Preselected routes are not supported by fused MoE RS")
         from tpu_inference.kernels.experimental.fused_moe.fused_moe_rs import \
             fused_moe_func_rs
         logger.info("fused_moe_rs kernel in use")
@@ -618,28 +621,32 @@ def fused_moe_func(
         "The kernel requires num_tokens * topk to be a multiple of "
         f"16 but got {num_tokens}*{topk}={num_tokens*topk}")
 
-    assert gating_output.shape == (num_tokens, global_num_experts)
-
-    topk_weights = apply_scoring_fn(scoring_fn, gating_output)
-    if hash_based_topk_indices is not None:
-        topk_indices = hash_based_topk_indices
-        topk_weights = jnp.take_along_axis(topk_weights, topk_indices, axis=-1)
-    elif envs.MOE_APPROX_TOPK:
-        topk_weights, topk_indices = jax.lax.approx_max_k(
-            topk_weights,
-            k=topk,
-            recall_target=envs.MOE_APPROX_TOPK_RECALL_TARGET)
+    if isinstance(gating_output, tuple):
+        topk_weights, topk_indices = gating_output
+        assert topk_weights.shape == topk_indices.shape == (num_tokens, topk)
     else:
-        if expert_score_correction_bias is not None:
-            _, topk_indices = jax.lax.top_k(
-                topk_weights + expert_score_correction_bias[None, :], k=topk)
-            topk_weights = jnp.take_along_axis(topk_weights,
-                                               topk_indices,
-                                               axis=-1)
+        assert gating_output.shape == (num_tokens, global_num_experts)
+
+        topk_weights = apply_scoring_fn(scoring_fn, gating_output)
+        if hash_based_topk_indices is not None:
+            topk_indices = hash_based_topk_indices
+            topk_weights = jnp.take_along_axis(topk_weights, topk_indices, axis=-1)
+        elif envs.MOE_APPROX_TOPK:
+            topk_weights, topk_indices = jax.lax.approx_max_k(
+                topk_weights,
+                k=topk,
+                recall_target=envs.MOE_APPROX_TOPK_RECALL_TARGET)
         else:
-            topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+            if expert_score_correction_bias is not None:
+                _, topk_indices = jax.lax.top_k(
+                    topk_weights + expert_score_correction_bias[None, :], k=topk)
+                topk_weights = jnp.take_along_axis(topk_weights,
+                                                   topk_indices,
+                                                   axis=-1)
+            else:
+                topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
+        if renormalize:
+            topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
     # Route padding tokens to expert 0 instead of picking a selected expert. This
     # is especially useful when we have a low number of tokens (e.g. low
     # concurrency), where padding tokens may activate unnecessary expert weights
