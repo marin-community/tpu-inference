@@ -372,6 +372,33 @@ class TestKVCacheManager:
         assert spec.num_kv_heads == 1
         assert spec.head_size == expected_head_size
 
+    def test_get_kv_cache_spec_pads_five_kv_heads_for_tp8(self):
+        devices = np.array(jax.devices()[:1] * 8)
+        self.runner.mesh = jax.sharding.Mesh(devices.reshape((1, 8)),
+                                             ('data', 'model'))
+        self.runner.vllm_config.compilation_config.static_forward_context = {
+            'layer.0': MagicMock(
+                spec=Attention,
+                num_kv_heads=5,
+                head_size=128,
+                attn_type=AttentionType.DECODER,
+                sliding_window=None,
+                kv_sharing_target_layer_name=None,
+            )
+        }
+
+        spec = self.runner.get_kv_cache_spec()['layer.0']
+
+        assert isinstance(spec, FullAttentionSpec)
+        assert spec.num_kv_heads == 8
+        assert spec.page_size_padded == get_attention_page_size_bytes(
+            self.runner.mesh,
+            self.runner.vllm_config.cache_config.block_size,
+            8,
+            128,
+            self.runner.kv_cache_dtype,
+            False)
+
     def test_get_kv_cache_spec_without_compilation_cfg(self):
         # tests if there's no compilation config, we use full attention kv
         # cache for each layer.
