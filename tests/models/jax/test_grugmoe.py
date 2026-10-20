@@ -167,20 +167,19 @@ def test_grugmoe_hf_config_preserves_global_layers(layer_count_key):
     assert restored.layer_types == config.layer_types
 
 
-def test_grugmoe_hf_config_defaults_global_interval():
-    config = grugmoe.GrugMoeHfConfig(num_layers=5)
-    assert config.layer_types == [
-        "sliding_attention", "sliding_attention", "sliding_attention",
-        "full_attention", "full_attention",
-    ]
-
-
-def test_grugmoe_hf_config_respects_global_interval():
-    config = grugmoe.GrugMoeHfConfig(num_layers=5, global_every=2)
-    assert config.layer_types == [
-        "sliding_attention", "full_attention", "sliding_attention",
-        "full_attention", "full_attention",
-    ]
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({}, ["sliding_attention", "sliding_attention", "sliding_attention",
+              "full_attention", "full_attention"]),
+        ({"global_every": 2}, ["sliding_attention", "full_attention",
+                              "sliding_attention", "full_attention",
+                              "full_attention"]),
+    ],
+)
+def test_grugmoe_hf_config_resolves_global_interval(kwargs, expected):
+    config = grugmoe.GrugMoeHfConfig(num_layers=5, **kwargs)
+    assert config.layer_types == expected
 
 
 def test_grugmoe_hf_config_rejects_mismatching_layer_types():
