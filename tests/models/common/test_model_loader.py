@@ -30,6 +30,7 @@ from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
                                              init_distributed_environment)
 from vllm.engine.arg_utils import EngineArgs
 from vllm.model_executor.models.registry import ModelRegistry
+from vllm.plugins import load_general_plugins
 
 from tpu_inference.distributed.jax_parallel_state import \
     init_pp_distributed_environment
@@ -670,3 +671,44 @@ class TestGetModel:
         mock_get_vllm.assert_called_once_with(vllm_config, rng, mesh, False,
                                               None)
         assert result == "vllm_model_sentinel"
+
+
+
+def test_grugmoe_engine_config_keeps_global_layers_unwindowed(tmp_path):
+    # Real plugin registration must select the TPU config, not vLLM's config.
+    load_general_plugins()
+    config = {
+        "model_type": "grug_moe",
+        "architectures": ["GrugMoeForCausalLM"],
+        "vocab_size": 128,
+        "hidden_dim": 512,
+        "intermediate_dim": 1024,
+        "shared_expert_intermediate_dim": 1024,
+        "num_experts": 2,
+        "num_experts_per_token": 1,
+        "num_layers": 26,
+        "global_every": 4,
+        "num_heads": 4,
+        "num_kv_heads": 1,
+        "head_dim": 128,
+        "max_seq_len": 4096,
+        "sliding_window": 2048,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    engine_config = EngineArgs(
+        model=str(tmp_path),
+        tokenizer=str(tmp_path),
+        trust_remote_code=True,
+        skip_tokenizer_init=True,
+        load_format="runai_streamer",
+        dtype="bfloat16",
+        max_model_len=4096,
+    ).create_engine_config()
+
+    hf_config = engine_config.model_config.hf_text_config
+    assert type(hf_config).__name__ == "GrugMoeHfConfig"
+    assert len(hf_config.layer_types) == 26
+    assert [i for i, kind in enumerate(hf_config.layer_types)
+            if kind == "full_attention"] == [3, 7, 11, 15, 19, 23, 25]
+    assert hf_config.sliding_window == 2048
+    assert engine_config.cache_config.sliding_window is None

@@ -123,6 +123,25 @@ class GrugMoeHfConfig(PretrainedConfig):
             if source not in kwargs and alias in kwargs:
                 kwargs[source] = kwargs[alias]
 
+        num_hidden_layers = int(kwargs.get("num_hidden_layers", 24))
+        global_every = int(kwargs.get("global_every", 4))
+        if global_every <= 0:
+            raise ValueError("global_every must be positive")
+        resolved_layer_types = [
+            "full_attention"
+            if (index + 1) % global_every == 0 or index == num_hidden_layers - 1
+            else "sliding_attention"
+            for index in range(num_hidden_layers)
+        ]
+        layer_types = kwargs.get("layer_types")
+        if layer_types is not None and layer_types != resolved_layer_types:
+            raise ValueError(
+                "layer_types must match the GrugMoE attention architecture"
+            )
+        # vLLM uses this to keep global layers out of the cache-wide window.
+        kwargs["layer_types"] = resolved_layer_types
+        kwargs["global_every"] = global_every
+
         super().__init__(
             architectures=architectures or ["GrugMoeForCausalLM"],
             **kwargs,
