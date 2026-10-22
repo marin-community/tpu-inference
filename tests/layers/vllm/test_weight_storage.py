@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import jax
+import numpy as np
 import pytest
 import torch
 import torchax
@@ -72,11 +73,15 @@ def test_replicated_linear_releases_host_storage(tmp_path, dtype, numpy_shared):
             quant_config=get_tpu_quantization_config(config, mesh))
     linear.weight.data = weight
     linear.bias.data = bias
+    weight_param = linear.weight
+    bias_param = linear.bias
+    del weight, bias
     if numpy_shared:
-        # Creating a view makes storage non-resizable even after the view dies.
-        # The byte view also covers BF16, which NumPy cannot represent directly.
-        linear.weight.detach().view(torch.uint8).numpy()
-        linear.bias.detach().view(torch.uint8).numpy()
+        # Byte views cover BF16 and keep the original allocation alive.
+        weight_view = weight_param.detach().view(torch.uint8).numpy()
+        bias_view = bias_param.detach().view(torch.uint8).numpy()
+        expected_weight_bytes = weight_view.copy()
+        expected_bias_bytes = bias_view.copy()
     # Isolate storage transfer from TPU's default reduced-precision FP32 matmul.
     with torchax.default_env(), jax.set_mesh(mesh), \
             jax.default_matmul_precision("highest"):
@@ -87,3 +92,8 @@ def test_replicated_linear_releases_host_storage(tmp_path, dtype, numpy_shared):
     torch.testing.assert_close(actual_weight, expected_weight, atol=0, rtol=0)
     torch.testing.assert_close(actual_bias, expected_bias, atol=0, rtol=0)
     torch.testing.assert_close(actual.to(dtype), expected.to(dtype))
+    assert weight_param.untyped_storage().nbytes() == 0
+    assert bias_param.untyped_storage().nbytes() == 0
+    if numpy_shared:
+        np.testing.assert_array_equal(weight_view, expected_weight_bytes)
+        np.testing.assert_array_equal(bias_view, expected_bias_bytes)

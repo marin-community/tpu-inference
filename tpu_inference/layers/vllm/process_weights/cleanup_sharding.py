@@ -40,7 +40,11 @@ logger = init_logger(__name__)
 
 
 def _free_torch_storage(tensor: torch.Tensor | None) -> None:
-    """Release a host tensor after transfer, including storage shared with NumPy."""
+    """Release host storage after transfer, including storage shared with NumPy.
+
+    Resizing empties storage for every Torch alias. For non-resizable storage,
+    set_ detaches only this tensor; other Torch and NumPy aliases keep it alive.
+    """
     if tensor is None:
         return
     storage = tensor.untyped_storage()
