@@ -153,3 +153,37 @@ def test_grugmoe_artifact_config_requires_schema_version(tmp_path):
     assert (
         grugmoe._read_artifact_config(tmp_path)["grugmoe_artifact_schema_version"] == 1
     )
+
+
+@pytest.mark.parametrize("layer_count_key", ["num_hidden_layers", "num_layers"])
+def test_grugmoe_hf_config_preserves_global_layers(layer_count_key):
+    config = grugmoe.GrugMoeHfConfig(**{layer_count_key: 26}, global_every=4)
+
+    assert len(config.layer_types) == 26
+    assert [i for i, kind in enumerate(config.layer_types)
+            if kind == "full_attention"] == [3, 7, 11, 15, 19, 23, 25]
+    assert set(config.layer_types) == {"full_attention", "sliding_attention"}
+    restored = grugmoe.GrugMoeHfConfig.from_dict(config.to_dict())
+    assert restored.layer_types == config.layer_types
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({}, ["sliding_attention", "sliding_attention", "sliding_attention",
+              "full_attention", "full_attention"]),
+        ({"global_every": 2}, ["sliding_attention", "full_attention",
+                              "sliding_attention", "full_attention",
+                              "full_attention"]),
+    ],
+)
+def test_grugmoe_hf_config_resolves_global_interval(kwargs, expected):
+    config = grugmoe.GrugMoeHfConfig(num_layers=5, **kwargs)
+    assert config.layer_types == expected
+
+
+def test_grugmoe_hf_config_rejects_mismatching_layer_types():
+    with pytest.raises(ValueError, match="layer_types must match the GrugMoE attention architecture"):
+        grugmoe.GrugMoeHfConfig(
+            num_hidden_layers=26, layer_types=["sliding_attention"] * 26
+        )
