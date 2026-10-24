@@ -396,9 +396,8 @@ class Qwen2ForCausalLM(JaxModule, LoadableWithIterator):
         model_config = vllm_config.model_config
         if not model_config.hf_config.tie_word_embeddings:
             vocab_size = model_config.get_vocab_size()
-            hidden_size = getattr(
-                model_config.hf_config, 'hidden_size',
-                model_config.hf_config.text_config.hidden_size)
+            hidden_size = getattr(model_config.hf_config, 'text_config',
+                                  model_config.hf_config).hidden_size
             self.lm_head = JaxLmHead(
                 hidden_size=hidden_size,
                 vocab_size=vocab_size,
