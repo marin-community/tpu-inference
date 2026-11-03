@@ -33,6 +33,9 @@ from tpu_inference.kernels.ragged_paged_attention.v3.util import (
     align_to, cdiv, get_dtype_packing, get_tpu_version, next_power_of_2)
 
 
+_V4_VMEM_TILE_BUDGET_BYTES = 12 * 1024 * 1024
+
+
 class RpaCase(Enum):
     """Represents the different cases for Ragged Paged Attention.
 
@@ -1537,7 +1540,7 @@ def get_default_block_sizes(
             while get_vmem_estimate_bytes(actual_num_kv_heads,
                                           num_q_heads_per_kv_head, head_dim,
                                           bq_sz, bkv_sz, q_dtype,
-                                          kv_dtype) > 12 * 1024 * 1024:
+                                          kv_dtype) > _V4_VMEM_TILE_BUDGET_BYTES:
                 if bq_sz > 1:
                     bq_sz //= 2
                 elif bkv_sz > page_size:

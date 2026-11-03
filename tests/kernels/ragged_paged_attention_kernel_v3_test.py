@@ -56,7 +56,6 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         k_scale: float | None = None,
         v_scale: float | None = None,
         use_causal_mask: bool = True,
-        use_default_block_sizes: bool = False,
         case: RpaCase = RpaCase.MIXED,
     ):
         rng = np.random.default_rng(1234)
@@ -185,7 +184,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         output, updated_kv_cache = ragged_paged_attention(
             *args,
             **kwargs,
-            m_block_sizes=None if use_default_block_sizes else
+            m_block_sizes=None if bq_sz is None else
             (bq_sz, bkv_sz, bq_csz, bkv_csz),
             vmem_limit_bytes=vmem_limit_bytes,
         )
@@ -226,7 +225,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                                           dtype,
                                           dtype,
                                           num_pages=512,
-                                          use_default_block_sizes=True,
+                                          bq_sz=None,
                                           case=case,
                                           vmem_limit_bytes=None,
                                           sliding_window=sliding_window)
