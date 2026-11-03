@@ -187,6 +187,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             m_block_sizes=None if bq_sz is None else
             (bq_sz, bkv_sz, bq_csz, bkv_csz),
             vmem_limit_bytes=vmem_limit_bytes,
+            chunk_prefill_size=seq_lens[0][0] if case == RpaCase.PREFILL else None,
         )
         output = output[:cu_q_lens[distribution[-1]]]
 
@@ -215,7 +216,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                                              page_size, dtype, sliding_window):
         seq_lens = {
             RpaCase.DECODE: [(1, 2047), (1, 2049)],
-            RpaCase.PREFILL: [(128, 128), (64, 64)],
+            RpaCase.PREFILL: [(128, 128), (128, 128)],
             RpaCase.MIXED: [(128, 2049), (1, 2304)],
         }[case]
         self._test_ragged_paged_attention(seq_lens,
