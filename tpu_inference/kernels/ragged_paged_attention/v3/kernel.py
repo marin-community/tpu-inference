@@ -19,6 +19,7 @@ specifications. It supports mixed prefill and decoding, enhancing throughput
 during inference.
 """
 import functools
+import math
 from enum import Enum
 from typing import Any
 
@@ -30,6 +31,9 @@ from jax.experimental.pallas import tpu as pltpu
 
 from tpu_inference.kernels.ragged_paged_attention.v3.util import (
     align_to, cdiv, get_dtype_packing, get_tpu_version, next_power_of_2)
+
+
+_V4_VMEM_TILE_BUDGET_BYTES = 12 * 1024 * 1024
 
 
 class RpaCase(Enum):
@@ -1526,6 +1530,28 @@ def get_default_block_sizes(
                           num_kv_heads_x2)
 
     match tpu_version:
+        case 4:
+            # v4 has 16 MiB VMEM per TensorCore. Start from the v4 tuned
+            # fallback, then shrink for wide heads/dtypes. Reserve a quarter of
+            # VMEM for flash-attention temporaries and compiler spills, which
+            # get_vmem_estimate_bytes does not include.
+            bq_sz = 1 if case == RpaCase.DECODE else min(32, max_q)
+            bkv_sz = align_to(min(512, min_bkv_sz_to_peak, max_kv), page_size)
+            while get_vmem_estimate_bytes(actual_num_kv_heads,
+                                          num_q_heads_per_kv_head, head_dim,
+                                          bq_sz, bkv_sz, q_dtype,
+                                          kv_dtype) > _V4_VMEM_TILE_BUDGET_BYTES:
+                if bq_sz > 1:
+                    bq_sz //= 2
+                elif bkv_sz > page_size:
+                    bkv_sz = max(page_size,
+                                 (bkv_sz // 2 // page_size) * page_size)
+                else:
+                    raise ValueError(
+                        "One RPA page exceeds the v4 VMEM budget; "
+                        "reduce page_size or shard the heads.")
+            bq_csz = bq_sz
+            bkv_csz = math.gcd(bkv_sz, align_to(128, page_size))
         case 5 | 6:
             if case == RpaCase.DECODE:
                 bq_sz = 1
