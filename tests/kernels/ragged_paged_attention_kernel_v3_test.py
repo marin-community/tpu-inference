@@ -22,6 +22,7 @@ from jax._src import dtypes
 from jax._src import test_util as jtu
 
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel import (
+    RpaCase,
     ragged_paged_attention, ref_ragged_paged_attention)
 from tpu_inference.kernels.ragged_paged_attention.v3.util import (
     align_to, cdiv, get_dtype_packing)
@@ -55,6 +56,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         k_scale: float | None = None,
         v_scale: float | None = None,
         use_causal_mask: bool = True,
+        use_default_block_sizes: bool = False,
+        case: RpaCase = RpaCase.MIXED,
     ):
         rng = np.random.default_rng(1234)
 
@@ -149,7 +152,10 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                             (0, max_num_seq + 1 - cu_q_lens.shape[0]))
         kv_lens = jnp.array(kv_lens, dtype=jnp.int32)
         kv_lens = jnp.pad(kv_lens, (0, max_num_seq - kv_lens.shape[0]))
-        distribution = jnp.array([0, 0, len(seq_lens)], dtype=jnp.int32)
+        distribution = jnp.array(
+            [len(seq_lens) if case == RpaCase.DECODE else 0,
+             len(seq_lens) if case != RpaCase.MIXED else 0,
+             len(seq_lens)], dtype=jnp.int32)
 
         args = (
             q,
@@ -179,7 +185,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         output, updated_kv_cache = ragged_paged_attention(
             *args,
             **kwargs,
-            m_block_sizes=(bq_sz, bkv_sz, bq_csz, bkv_csz),
+            m_block_sizes=None if use_default_block_sizes else
+            (bq_sz, bkv_sz, bq_csz, bkv_csz),
             vmem_limit_bytes=vmem_limit_bytes,
         )
         output = output[:cu_q_lens[distribution[-1]]]
@@ -196,6 +203,33 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         mask = ~jnp.isnan(expected_kv_cache)
         self.assertArraysEqual(updated_kv_cache[mask], expected_kv_cache[mask])
         self.assertEqual(output.shape[-1], head_dim)
+
+    @parameterized.product(
+        case=[RpaCase.DECODE, RpaCase.PREFILL, RpaCase.MIXED],
+        num_heads=[(4, 1), (8, 2), (32, 8)],
+        head_dim=[64, 128, 256],
+        page_size=[16, 128],
+        dtype=[jnp.bfloat16, jnp.float32],
+        sliding_window=[None, 2048],
+    )
+    def test_default_tiles_against_reference(self, case, num_heads, head_dim,
+                                             page_size, dtype, sliding_window):
+        seq_lens = {
+            RpaCase.DECODE: [(1, 2047), (1, 2049)],
+            RpaCase.PREFILL: [(128, 128), (64, 64)],
+            RpaCase.MIXED: [(128, 2049), (1, 2304)],
+        }[case]
+        self._test_ragged_paged_attention(seq_lens,
+                                          num_heads,
+                                          head_dim,
+                                          page_size,
+                                          dtype,
+                                          dtype,
+                                          num_pages=512,
+                                          use_default_block_sizes=True,
+                                          case=case,
+                                          vmem_limit_bytes=None,
+                                          sliding_window=sliding_window)
 
     @parameterized.product(
         dtype=[jnp.float32, jnp.bfloat16],
@@ -777,6 +811,47 @@ class GetDefaultBlockSizesTest(parameterized.TestCase):
                                                max_num_seqs=256,
                                                pages_per_seq=1024,
                                                case=case)
+
+    @parameterized.product(
+        case=[RpaCase.DECODE, RpaCase.PREFILL, RpaCase.MIXED],
+        heads=[(4, 1), (32, 8), (64, 16)],
+        dtype=[jnp.bfloat16, jnp.float32],
+        page_size=[16, 48, 128],
+    )
+    def test_v4_tiles_fit_wide_head_scratch(self, case, heads, dtype,
+                                            page_size):
+        q_heads, kv_heads = heads
+        with mock.patch.object(self._k, "get_tpu_version", return_value=4):
+            sizes = self._k.get_default_block_sizes(dtype,
+                                                    dtype,
+                                                    q_heads,
+                                                    kv_heads,
+                                                    256,
+                                                    page_size,
+                                                    512,
+                                                    8,
+                                                    32,
+                                                    case=case)
+        self.assertLessEqual(
+            self._k.get_vmem_estimate_bytes(kv_heads, q_heads // kv_heads, 256,
+                                            sizes["bq_sz"], sizes["bkv_sz"],
+                                            dtype, dtype), 12 * 1024 * 1024)
+        self.assertEqual(sizes["bq_sz"] % sizes["bq_csz"], 0)
+        self.assertEqual(sizes["bkv_sz"] % sizes["bkv_csz"], 0)
+        self.assertEqual(sizes["bkv_csz"] % page_size, 0)
+
+    @parameterized.parameters(5, 6)
+    def test_v5_v6_tiles_unchanged(self, version):
+        with mock.patch.object(self._k,
+                               "get_tpu_version",
+                               return_value=version):
+            self.assertEqual(
+                self._call(RpaCase.DECODE),
+                dict(bq_sz=1, bkv_sz=16384, bq_csz=1, bkv_csz=16384))
+            for case in (RpaCase.PREFILL, RpaCase.MIXED):
+                self.assertEqual(
+                    self._call(case),
+                    dict(bq_sz=128, bkv_sz=1024, bq_csz=64, bkv_csz=512))
 
     def test_kernel_has_no_env_dependency(self):
         # The kernel module must not import tpu_inference.envs (self-contained).
