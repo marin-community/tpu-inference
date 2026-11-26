@@ -47,6 +47,7 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 
 from tpu_inference import envs
+from tpu_inference.core.sched.request_transport import request_for_ipc
 from tpu_inference.logger import init_logger
 from tpu_inference.utils import time_function
 
@@ -203,6 +204,8 @@ def _scheduler_worker_process(
             match command:
                 case SchedulerCommand.ADD_REQUEST:
                     request = data
+                    if request.structured_output_request is not None:
+                        structured_output_manager.grammar_init(request)
                     scheduler.add_request(request)
                     _send_result(None)  # Signal completion
 
@@ -597,6 +600,9 @@ class DPScheduler(SchedulerInterface):
                       data: Any = None) -> None:
         """Send a command to a worker process via its input pipe."""
         start_time = time()
+        if command in (SchedulerCommand.ADD_REQUEST,
+                       SchedulerCommand.PROBE_COMPUTED_BLOCKS):
+            data = request_for_ipc(data)
         payload = cloudpickle.dumps((command, data))
         serialize_time = time() - start_time
         self.input_conns[rank].send_bytes(payload)
