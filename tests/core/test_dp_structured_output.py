@@ -24,6 +24,7 @@ from vllm.v1.structured_output.backend_xgrammar import XgrammarGrammar
 
 from tpu_inference.core.sched.dp_scheduler import DPScheduler, SchedulerCommand
 from tpu_inference.runner.structured_decoding_manager import StructuredDecodingManager
+from tpu_inference.runner.tpu_runner import TPUModelRunner
 
 
 VOCAB = ["a", "b", "c", "d"] + [f"<{i}>" for i in range(4, 32)]
@@ -190,3 +191,57 @@ def test_rank_masks_sample_tokens_accepted_by_each_native_grammar():
                 req_ids=["alpha", "zulu"], req_id_to_index={"alpha": 0, "zulu": 1},
                 sampled_token_ids=[[token] for token in sampled], logprobs=None,
                 prompt_logprobs_dict={}))
+
+
+@pytest.mark.parametrize("dp_size, requests, batch_ids", [
+    (1, [(0, "alpha", "ab"), (0, "zulu", "cd")], ["alpha", "zulu"]),
+    (2, [(1, "alpha", "ab"), (0, "zulu", "cd")], ["alpha", "zulu"]),
+    (2, [(1, "alpha", "ab"), (0, "zulu", "cd"), (0, "beta", "ab")],
+     ["alpha", "zulu", "beta"]),
+    (2, [(1, "alpha", "ab"), (1, "zulu", "cd")], ["alpha", "zulu"]),
+])
+def test_padded_dp_logits_sample_tokens_accepted_by_each_grammar(
+        dp_size, requests, batch_ids):
+    with grammar_scheduler(requests) as scheduler:
+        manager = decoding_manager(batch_ids)
+        runner = manager.runner
+        runner.dp_size = dp_size
+        runner.max_num_reqs = 8
+        runner.enable_continue_decode = False
+        runner.num_reqs_paddings_per_dp = [4, 8]
+        runner.attn_num_reqs_paddings_per_dp = [4, 8]
+        runner.num_tokens_paddings_per_dp = [4, 8]
+        runner.grammar_bitmask_cpu = np.zeros((8, 1), dtype=np.int32)
+        runner.require_structured_out_cpu = np.zeros((8, 1), dtype=bool)
+        runner.input_batch.req_ids = batch_ids
+        runner.input_batch.num_reqs = len(batch_ids)
+        runner.input_batch.request_distribution = [len(batch_ids), 0, 0]
+        expected = {rid: [VOCAB.index(token) for token in text]
+                    for _, rid, text in requests}
+        for step in range(2):
+            frame = scheduler.schedule(batch_ids)
+            # Exercise the same rank placement and padding as the model runner.
+            metadata = TPUModelRunner._prepare_input_metadata(runner, frame)
+            padded_num_reqs, selector = metadata[6], metadata[10]
+            output = scheduler.get_grammar_bitmask(frame)
+            logits = jnp.zeros((padded_num_reqs, 32)).at[:, 30].set(10)
+            required, masks, arange = manager.prepare_structured_decoding_input(
+                logits, output, logits_indices_selector=selector)
+            constrained = manager.structured_decode_fn(required, masks, logits, arange)
+            sampled = np.asarray(jnp.argmax(constrained, axis=-1))
+            if selector is not None:
+                sampled = sampled[selector]
+            else:
+                sampled = sampled[:len(batch_ids)]
+            # A wrong physical mask row reaches the native FSM as token 30 or
+            # another request's token, reproducing the serving rejection.
+            scheduler.update_from_output(frame, ModelRunnerOutput(
+                req_ids=batch_ids,
+                req_id_to_index={rid: i for i, rid in enumerate(batch_ids)},
+                sampled_token_ids=[[int(token)] for token in sampled],
+                logprobs=None, prompt_logprobs_dict={}))
+            assert sampled.tolist() == [expected[rid][step] for rid in batch_ids]
+            active_rows = (set(selector.tolist()) if selector is not None
+                           else set(range(len(batch_ids))))
+            for row in set(range(padded_num_reqs)) - active_rows:
+                assert np.isfinite(np.asarray(constrained[row])).all()
