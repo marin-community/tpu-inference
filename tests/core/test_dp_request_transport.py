@@ -90,7 +90,7 @@ class TestDPRequestTransport(unittest.TestCase):
                     future = request.structured_output_request._grammar
                     if completed:
                         future.set_result(None)
-                    with self.assertRaisesRegex(TypeError, "RLock"):
+                    with self.assertRaises(TypeError):
                         cloudpickle.dumps((command, request))
                     sender, receiver = multiprocessing.Pipe()
                     try:

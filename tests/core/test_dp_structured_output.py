@@ -27,7 +27,8 @@ from tpu_inference.runner.structured_decoding_manager import StructuredDecodingM
 from tpu_inference.runner.tpu_runner import TPUModelRunner
 
 
-VOCAB = ["a", "b", "c", "d"] + [f"<{i}>" for i in range(4, 32)]
+VOCAB_SIZE = 32
+VOCAB = ["a", "b", "c", "d"] + [f"<{i}>" for i in range(4, VOCAB_SIZE)]
 
 
 class NativeGrammarManager(StructuredOutputManager):
@@ -40,10 +41,10 @@ class NativeGrammarManager(StructuredOutputManager):
         compiled = compiler.compile_grammar(
             request.sampling_params.structured_outputs.grammar)
         request.structured_output_request.grammar = XgrammarGrammar(
-            vocab_size=32, ctx=compiled,
+            vocab_size=VOCAB_SIZE, ctx=compiled,
             matcher=xgrammar.GrammarMatcher(compiled, max_rollback_tokens=2))
         self.backend = SimpleNamespace(
-            allocate_token_bitmask=lambda batch: xgrammar.allocate_token_bitmask(batch, 32))
+            allocate_token_bitmask=lambda batch: xgrammar.allocate_token_bitmask(batch, VOCAB_SIZE))
 
 
 class FrameScheduler:
@@ -117,7 +118,7 @@ def grammar_scheduler(requests):
 
 
 def allowed_tokens(mask):
-    return [token for token in range(32)
+    return [token for token in range(VOCAB_SIZE)
             if (int(mask[token // 32]) >> (token % 32)) & 1]
 
 
@@ -151,7 +152,7 @@ def test_grammar_mask_uses_requested_frame_with_two_queued_steps():
 
 def decoding_manager(request_ids):
     runner = SimpleNamespace(
-        vocab_size=32, mesh=Mesh(np.array(jax.devices()[:1]), ("data",)),
+        vocab_size=VOCAB_SIZE, mesh=Mesh(np.array(jax.devices()[:1]), ("data",)),
         grammar_bitmask_cpu=np.zeros((len(request_ids), 1), dtype=np.int32),
         require_structured_out_cpu=np.zeros((len(request_ids), 1), dtype=bool),
         structured_decode_arange=np.arange(32, dtype=np.int32),
@@ -167,7 +168,7 @@ def test_runner_preserves_mask_rows_when_ids_are_unsorted_or_absent(missing_requ
     values = [[1], [8], [4]] if missing_request else [[1], [4]]
     output = GrammarOutput(ids, np.array(values, dtype=np.int32))
     manager = decoding_manager(["alpha", "plain", "zulu"])
-    logits = jnp.zeros((3, 32))
+    logits = jnp.zeros((3, VOCAB_SIZE))
     required, masks, arange = manager.prepare_structured_decoding_input(logits, output)
     actual = np.asarray(manager.structured_decode_fn(required, masks, logits, arange))
     assert np.flatnonzero(np.isfinite(actual[0])).tolist() == [2]
@@ -182,7 +183,7 @@ def test_rank_masks_sample_tokens_accepted_by_each_native_grammar():
         for expected in ([2, 0], [3, 1]):
             frame = scheduler.schedule(["zulu", "alpha"])
             output = scheduler.get_grammar_bitmask(frame)
-            logits = jnp.zeros((2, 32))
+            logits = jnp.zeros((2, VOCAB_SIZE))
             args = manager.prepare_structured_decoding_input(logits, output)
             constrained = manager.structured_decode_fn(args[0], args[1], logits, args[2])
             sampled = np.asarray(jnp.argmax(constrained, axis=-1)).tolist()
@@ -224,7 +225,7 @@ def test_padded_dp_logits_sample_tokens_accepted_by_each_grammar(
             metadata = TPUModelRunner._prepare_input_metadata(runner, frame)
             padded_num_reqs, selector = metadata[6], metadata[10]
             output = scheduler.get_grammar_bitmask(frame)
-            logits = jnp.zeros((padded_num_reqs, 32)).at[:, 30].set(10)
+            logits = jnp.zeros((padded_num_reqs, VOCAB_SIZE)).at[:, 30].set(10)
             required, masks, arange = manager.prepare_structured_decoding_input(
                 logits, output, logits_indices_selector=selector)
             constrained = manager.structured_decode_fn(required, masks, logits, arange)
