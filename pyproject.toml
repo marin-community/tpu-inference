@@ -22,6 +22,11 @@ checks = ["ruff-check"]
 # never disagree about the same file.
 ruff_version = "0.11.8"
 include = [
+    "tpu_inference/core/sched/dp_scheduler.py",
+    "tpu_inference/core/sched/request_transport.py",
+    "tests/core/test_dp_request_transport.py",
+    "tests/core/test_dp_structured_output.py",
+    "tpu_inference/runner/structured_decoding_manager.py",
     "tpu_inference/models/jax/grugmoe.py",
     "tpu_inference/layers/common/fused_moe_gmm.py",
     "tpu_inference/layers/vllm/interface/moe.py",

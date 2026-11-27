@@ -29,7 +29,6 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import cloudpickle
 import numpy as np
-import torch
 from vllm.config import VllmConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -47,6 +46,7 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 
 from tpu_inference import envs
+from tpu_inference.core.sched.request_transport import request_for_ipc
 from tpu_inference.logger import init_logger
 from tpu_inference.utils import time_function
 
@@ -203,6 +203,8 @@ def _scheduler_worker_process(
             match command:
                 case SchedulerCommand.ADD_REQUEST:
                     request = data
+                    if request.structured_output_request is not None:
+                        structured_output_manager.grammar_init(request)
                     scheduler.add_request(request)
                     _send_result(None)  # Signal completion
 
@@ -282,9 +284,7 @@ def _scheduler_worker_process(
                     _send_result(result)
 
                 case SchedulerCommand.GET_GRAMMAR_BITMASK:
-                    assert _cached_scheduler_outputs is not None
-                    cached_output = _cached_scheduler_outputs[-1]
-                    result = scheduler.get_grammar_bitmask(cached_output)
+                    result = scheduler.get_grammar_bitmask(data)
                     _send_result(result)
 
                 case SchedulerCommand.MAKE_STATS:
@@ -412,17 +412,20 @@ class DPSchedulerOutput(SchedulerOutput):
     # (padded_max * dp_size), ensuring consistent shapes across pipeline stages.
     max_num_scheduled_tokens_per_dp_rank: int = 0
     req_ids_per_rank: Optional[Dict[int, List[str]]] = None
+    rank_outputs: Optional[List[SchedulerOutput]] = None
 
     def __init__(self,
                  *args,
                  assigned_dp_rank=None,
                  max_num_scheduled_tokens_per_dp_rank=0,
                  req_ids_per_rank=None,
+                 rank_outputs=None,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.assigned_dp_rank = assigned_dp_rank or {}
         self.max_num_scheduled_tokens_per_dp_rank = max_num_scheduled_tokens_per_dp_rank
         self.req_ids_per_rank = req_ids_per_rank or {}
+        self.rank_outputs = rank_outputs
 
 
 class DPScheduler(SchedulerInterface):
@@ -597,6 +600,9 @@ class DPScheduler(SchedulerInterface):
                       data: Any = None) -> None:
         """Send a command to a worker process via its input pipe."""
         start_time = time()
+        if command in (SchedulerCommand.ADD_REQUEST,
+                       SchedulerCommand.PROBE_COMPUTED_BLOCKS):
+            data = request_for_ipc(data)
         payload = cloudpickle.dumps((command, data))
         serialize_time = time() - start_time
         self.input_conns[rank].send_bytes(payload)
@@ -998,6 +1004,7 @@ class DPScheduler(SchedulerInterface):
             assigned_dp_rank=assigned_dp_rank,
             max_num_scheduled_tokens_per_dp_rank=max_scheduled_tokens_per_rank,
             req_ids_per_rank=req_ids_per_rank,
+            rank_outputs=rank_outputs,
             kv_connector_metadata=combined_kv_connector_metadata,
             has_structured_output_requests=has_structured_output_requests,
             pending_structured_output_tokens=pending_structured_output_tokens,
@@ -1132,8 +1139,7 @@ class DPScheduler(SchedulerInterface):
         This method calls get_grammar_bitmask on each underlying scheduler and
         combines their outputs, similar to how other operations are handled.
         """
-        # Use the most recent cached outputs from the schedule() call
-        if not self.cached_schedulers_output:
+        if not scheduler_output.rank_outputs:
             return None
 
         combined_structured_output_request_ids = []
@@ -1141,7 +1147,9 @@ class DPScheduler(SchedulerInterface):
 
         # Get grammar bitmask from each DP rank scheduler
         for rank in range(self.dp_size):
-            self._send_command(rank, SchedulerCommand.GET_GRAMMAR_BITMASK)
+            # Async execution may have queued another frame since this one.
+            self._send_command(rank, SchedulerCommand.GET_GRAMMAR_BITMASK,
+                               scheduler_output.rank_outputs[rank])
         for rank in range(self.dp_size):
             grammar_output = self._get_result(
                 rank, SchedulerCommand.GET_GRAMMAR_BITMASK)
@@ -1157,7 +1165,7 @@ class DPScheduler(SchedulerInterface):
         if len(combined_bitmasks) == 1:
             combined_bitmask = combined_bitmasks[0]
         else:
-            combined_bitmask = torch.cat(combined_bitmasks, dim=0)
+            combined_bitmask = np.concatenate(combined_bitmasks, axis=0)
 
         return GrammarOutput(combined_structured_output_request_ids,
                              combined_bitmask)
