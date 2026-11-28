@@ -13,14 +13,19 @@
 # limitations under the License.
 
 import collections
+from types import SimpleNamespace
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
 from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
+from jax.experimental.pallas import tpu as pltpu
 
-from tpu_inference.kernels.megablox.gmm_v2 import (TileSizes, apply_act_fn,
-                                                   gmm_v2, interleave_lane)
+from tpu_inference.kernels.megablox.gmm_v2 import (Dimensions, InputConfigs,
+                                                   TileSizes, apply_act_fn,
+                                                   calculate_tiling, gmm_v2,
+                                                   interleave_lane)
 
 jax.config.parse_flags_with_absl()
 
@@ -129,6 +134,35 @@ def reference_gmm(
 
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
 class GmmTest(jtu.JaxTestCase):
+
+    def test_tiling_counts_v4_snowball_scratch(self):
+        dims = Dimensions(size_m=512,
+                          size_k=2560,
+                          size_n=512,
+                          size_group=256,
+                          size_lhs_group=256,
+                          size_lhs_sublane=8)
+        lhs_cfgs = InputConfigs(quant_dtype=None,
+                                quant_block_size=512,
+                                dtype=jnp.bfloat16)
+        rhs_cfgs = InputConfigs(quant_dtype=None,
+                                quant_block_size=2560,
+                                dtype=jnp.bfloat16)
+        tpu_info = SimpleNamespace(num_lanes=128, mxu_column_size=128)
+
+        def tiles_for_limit(limit, zero_initialize):
+            return calculate_tiling(dims, lhs_cfgs, rhs_cfgs, limit, "silu",
+                                    jnp.bfloat16, jnp.float32, zero_initialize)
+
+        with mock.patch.object(pltpu, "get_tpu_info", return_value=tpu_info):
+            # At tile_m=512 the declared buffers total 14,815,232 bytes:
+            # 14,680,064 tile bytes + 4,096 partial output + 131,072 zero fill.
+            self.assertEqual(tiles_for_limit(14_815_231, True).tile_m, 384)
+            self.assertEqual(tiles_for_limit(14_815_232, True).tile_m, 512)
+            self.assertEqual(tiles_for_limit(14_684_160, False).tile_m, 512)
+            self.assertEqual(
+                tiles_for_limit(int(16 * 1024 * 1024 * 0.85), True).tile_m,
+                384)
 
     @parameterized.product(
         batch_size=[128],

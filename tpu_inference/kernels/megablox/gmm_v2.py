@@ -26,6 +26,11 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+_ZERO_REF_TARGET_BYTES = 2 * 1024 * 1024
+_SMALL_VMEM_CAPACITY_BYTES = 16 * 1024 * 1024
+_SMALL_VMEM_BUDGET_FRACTION = 0.85
+_DEFAULT_VMEM_BUDGET_FRACTION = 0.9
+
 # Util.
 
 
@@ -262,8 +267,10 @@ class GmmConfigs:
             return self.dims.size_n // 2
 
 
-TileFn = Callable[[Dimensions, InputConfigs, InputConfigs, int, str | None],
-                  TileSizes]
+TileFn = Callable[[
+    Dimensions, InputConfigs, InputConfigs, int, str
+    | None, jnp.dtype, jnp.dtype, bool
+], TileSizes]
 
 
 class IndexMaps:
@@ -913,7 +920,10 @@ def calculate_tiling(
     lhs_cfgs: InputConfigs,
     rhs_cfgs: InputConfigs,
     vmem_limit_bytes: int,
-    fuse_act: str | None = None,
+    fuse_act: str | None,
+    out_dtype: jnp.dtype,
+    acc_dtype: jnp.dtype,
+    zero_initialize: bool,
 ) -> TileSizes:
     """Calculate optimal tile sizes for GMM kernel."""
 
@@ -986,14 +996,25 @@ def calculate_tiling(
 
         # 3. Accumulator
         acc_cols = fuse_act_factor * tn
-        acc_dtype_bytes = 2 if lhs_cfgs.quant_dtype is not None else 4
+        acc_dtype_bytes = jnp.dtype(acc_dtype).itemsize
         acc_vmem = tm * acc_cols * acc_dtype_bytes
 
         # 4. Output tile (double-buffered)
-        out_dtype_bytes = jax.dtypes.itemsize_bits(lhs_cfgs.dtype) // 8
+        out_dtype_bytes = jnp.dtype(out_dtype).itemsize
         out_vmem = 2 * tm * tn * out_dtype_bytes
 
-        return lhs_vmem + rhs_vmem + acc_vmem + out_vmem
+        # 5. VMEM scratch declared by gmm_v2: partial output and, when enabled,
+        # the zero-fill DMA tile. The accumulator scratch is counted above.
+        partial_out_vmem = dims.size_lhs_sublane * tn * out_dtype_bytes
+        zero_out_vmem = 0
+        if zero_initialize:
+            tile_zero_m = min(
+                _ZERO_REF_TARGET_BYTES // num_lanes // out_dtype_bytes,
+                dims.size_m)
+            zero_out_vmem = tile_zero_m * num_lanes * out_dtype_bytes
+
+        return (lhs_vmem + rhs_vmem + acc_vmem + out_vmem + partial_out_vmem +
+                zero_out_vmem)
 
     # Multiple k tiles will introduce accumulation overhead. Thus, we first try
     # to fit the tensors into vmem by only adjusting tile_n.
@@ -1217,7 +1238,8 @@ def make_gmm_configs(
     if isinstance(tile_info, TileSizes):
         tiles = tile_info
     else:
-        tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
+        tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act,
+                          out_dtype, acc_dtype, zero_initialize)
 
     return GmmConfigs(
         dims=dims,
@@ -1305,7 +1327,12 @@ def gmm_v2(
             group_offset = group_offset[None]
 
     if vmem_limit_bytes is None:
-        vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+        vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+        # The v4 compiler uses more VMEM than the declared tile buffers alone.
+        budget_fraction = (_SMALL_VMEM_BUDGET_FRACTION
+                           if vmem_capacity_bytes <= _SMALL_VMEM_CAPACITY_BYTES
+                           else _DEFAULT_VMEM_BUDGET_FRACTION)
+        vmem_limit_bytes = int(vmem_capacity_bytes * budget_fraction)
 
     cfgs = make_gmm_configs(
         lhs,
@@ -1352,8 +1379,6 @@ def gmm_v2(
     num_lanes = pltpu.get_tpu_info().num_lanes
     if cfgs.zero_init:
         # TODO(kyuyeunk): Create better heuristics for determining this value.
-        target_zero_ref_bytes = 2 * 1024 * 1024
-
         # Zero initialization is done by tiling size_m dim where each tile invokes
         # zero initializing DMA for up-to tile_zero_m rows. This means larger
         # tile_zero_m will result in fewer number of tiles and lead to smaller
@@ -1365,7 +1390,7 @@ def gmm_v2(
         # size_n//num_lanes times in a single tile, we can significantly increase
         # tile_zero_m without triggering OOM.
         out_bytes = jnp.dtype(cfgs.out_dtype).itemsize
-        tile_zero_m = target_zero_ref_bytes // num_lanes // out_bytes
+        tile_zero_m = _ZERO_REF_TARGET_BYTES // num_lanes // out_bytes
         tile_zero_m = min(tile_zero_m, dims.size_m)
 
         scratch_shapes += [
